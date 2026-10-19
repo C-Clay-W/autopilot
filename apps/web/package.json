@@ -1,0 +1,51 @@
+{
+  "name": "@autopilot-agent/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --webpack",
+    "build": "next build",
+    "start": "next start --hostname 127.0.0.1",
+    "lint": "eslint",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@autopilot-agent/core": "0.1.0",
+    "@autopilot-agent/presentation": "0.1.0",
+    "@lancedb/lancedb": "^0.31.0",
+    "mammoth": "^1.12.0",
+    "next": "16.2.10",
+    "pdf-parse": "^2.4.5",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "optionalDependencies": {
+    "@lancedb/lancedb-darwin-arm64": "^0.31.0",
+    "@lancedb/lancedb-linux-x64-gnu": "^0.31.0",
+    "@lancedb/lancedb-win32-arm64-msvc": "^0.31.0",
+    "@lancedb/lancedb-win32-x64-msvc": "^0.31.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.10",
+    "tailwindcss": "^4",
+    "tsx": "^4.23.0",
+    "typescript": "^5"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/C-Clay-W/autopilot.git",
+    "directory": "apps/web"
+  },
+  "homepage": "https://github.com/C-Clay-W/autopilot#readme",
+  "bugs": {
+    "url": "https://github.com/C-Clay-W/autopilot/issues"
+  }
+}

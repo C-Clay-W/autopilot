@@ -1,0 +1,85 @@
+{
+  "name": "@autopilot-agent/core",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    },
+    "./experimental": {
+      "types": "./dist/experimental/index.d.ts",
+      "import": "./dist/experimental/index.mjs",
+      "require": "./dist/experimental/index.js"
+    }
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.mjs",
+    "dist/**/*.d.ts",
+    "dist/scripts/pdf_extract.py",
+    "!**/*.map",
+    "!**/*.{test,spec,bench}.*",
+    "!**/*-fixture*.*",
+    "!**/{test,tests,test-*,__tests__,__mocks__,contract-test,fixtures,coverage,playwright-report,test-results}/**",
+    "!**/{agent,agents,.agent-tests,.agents,.codex,.cursor,.idea,.vscode}/**",
+    "!**/{.git,.hg,.svn,.github,.gitlab}/**",
+    "!**/{.local,.autopilot,.cache,.npm-cache,.turbo,.next,.vite,__pycache__,node_modules,src,dist-types}/**",
+    "!**/*.{log,tsbuildinfo,tmp,temp,bak,orig,rej,swp,swo,pyc,pyo,tgz,tar,zip,7z,rar,db,sqlite,sqlite3,wal,shm}",
+    "!**/*.{pem,key,p12,pfx,crt,cer}",
+    "!**/{.env*,.npmrc*,.yarnrc*,.pnp.*,AGENTS.md,CLAUDE.md,.DS_Store,Thumbs.db}",
+    "!**/{settings.json,settings.local.json,mcp.json,credentials.json,credentials.local.json,package-lock.json,npm-shrinkwrap.json,yarn.lock,pnpm-lock.yaml,bun.lockb}",
+    "!**/{tsconfig*,vitest.config.*,vite.config.*,playwright.config.*,eslint.config.*,jest.config.*,turbo.json}"
+  ],
+  "scripts": {
+    "prepack": "npm run build && node ../../scripts/check-npm-pack.mjs packages/core",
+    "build": "node scripts/build-core.mjs",
+    "build:dev": "node scripts/build-core.mjs --dev",
+    "dev": "node scripts/build-core.mjs --watch --dev",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src test --ext .ts",
+    "typecheck:watch": "tsc --noEmit --watch",
+    "test": "vitest run --config vitest.config.ts",
+    "test:watch": "vitest --config vitest.config.ts"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "rimraf": "^5.0.0",
+    "typescript": "^5",
+    "vitest": "^3.2.4"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
+    "@langchain/core": "^1.2.1",
+    "@napi-rs/canvas": "^0.1.80",
+    "@types/sql.js": "^1.4.11",
+    "@vscode/ripgrep": "^1.18.0",
+    "langchain": "^1.5.2",
+    "mammoth": "^1.12.0",
+    "mysql2": "^3.23.1",
+    "pdf-parse": "^2.4.5",
+    "pdfjs-dist": "5.4.296",
+    "sql.js": "^1.14.1",
+    "xlsx": "^0.18.5",
+    "zod": "^4.4.3",
+    "@lancedb/lancedb": "^0.31.0"
+  },
+  "description": "Autopilot Agent 共享运行时、工具执行与会话管理。",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/C-Clay-W/autopilot.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/C-Clay-W/autopilot#readme",
+  "bugs": {
+    "url": "https://github.com/C-Clay-W/autopilot/issues"
+  }
+}

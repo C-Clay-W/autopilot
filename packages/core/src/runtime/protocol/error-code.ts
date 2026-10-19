@@ -1,0 +1,71 @@
+/**
+ * runtime/protocol/error-code.ts — Runtime 层统一错误码与错误类
+ *
+ * Phase 3 扩充错误码集合，覆盖 Project / Provider / Turn 冻结 / 凭据等场景。
+ * Web 端错误映射留给 Phase 4；本阶段只扩充类型与 contract test。
+ */
+
+/** Runtime 层统一错误码。 */
+export type AgentErrorCode =
+  | "SESSION_MODE_MISMATCH"
+  | "CHAT_RETRIEVAL_MODE_LOCKED"
+  | "CHAT_TOOL_FORBIDDEN"
+  | "CHAT_RAG_EVIDENCE_INSUFFICIENT"
+  | "WORKSPACE_REQUIRED"
+  | "WORK_HISTORY_READ_ONLY"
+  | "SESSION_NOT_FOUND"
+  | "SESSION_TITLE_INVALID"
+  | "TURN_NOT_FOUND"
+  | "TURN_NOT_RESUMABLE"
+  | "TURN_ALREADY_RUNNING"
+  | "CHECKPOINT_NOT_FOUND"
+  | "PROJECT_NOT_FOUND"
+  | "NOT_IMPLEMENTED"
+  | "RUNTIME_ERROR"
+  | "INVALID_RUN_CONFIG"
+  | "PROVIDER_UNAUTHORIZED"
+  | "MODEL_NOT_FOUND"
+  | "MODEL_NOT_SUPPORTED"
+  | "REASONING_EFFORT_NOT_SUPPORTED"
+  | "TURN_FROZEN_MISMATCH"
+  | "CREDENTIAL_REF_INVALID"
+  | "MISSING_CREDENTIAL"
+  | "PROVIDER_PROTOCOL_REQUIRED"
+  | "UNSUPPORTED_API_PROTOCOL"
+  | "INVALID_PROTOCOL_PROFILE"
+  | "DUPLICATE_API_PROTOCOL_ADAPTER"
+  | "CANONICAL_MESSAGE_INVALID"
+  | "APPROVAL_NOT_FOUND"
+  | "APPROVAL_MISMATCH"
+  | "APPROVAL_ALREADY_SUBMITTED"
+  | "QUESTION_NOT_FOUND"
+  | "QUESTION_ALREADY_ANSWERED"
+  | "QUESTION_ANSWER_INVALID"
+  | "QUESTION_TURN_STATE_INVALID"
+  | "JOB_NOT_FOUND"
+  | "JOB_INPUT_INVALID"
+  | "JOB_CURSOR_INVALID"
+  | "JOB_OWNER_UNAVAILABLE"
+  | "JOB_OWNER_UNKNOWN"
+  | "JOB_STATE_CONFLICT"
+  | "JOB_STOP_TIMEOUT"
+  | "JOB_STOP_FAILED"
+  | "JOB_STORAGE_FAILED"
+  | "JOB_SPAWN_FAILED"
+  | "JOB_STORE_CAPABILITY_UNSUPPORTED"
+  | "SESSION_HAS_ACTIVE_JOBS"
+  | "INTERACTIVE_TOOL_CONFLICT"
+  | "INBOX_INPUT_NOT_FOUND"
+  | "INVALID_INPUT";
+
+/** Runtime 层统一错误。 */
+export class AgentRuntimeError extends Error {
+  constructor(
+    public readonly code: AgentErrorCode,
+    message: string,
+    public readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = "AgentRuntimeError";
+  }
+}

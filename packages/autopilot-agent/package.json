@@ -1,0 +1,51 @@
+{
+  "name": "autopilot-agent",
+  "version": "0.1.0",
+  "description": "Autopilot Agent CLI：本地工作区中的 AI 编程助手。",
+  "type": "module",
+  "bin": {
+    "ap": "bin/autopilot-agent.mjs",
+    "autopilot": "bin/autopilot-agent.mjs"
+  },
+  "files": [
+    "bin/autopilot-agent.mjs",
+    "schema/cc-compatible-settings.schema.json",
+    "!**/*.map",
+    "!**/*.{test,spec,bench}.*",
+    "!**/*-fixture*.*",
+    "!**/{test,tests,test-*,__tests__,__mocks__,contract-test,fixtures,coverage,playwright-report,test-results}/**",
+    "!**/{agent,agents,.agent-tests,.agents,.codex,.cursor,.idea,.vscode}/**",
+    "!**/{.git,.hg,.svn,.github,.gitlab}/**",
+    "!**/{.local,.autopilot,.cache,.npm-cache,.turbo,.next,.vite,__pycache__,node_modules,src,dist-types}/**",
+    "!**/*.{log,tsbuildinfo,tmp,temp,bak,orig,rej,swp,swo,pyc,pyo,tgz,tar,zip,7z,rar,db,sqlite,sqlite3,wal,shm}",
+    "!**/*.{pem,key,p12,pfx,crt,cer}",
+    "!**/{.env*,.npmrc*,.yarnrc*,.pnp.*,AGENTS.md,CLAUDE.md,.DS_Store,Thumbs.db}",
+    "!**/{settings.json,settings.local.json,mcp.json,credentials.json,credentials.local.json,package-lock.json,npm-shrinkwrap.json,yarn.lock,pnpm-lock.yaml,bun.lockb}",
+    "!**/{tsconfig*,vitest.config.*,vite.config.*,playwright.config.*,eslint.config.*,jest.config.*,turbo.json}"
+  ],
+  "engines": {
+    "node": ">=20.11.0 <22"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "scripts": {
+    "prepack": "node ../../scripts/check-npm-pack.mjs packages/autopilot-agent"
+  },
+  "dependencies": {
+    "@autopilot-agent/adapters": "0.1.0",
+    "@autopilot-agent/cli": "0.1.0",
+    "@autopilot-agent/core": "0.1.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/C-Clay-W/autopilot.git",
+    "directory": "packages/autopilot-agent"
+  },
+  "homepage": "https://github.com/C-Clay-W/autopilot#readme",
+  "bugs": {
+    "url": "https://github.com/C-Clay-W/autopilot/issues"
+  }
+}

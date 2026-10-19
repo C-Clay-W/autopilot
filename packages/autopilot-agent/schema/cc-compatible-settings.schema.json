@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Autopilot CC-compatible provider settings",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "env": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "properties": {
+        "ANTHROPIC_BASE_URL": { "type": "string" },
+        "ANTHROPIC_AUTH_TOKEN": { "type": "string" },
+        "ANTHROPIC_API_KEY": { "type": "string" },
+        "ANTHROPIC_MODEL": { "type": "string" },
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": { "type": "string" },
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": { "type": "string" },
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": { "type": "string" },
+        "CLAUDE_CODE_SUBAGENT_MODEL": { "type": "string" },
+        "CLAUDE_CODE_EFFORT_LEVEL": { "enum": ["auto", "unset", "low", "medium", "high", "max"] },
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "API_TIMEOUT_MS": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "CLAUDE_CODE_DISABLE_AUTO_UPDATE": { "type": "string" }
+      }
+    },
+    "model": { "type": "string" },
+    "availableModels": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "modelOverrides": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "minLength": 1 }
+    },
+    "alwaysThinkingEnabled": { "type": "boolean" },
+    "maxTurns": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "effortLevel": { "enum": ["low", "medium", "high"] },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "allow": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^(Read|Write|Edit)\\((?:[A-Za-z]:[\\\\/]|/).+\\)$" }
+        },
+        "deny": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^(Read|Write|Edit)\\((?:[A-Za-z]:[\\\\/]|/).+\\)$" }
+        },
+        "ask": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^(Read|Write|Edit)\\((?:[A-Za-z]:[\\\\/]|/).+\\)$" }
+        }
+      }
+    }
+  },
+  "additionalProperties": true
+}

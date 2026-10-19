@@ -1,0 +1,31 @@
+{
+  "requestTarget": "/chat/completions",
+  "canonicalInput": {
+    "model": "deepseek-v4-flash",
+    "temperature": 0.2,
+    "maxTokens": 8192,
+    "thinking": "enabled",
+    "reasoningEffort": "high",
+    "messages": [
+      {
+        "role": "system",
+        "content": "fixture system"
+      },
+      {
+        "role": "user",
+        "content": "fixture user"
+      }
+    ],
+    "tools": []
+  },
+  "expectedProviderFields": [
+    "model",
+    "messages",
+    "stream",
+    "temperature",
+    "max_tokens",
+    "thinking",
+    "reasoning_effort"
+  ],
+  "stage3Replacement": "Anthropic Messages with output_config.effort; do not retain this as the primary Agent transport."
+}

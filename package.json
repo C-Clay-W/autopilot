@@ -1,0 +1,34 @@
+{
+  "name": "autopilot-agent-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "npm@10.8.2",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "check:npm-pack": "node scripts/check-npm-pack.mjs",
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test:unit": "npm run test --workspaces --if-present",
+    "test:e2e": "node test/e2e/cross-process-lease-smoke.mjs",
+    "test": "npm run test:unit && npm run test:e2e",
+    "check": "npm run typecheck && npm run lint && npm run test"
+  },
+  "devDependencies": {
+    "turbo": "^2.0.0",
+    "typescript": "^5"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/C-Clay-W/autopilot.git"
+  },
+  "homepage": "https://github.com/C-Clay-W/autopilot#readme",
+  "bugs": {
+    "url": "https://github.com/C-Clay-W/autopilot/issues"
+  }
+}

@@ -1,0 +1,52 @@
+# Dependencies and generated output
+node_modules/
+.next/
+.turbo/
+dist/
+dist-types/
+build/
+out/
+*.tsbuildinfo
+__pycache__/
+*.pyc
+
+# Local settings, credentials and runtime data
+.env*
+.npmrc
+.autopilot/
+.local/
+*.pem
+*.key
+*.p12
+*.pfx
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.wal
+*.shm
+*.lance/
+lancedb/
+
+# Test output, logs, packages and temporary files
+coverage/
+playwright-report/
+test-results/
+runs/
+*.log
+*.pid
+*.tgz
+*.zip
+*.bak
+*.tmp
+*.orig
+*.rej
+.cache/
+.npm-cache/
+.agent-tests/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

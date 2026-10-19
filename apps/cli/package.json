@@ -1,0 +1,70 @@
+{
+  "name": "@autopilot-agent/cli",
+  "version": "0.1.0",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "ap": "./dist/main.js",
+    "autopilot": "./dist/main.js"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.mjs",
+    "dist/**/*.d.ts",
+    "!**/*.map",
+    "!**/*.{test,spec,bench}.*",
+    "!**/*-fixture*.*",
+    "!**/{test,tests,test-*,__tests__,__mocks__,contract-test,fixtures,coverage,playwright-report,test-results}/**",
+    "!**/{agent,agents,.agent-tests,.agents,.codex,.cursor,.idea,.vscode}/**",
+    "!**/{.git,.hg,.svn,.github,.gitlab}/**",
+    "!**/{.local,.autopilot,.cache,.npm-cache,.turbo,.next,.vite,__pycache__,node_modules,src,dist-types}/**",
+    "!**/*.{log,tsbuildinfo,tmp,temp,bak,orig,rej,swp,swo,pyc,pyo,tgz,tar,zip,7z,rar,db,sqlite,sqlite3,wal,shm}",
+    "!**/*.{pem,key,p12,pfx,crt,cer}",
+    "!**/{.env*,.npmrc*,.yarnrc*,.pnp.*,AGENTS.md,CLAUDE.md,.DS_Store,Thumbs.db}",
+    "!**/{settings.json,settings.local.json,mcp.json,credentials.json,credentials.local.json,package-lock.json,npm-shrinkwrap.json,yarn.lock,pnpm-lock.yaml,bun.lockb}",
+    "!**/{tsconfig*,vitest.config.*,vite.config.*,playwright.config.*,eslint.config.*,jest.config.*,turbo.json}"
+  ],
+  "engines": {
+    "node": ">=20.11.0 <22"
+  },
+  "scripts": {
+    "prepack": "npm run build && node ../../scripts/check-npm-pack.mjs apps/cli",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint src test --ext .ts,.tsx",
+    "test": "vitest run --config vitest.config.ts",
+    "test:watch": "vitest --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@autopilot-agent/adapters": "0.1.0",
+    "@autopilot-agent/core": "0.1.0",
+    "@autopilot-agent/presentation": "0.1.0",
+    "ink": "6.8.0",
+    "react": "19.2.4",
+    "string-width": "^8.1.1",
+    "wrap-ansi": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/react": "19.2.0",
+    "ink-testing-library": "4.0.0",
+    "typescript": "^5",
+    "vitest": "^3.2.4"
+  },
+  "description": "Autopilot Agent 终端客户端；推荐安装 autopilot-agent。",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/C-Clay-W/autopilot.git",
+    "directory": "apps/cli"
+  },
+  "homepage": "https://github.com/C-Clay-W/autopilot#readme",
+  "bugs": {
+    "url": "https://github.com/C-Clay-W/autopilot/issues"
+  }
+}

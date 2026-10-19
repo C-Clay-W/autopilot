@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 2,
+  "models": {
+    "primary": {
+      "provider": "deepseek",
+      "modelId": "deepseek-v4-flash"
+    },
+    "vision": {
+      "provider": "ali",
+      "modelId": "qwen-vl-max"
+    }
+  },
+  "providers": {
+    "deepseek": {
+      "baseUrl": "https://legacy-v2.fixture.invalid/v1"
+    },
+    "ali": {
+      "baseUrl": "https://legacy-vision.fixture.invalid"
+    }
+  }
+}

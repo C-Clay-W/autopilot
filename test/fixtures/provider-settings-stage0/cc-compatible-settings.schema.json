@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fixture.invalid/autopilot/provider-settings-stage0.schema.json",
+  "title": "Autopilot CC-compatible provider settings Stage 0 fixture",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "env": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "properties": {
+        "ANTHROPIC_BASE_URL": { "type": "string" },
+        "ANTHROPIC_AUTH_TOKEN": { "type": "string" },
+        "ANTHROPIC_API_KEY": { "type": "string" },
+        "ANTHROPIC_MODEL": { "type": "string" },
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": { "type": "string" },
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": { "type": "string" },
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": { "type": "string" },
+        "CLAUDE_CODE_SUBAGENT_MODEL": { "type": "string" },
+        "CLAUDE_CODE_EFFORT_LEVEL": {
+          "enum": ["auto", "unset", "low", "medium", "high", "max"]
+        },
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "API_TIMEOUT_MS": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+        "CLAUDE_CODE_DISABLE_AUTO_UPDATE": { "type": "string" }
+      }
+    },
+    "model": {
+      "type": "string"
+    },
+    "availableModels": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "modelOverrides": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "alwaysThinkingEnabled": {
+      "type": "boolean"
+    },
+    "effortLevel": {
+      "enum": ["low", "medium", "high"]
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,10 @@
+{
+  "purpose": "只描述既有兼容回退的存在条件；真实环境变量值不进入 fixture。",
+  "requiredVariables": [
+    "LOOP_LLM_BASE_URL",
+    "LOOP_LLM_API_KEY",
+    "LOOP_LLM_MODEL"
+  ],
+  "fallbackPrecedence": "低于后续 CC-compatible User settings",
+  "removal": "本 Plan 实施完成后的一个兼容周期再另行评估"
+}

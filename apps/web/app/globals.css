@@ -1,0 +1,139 @@
+@import "tailwindcss";
+
+/* ============================================================
+ * 复古纸本百科 · Design Token
+ * ============================================================ */
+:root {
+  --bg-page: #F2E8CE;
+  --bg-card: #F2E8CE;
+  --ink: #0A0A0A;
+  --ink-soft: #1F1F1F;
+  --ink-on-dark: #F2E8CE;
+  --accent: #E85A1A;
+  --accent-soft: #F4A678;
+  --error: #B42318;
+  --success: #2D6A4F;
+  --approval-deep: #244A68;
+  --approval-soft: #C9DCE8;
+  --muted: #6B6B6B;
+  --rule: #0A0A0A;
+  --font-mono: var(--font-jetbrains-mono), 'Menlo', 'Consolas', monospace;
+}
+
+/* 通过 Tailwind v4 @theme inline 暴露为 design token
+ * 前端可用：bg-bg / bg-card / bg-ink / bg-accent
+ *           text-ink / text-accent / text-muted / text-ink-on-dark
+ *           border-ink / border-accent / border-rule
+ *           font-mono
+ */
+@theme inline {
+  --color-bg: var(--bg-page);
+  --color-card: var(--bg-card);
+  --color-ink: var(--ink);
+  --color-ink-soft: var(--ink-soft);
+  --color-ink-on-dark: var(--ink-on-dark);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-error: var(--error);
+  --color-success: var(--success);
+  --color-approval-deep: var(--approval-deep);
+  --color-approval-soft: var(--approval-soft);
+  --color-muted: var(--muted);
+  --color-rule: var(--rule);
+  --font-mono: var(--font-mono);
+}
+
+/* ============================================================
+ * 全局基础样式
+ * ============================================================ */
+body {
+  margin: 0;
+  background: var(--bg-page);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* 圆点虚线分隔工具类 */
+.divider-dotted {
+  border-bottom: 2px dotted var(--rule);
+  margin: 1.25rem 0;
+}
+
+/* 粗黑实线分隔 */
+.divider-thick {
+  border-top: 2px solid var(--ink);
+}
+
+/* 侧栏 Session 的八点像素追逐环；SVG 继承唯一强调色 token。 */
+@keyframes session-status-chase {
+  0%, 20% { opacity: 1; }
+  35%, 100% { opacity: 0.22; }
+}
+
+.session-status-ring circle {
+  fill: currentColor;
+  opacity: 0.22;
+  animation: session-status-chase 960ms steps(1, end) infinite;
+}
+
+.session-status-ring circle:nth-child(2) { animation-delay: 120ms; }
+.session-status-ring circle:nth-child(3) { animation-delay: 240ms; }
+.session-status-ring circle:nth-child(4) { animation-delay: 360ms; }
+.session-status-ring circle:nth-child(5) { animation-delay: 480ms; }
+.session-status-ring circle:nth-child(6) { animation-delay: 600ms; }
+.session-status-ring circle:nth-child(7) { animation-delay: 720ms; }
+.session-status-ring circle:nth-child(8) { animation-delay: 840ms; }
+
+.session-status-dot {
+  display: block;
+}
+
+.session-status-success {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--success) 25%, transparent);
+}
+
+/* 顶部通知只做一次轻量下落，避免抢占聊天消息布局。 */
+@keyframes notice-slide-in {
+  from { opacity: 0; transform: translateY(-0.75rem); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.notice-enter {
+  animation: notice-slide-in 180ms ease-out both;
+}
+
+/* RAG 入库只显示当前阶段；橙色脉冲块反复轻扫，不伪装成整体完成百分比。 */
+@keyframes knowledge-ingest-sweep {
+  0% { opacity: 0.25; transform: translateX(-110%); }
+  45% { opacity: 1; }
+  100% { opacity: 0.25; transform: translateX(310%); }
+}
+
+.knowledge-ingest-sweep {
+  animation: knowledge-ingest-sweep 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .notice-enter { animation: none; }
+  .session-status-ring circle { animation: none; opacity: 1; }
+  .knowledge-ingest-sweep { animation: none; opacity: 0.7; transform: translateX(100%); }
+}
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--ink); }
+
+::selection {
+  background-color: #e85a1a;
+  color: #ffffff;
+}
+.article-content::selection {
+  background-color: #3b82f6;
+  color: #ffffff;
+}
+::-moz-selection {
+  background-color: #e85a1a;
+  color: #ffffff;
+}

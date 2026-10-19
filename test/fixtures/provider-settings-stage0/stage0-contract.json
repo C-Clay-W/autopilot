@@ -1,0 +1,81 @@
+{
+  "fixtureVersion": 1,
+  "provider": {
+    "internalType": "firstParty",
+    "protocol": "Anthropic Messages API",
+    "excludedFromCurrentPlan": ["bedrock", "vertex", "foundry", "openai", "gemini"]
+  },
+  "scope": {
+    "userOnlyEnv": [
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_AUTH_TOKEN",
+      "ANTHROPIC_API_KEY",
+      "ANTHROPIC_MODEL",
+      "ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+      "CLAUDE_CODE_SUBAGENT_MODEL",
+      "CLAUDE_CODE_EFFORT_LEVEL",
+      "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+      "API_TIMEOUT_MS"
+    ],
+    "projectAndLocal": {
+      "maySelect": ["model"],
+      "mustNotInject": ["endpoint", "credential", "env"]
+    }
+  },
+  "modelResolution": {
+    "primaryPrecedence": ["session-or-cli-override", "env.ANTHROPIC_MODEL", "model"],
+    "aliases": {
+      "opus": "env.ANTHROPIC_DEFAULT_OPUS_MODEL",
+      "sonnet": "env.ANTHROPIC_DEFAULT_SONNET_MODEL",
+      "haiku": "env.ANTHROPIC_DEFAULT_HAIKU_MODEL"
+    },
+    "subagent": "env.CLAUDE_CODE_SUBAGENT_MODEL or resolved primary model",
+    "vision": "current resolved model only; no dedicated vision model or automatic model switch"
+  },
+  "effort": {
+    "topLevelAccepted": ["low", "medium", "high"],
+    "envAccepted": ["auto", "unset", "low", "medium", "high", "max"],
+    "topLevelMax": "preserve with warning; do not apply",
+    "autoOrUnset": "omit explicit effort",
+    "maxWithoutVerifiedSupport": {
+      "requested": "max",
+      "effective": "high",
+      "diagnostic": "REASONING_EFFORT_CLAMPED"
+    },
+    "rejected": ["xhigh", "ultra"],
+    "messagesField": "output_config.effort",
+    "legacyOpenAIField": "reasoning_effort is not permitted on the future primary Agent path"
+  },
+  "paths": {
+    "homeSource": "os.homedir()",
+    "userSettings": ".autopilot/settings.json",
+    "homeFallback": "forbidden",
+    "unsafeEntries": ["symlink", "junction", "reparse-point", "unknown-file-type"],
+    "unsafeEntryPolicy": "fail-closed",
+    "errors": [
+      "AUTOPILOT_HOME_UNRESOLVED",
+      "AUTOPILOT_CONFIG_ROOT_NOT_DIRECTORY",
+      "AUTOPILOT_CONFIG_ROOT_UNSAFE_LINK",
+      "AUTOPILOT_CONFIG_ROOT_UNAVAILABLE",
+      "SETTINGS_FILE_UNSAFE_LINK"
+    ]
+  },
+  "diagnosticSafety": {
+    "allowedFields": ["scope", "code", "field"],
+    "forbiddenValues": ["credential", "endpoint", "home-path", "provider-raw-body"]
+  },
+  "platformMatrix": {
+    "node": ">=20 <22",
+    "npm": "10.8.2",
+    "win32": {
+      "stage0": ["fixture", "CI-and-acceptance-checklist"],
+      "execution": "Stage 1-6 platform-relevant automated checks"
+    },
+    "darwin": {
+      "stage0": ["fixture", "runner-and-manual-checklist"],
+      "execution": "Stage 7 native automated and manual acceptance"
+    }
+  }
+}

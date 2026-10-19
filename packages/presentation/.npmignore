@@ -1,0 +1,13 @@
+# npm 发布排除项；对应 package.json.files 同步排除，开发文件仍保留在仓库。
+**/*.map
+**/*.{test,spec,bench}.*
+**/*-fixture*.*
+**/{test,tests,test-*,__tests__,__mocks__,contract-test,fixtures,coverage,playwright-report,test-results}/**
+**/{agent,agents,.agent-tests,.agents,.codex,.cursor,.idea,.vscode}/**
+**/{.git,.hg,.svn,.github,.gitlab}/**
+**/{.local,.autopilot,.cache,.npm-cache,.turbo,.next,.vite,__pycache__,node_modules,src,dist-types}/**
+**/*.{log,tsbuildinfo,tmp,temp,bak,orig,rej,swp,swo,pyc,pyo,tgz,tar,zip,7z,rar,db,sqlite,sqlite3,wal,shm}
+**/*.{pem,key,p12,pfx,crt,cer}
+**/{.env*,.npmrc*,.yarnrc*,.pnp.*,AGENTS.md,CLAUDE.md,.DS_Store,Thumbs.db}
+**/{settings.json,settings.local.json,mcp.json,credentials.json,credentials.local.json,package-lock.json,npm-shrinkwrap.json,yarn.lock,pnpm-lock.yaml,bun.lockb}
+**/{tsconfig*,vitest.config.*,vite.config.*,playwright.config.*,eslint.config.*,jest.config.*,turbo.json}
