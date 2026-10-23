@@ -8,13 +8,20 @@ Autopilot 是一个包含 core（无头 Agent Kernel）、cli（终端交互）�
 
 ---
 
-## [Unreleased]
+## [0.2.0] - 2026-10-23
 
 ### 新增
-- GitHub 开源准备（2026-10-19）：完成仓库治理与发布流程定版（单开发主线 + 白名单导出 + 独立公开历史）。
+- Web Work 内置网页预览面板，支持手动打开和 Agent 发起预览。
+- 工具执行过程信息展示。
 
-### 变更
-- macOS 外部权限支持维持 DEFERRED（裁决暂缓，不计入交付范围）。
+### 修复
+- Windows 下 npm、npx、pnpm 命令及 MCP 启动异常。
+- 预览会话切换、窄屏布局、拖拽调整、取消导航与结果入口异常。
+- 权限配置错误被误判为模型配置错误的问题。
+
+### 调整
+- Windows 移除进程沙箱，改为逐次审批后以当前用户权限直接执行，并明确显示未隔离状态。
+- macOS 继续使用 Seatbelt 沙箱。
 
 ---
 
@@ -23,22 +30,28 @@ Autopilot 是一个包含 core（无头 Agent Kernel）、cli（终端交互）�
 发布包：`autopilot-agent`、`@autopilot-agent/core`、`@autopilot-agent/adapters`、`@autopilot-agent/presentation`、`@autopilot-agent/cli`，入口命令 `ap` / `autopilot`。
 
 ### 新增 — 沙箱与安全
-- 沙箱体系 Stage 0–6：macOS Spike 验证、Core 沙箱契约、Node Adapter 与双平台初始化入口、前台 `run_command` 隔离执行与审批自动放行、后台 Job 全生命周期隔离、文件 mutation policy 与删除边界、本地 MCP server 隔离。
+- 沙箱体系：macOS Spike 验证、Core 沙箱契约、Node Adapter 与双平台初始化入口、前台 `run_command` 隔离执行与审批自动放行、后台 Job 全生命周期隔离、文件 mutation policy 与删除边界、本地 MCP server 隔离。
 - Windows 适配：Windows Adapter 接入、原生门禁、host MCP 环境白名单与 libuv 环境隔离修复、Windows 私有 Job 句柄控制与跨平台停止源码。
 - 沙箱不可用时 fail-closed（workspace-write 降级为审批模式并明确拒绝终态）。
+- Core 目标权限模型与文件工具改造、外部工作区权限拓宽、Runtime 权限投影与审批存储、CLI/Web 双端接入。
+- Web「记住此命令」：相同外部命令免重复审批。
+- 任务文件集合支持一次性批量审批（含外部文件集合一次审批）。
+- 沙箱启动失败自动降级为审批模式并明确拒绝终态。
 
 ### 修复
 - 并发场景下结果增量入账缺陷；`read_file`、CLI steer 展示与可选长任务限额问题；工具摘要与失败徽标展示；停止时绑定失败（保留活跃 wrapper）。
+- 授权状态保护缺口、D1 撤权恢复缺失、锁内授权绑定、Undo 重验（CR R2/R3/R5/R6）；跨 workspace/stateRoot 同目标锁竞争（R4）；workspace-write 沙箱不可用 fail-closed（CR R2）；Windows 包管理器直接执行受信解析（R3）；沙箱 prepare 重试与耗尽后 deny（R4）；活跃出口修复 + deny 诊断结构化（R5）；精确命令授权不再合并 macOS 上不同的实际程序（R6）；CLI 初始化错误根因修复；Web 中文工作区 `DIRECTORY_INVALID` 编码问题；运行时无法持续滚动到底部。
 
 ### 变更
 - 新增全仓构建打包手册 `BUILD.md`；`engines.node` 冻结为 `>=20.11.0 <22`。
+- Web Diff 侧边栏支持拖动调宽。
 
 ---
 
 ## [0.1.0-beta] - 2026-09-02（内部版本冻结）
 
 ### 新增
-- Provider Adapter V2 架构（Stage 0–6）：canonical 消息与迁移、`apiProtocol`/`credentialRef`/封闭 compat profile，Anthropic Messages 与 OpenAI Chat Completions 各自收口为唯一 Adapter，移除 Core 对第三方厂商名硬编码。
+- Provider Adapter V2 架构：canonical 消息与迁移、`apiProtocol`/`credentialRef`/封闭 compat profile，Anthropic Messages 与 OpenAI Chat Completions 各自收口为唯一 Adapter，移除 Core 对第三方厂商名硬编码。
 - Web Search 方案定版：DeepSeek Responses 原生 Search capability + 本地安全 `web_fetch`。
 - RAG 管线重建：独立 `database_search` Tool、PDF 批处理核心、Workspace 级 RAG Root/资源 manifest、关键词索引与向量空间复用、统一错误码。
 
@@ -93,7 +106,7 @@ Autopilot 是一个包含 core（无头 Agent Kernel）、cli（终端交互）�
 ## 0.1.0-beta 冻结后至 0.1.0 发布前的演进（2026-09-03 ~ 2026-10-09）
 
 ### 新增
-- Web Search First 收口（Stage 3–5）：安全 Web Fetch、Search First 行为、本机 Key 配置页。
+- Web Search First 收口：安全 Web Fetch、Search First 行为、本机 Key 配置页。
 - Chat/Work 分域与 RAG 归属纠偏：Chat 只读工具、RAG 证据门、错误协议统一；Web 区分 chat/work。
 - 真实 Rerank 供应商 Adapter（百炼）与 Web 可视化模型配置。
 - 后台任务操作闭环：CLI `/jobs` 管理、持续运行动画。
@@ -105,7 +118,6 @@ Autopilot 是一个包含 core（无头 Agent Kernel）、cli（终端交互）�
 - CLI `@文件` 提及全量落地（候选菜单、四档评分、提交注入上下文）。
 - 第三方模型 `contextWindowTokens` 通用适配。
 - Web 侧栏工作区分组折叠（持久徽标 + Ctrl+O）、模型回复复制按钮。
-- `/autopilot` 多会话自主工作流 Plan 定版；单独开源 CLI 的 npm 发布可行性定版。
 
 ### 变更
 - Chat RAG 资源入口统一到侧栏「资源目录」，退役旧 `/lancedb` 页面与 API。
@@ -114,19 +126,3 @@ Autopilot 是一个包含 core（无头 Agent Kernel）、cli（终端交互）�
 
 ### 修复
 - Windows 下 LanceDB 原生包缺失与用户级 settings.json 解析冲突；RAG 引用串码/表格格式（换用标准 Markdown 库）；TUI 跨显示器 resize 残帧、Logo 响应式列宽、scrollback 旧物理回流帧；CLI 命令审批与 full_access 核对；Turn 运行中手动 compact 未被拒绝的守卫缺口；mutation gate 自然语言误判；Web stalled 阈值对齐 CLI 20s；RAG 过程文案重复显示等系列问题。
-
----
-
-## [0.1.0] 发布后至开源准备（2026-10-12 ~ 2026-10-19）
-
-### 新增 — 1013 外部工作区权限系统
-- Core 目标权限模型与文件工具改造（Stage 1）、Runtime 权限投影与审批存储（Stage 2）、CLI/Web 双端接入（Stage 4）。
-- Web「记住此命令」：相同外部命令免重复审批。
-- 任务文件集合支持一次性批量审批（含外部文件集合一次审批）。
-- 沙箱启动失败自动降级为审批模式并明确拒绝终态。
-
-### 调整
-- Web Diff 侧边栏支持拖动调宽。
-
-### 修复
-- 授权状态保护缺口、D1 撤权恢复缺失、锁内授权绑定、Undo 重验（CR R2/R3/R5/R6）；跨 workspace/stateRoot 同目标锁竞争（R4）；workspace-write 沙箱不可用 fail-closed（CR R2）；Windows 包管理器直接执行受信解析（R3）；沙箱 prepare 重试与耗尽后 deny（R4）；活跃出口修复 + deny 诊断结构化（R5）；精确命令授权不再合并 macOS 上不同的实际程序（R6）；CLI 初始化错误根因修复；Web 中文工作区 `DIRECTORY_INVALID` 编码问题；运行时无法持续滚动到底部。

@@ -108,7 +108,9 @@ function renderPresentationItem(item: TimelineItem, useColor: boolean, maximumWi
     const detail = item.display?.actionPreview ?? item.display?.operation ?? "需要确认";
     // 历史行与待审卡共用 constraint 判定，普通批准与无沙箱批准不得混淆。
     const noSandbox = item.constraint === "no-sandbox-exec:v1" ? " · 无沙箱直接执行" : "";
-    return <Text key={item.id} dimColor={useColor}>⚠ {detail}{noSandbox}{item.state === "resolved" ? " · 已处理" : ""}</Text>;
+    // Talk-Plan1022 S3：宿主执行审批事实与 no-sandbox 降级卡分开呈现，措辞不宣称已执行。
+    const hostExecution = item.display?.executionMode === "unisolated" ? " · 将在当前用户权限下运行（未启用沙箱隔离）" : "";
+    return <Text key={item.id} dimColor={useColor}>⚠ {detail}{noSandbox}{hostExecution}{item.state === "resolved" ? " · 已处理" : ""}</Text>;
   }
   if (item.kind === "user_question") return <Text key={item.id} dimColor={useColor}>请在支持结构化回答的 Web 中处理</Text>;
   if (item.kind === "assistant_answer") {

@@ -5,7 +5,7 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { normalizeProviderBaseUrl, resolveAutopilotSettings } from "@autopilot-agent/core";
+import { isExternalPermissionDiagnostic, normalizeProviderBaseUrl, resolveAutopilotSettings, type SettingsDiagnostic } from "@autopilot-agent/core";
 import { atomicReplace, withFileLock } from "../file-utils";
 import { ensureUserConfigDirectory } from "./user-config-directory";
 import { resolveNodeUserSettingsPath } from "./node-settings-loader";
@@ -59,12 +59,21 @@ export interface WebSearchSettingsCategoryInput {
   apiKey?: string;
 }
 
-/** Web 设置页读取的安全快照；只包含连接元数据和凭据是否存在。 */
+/** 设置页可展示的脱敏诊断：只有错误码、字段路径与作用域，不含配置值。 */
+export interface UserSettingsDiagnostic {
+  code: string;
+  field?: string;
+  scope: string;
+}
+
+/** Web 设置页读取的安全快照；只包含连接元数据、凭据是否存在与权限段脱敏诊断。 */
 export interface UserSettingsStatus {
   revision: string;
   main: Omit<MainSettingsCategoryInput, "apiKey"> & { provider: "deepseek" | "custom"; configured: boolean };
   search: Omit<WebSearchSettingsCategoryInput, "apiKey"> & { configured: boolean };
   rag: Record<RagConnectionRole, RagSettingsCategoryConnectionInput & { configured: boolean }>;
+  /** 权限段单独隔离：模型字段仍可用，页面按类别说明不支持的字段与作用域。 */
+  diagnostics: UserSettingsDiagnostic[];
 }
 
 /** 主模型分类一次提交主连接与 Search，避免分类内两次写入产生修订竞争。 */
@@ -87,9 +96,29 @@ export interface MainModelCatalogResult {
 
 /** 用户设置保存错误；调用方只能按稳定码展示，不回显底层内容。 */
 export class NodeUserSettingsError extends Error {
-  constructor(public readonly code: "SETTINGS_INVALID" | "SETTINGS_CHANGED" | "SETTINGS_INPUT_INVALID" | "SETTINGS_KEY_REQUIRED" | "SETTINGS_MIGRATION_CONFLICT") {
+  constructor(
+    public readonly code: "SETTINGS_INVALID" | "SETTINGS_CHANGED" | "SETTINGS_INPUT_INVALID" | "SETTINGS_KEY_REQUIRED" | "SETTINGS_MIGRATION_CONFLICT",
+    /** 触发错误的脱敏诊断；只含错误码与字段路径，供页面指出具体字段。 */
+    public readonly diagnostic?: UserSettingsDiagnostic,
+  ) {
     super(code);
   }
+}
+
+/** 把 Core 诊断归约为不含配置值的安全三元组。 */
+function safeDiagnostic(diagnostic: SettingsDiagnostic): UserSettingsDiagnostic {
+  return { code: diagnostic.code, scope: diagnostic.scope, ...(diagnostic.field ? { field: diagnostic.field } : {}) };
+}
+
+/** 拆分可隔离的权限诊断与必须阻断的分类诊断。 */
+function splitDiagnostics(diagnostics: readonly SettingsDiagnostic[]): { blocking: SettingsDiagnostic[]; permissions: UserSettingsDiagnostic[] } {
+  const blocking: SettingsDiagnostic[] = [];
+  const permissions: UserSettingsDiagnostic[] = [];
+  for (const diagnostic of diagnostics) {
+    if (isExternalPermissionDiagnostic(diagnostic)) permissions.push(safeDiagnostic(diagnostic));
+    else blocking.push(diagnostic);
+  }
+  return { blocking, permissions };
 }
 
 /** 判断值是否为普通对象。 */
@@ -323,9 +352,9 @@ export function createNodeUserSettingsService(options: { homeDirectory?: string;
       const current = readUserSettings(settingsPath);
       assertRevision(current.original, revision);
       update(current.raw);
-      const resolved = resolveAutopilotSettings([{ scope: "user", value: current.raw }]);
-      const blockingDiagnostics = resolved.diagnostics;
-      if (blockingDiagnostics.length > 0) throw new NodeUserSettingsError("SETTINGS_INPUT_INVALID");
+      // 权限段问题不阻断模型/凭据保存：原 permissions 原样保留，不删除、不迁移、不扩大。
+      const { blocking } = splitDiagnostics(resolveAutopilotSettings([{ scope: "user", value: current.raw }]).diagnostics);
+      if (blocking.length > 0) throw new NodeUserSettingsError("SETTINGS_INPUT_INVALID", safeDiagnostic(blocking[0]!));
       const content = `${JSON.stringify(current.raw, null, 2)}\n`;
       atomicReplace(settingsPath, content);
       return { revision: revisionOf(content), configured: true };
@@ -358,8 +387,9 @@ export function createNodeUserSettingsService(options: { homeDirectory?: string;
       const raw = current.raw;
       const environment = isRecord(raw.env) ? raw.env : {};
       const resolved = resolveAutopilotSettings([{ scope: "user", value: raw }]);
-      const blockingDiagnostics = resolved.diagnostics;
-      if (blockingDiagnostics.length > 0) throw new NodeUserSettingsError("SETTINGS_INVALID");
+      const { blocking, permissions } = splitDiagnostics(resolved.diagnostics);
+      // 权限段错误不阻断安全模型状态读取；其他分类仍 fail-closed，并指出首个出错字段。
+      if (blocking.length > 0) throw new NodeUserSettingsError("SETTINGS_INVALID", safeDiagnostic(blocking[0]!));
       const mainBaseUrl = resolved.firstParty.baseUrl ?? "https://api.deepseek.com/anthropic";
       const mainModel = resolved.modelRef?.modelId ?? "deepseek-v4-flash";
       const mainKey = readEnvironmentKey(environment, "ANTHROPIC_AUTH_TOKEN") ?? readEnvironmentKey(environment, "ANTHROPIC_API_KEY");
@@ -407,6 +437,7 @@ export function createNodeUserSettingsService(options: { homeDirectory?: string;
           model: search?.model ?? "deepseek-v4-flash",
           configured: Boolean(search && searchKey),
         },
+        diagnostics: permissions,
         rag,
       };
     },

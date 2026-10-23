@@ -31,7 +31,9 @@ function renderTextEvent(event: CliPublicEvent): string {
     case "approval_required": {
       const cwd = event.display?.cwd ? ` · 工作目录：${event.display.cwd}` : "";
       const noSandbox = isNoSandboxApproval(event.constraint) ? " · 无沙箱直接执行，仅本次有效" : "";
-      return `approval ${event.approvalId}: ${event.toolName} ${event.reason}${cwd}${noSandbox}`;
+      // Talk-Plan1022 S3：宿主执行审批卡按"将采用"措辞说明无隔离事实，待审批不显示成已执行。
+      const hostExecution = event.display?.executionMode === "unisolated" ? " · 将在当前用户权限下运行（未启用沙箱隔离）" : "";
+      return `approval ${event.approvalId}: ${event.toolName} ${event.reason}${cwd}${noSandbox}${hostExecution}`;
     }
     case "input_queued": return `input queued: ${event.inputId} (${event.delivery})`;
     case "todo_updated": {

@@ -26,6 +26,8 @@ export interface FrozenRunConfig {
   capabilityCeiling?: import("./product-mode").CapabilityCeiling;
   /** 当前 Turn 的附件引用上限，继续运行不能引入新附件。 */
   chatAttachmentGrants?: readonly import("../protocol/chat-capability").ChatAttachmentGrant[];
+  /** 当前 Turn 冻结的 Work 预览能力开关；旧记录缺失按 false，仅受信 Host 计算，override 不可开启。 */
+  workPreviewEnabled?: boolean;
 
   /** 模型引用；冻结时已解析，可能为 undefined（表示使用 Runtime 默认 sampler）。 */
   modelRef?: ModelRef;
@@ -69,4 +71,10 @@ export interface FrozenRunConfig {
   sandboxPolicyDigest?: string;
   /** 沙箱冻结语义版本；缺省表示需要在恢复边界迁移。 */
   sandboxPolicyVersion?: 1;
+  /**
+   * Talk-Plan1022 R2：本次 Turn 的有效进程执行方式。新 Turn 由受信宿主的 SandboxPort
+   * 静态声明冻结，整个 Turn 生命周期不可变；恢复时必须与当前 Port 一致，否则拒绝继续
+   * （旧沙箱 Turn/checkpoint 不得静默转成宿主执行）。缺省表示升级前的沙箱时代记录。
+   */
+  processExecution?: "sandbox" | "host";
 }

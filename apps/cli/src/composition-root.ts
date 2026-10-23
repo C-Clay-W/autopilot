@@ -19,6 +19,7 @@ import {
   type ResolvedAutopilotSettings,
   type SafeBootstrapConfig,
   type SandboxCapabilityReport,
+  type SandboxPort,
   type WorkspaceTrustEntry,
   type WorkspaceTrustPolicy,
   getMcpServerGrantConstraint,
@@ -29,6 +30,7 @@ import type { CliRuntimeStatusDefaults, CliSkillSummary } from "./types.js";
 import {
   createNodeCredentialStore,
   createNodeCapabilityLoader,
+  createNodeHostExecutionSandboxPort,
   createNodeSandboxPort,
   createNodeSettingsLoader,
   createNodeSettingsWriter,
@@ -331,9 +333,18 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
   }
 
   /** 惰性创建的沙箱查询端口；绑定当前 canonical workspaceRoot，同一 root 复用实例。 */
-  let sandboxPort: ReturnType<typeof createNodeSandboxPort> | undefined;
+  let sandboxPort: SandboxPort | undefined;
   let sandboxPortRoot: string | undefined;
-  function getSandboxPort(workspaceRoot: string): ReturnType<typeof createNodeSandboxPort> {
+  function getSandboxPort(workspaceRoot: string): SandboxPort {
+    // Talk-Plan1022 S1：Windows 宿主执行模式——status/setup/doctor 只报告停用事实，
+    // 不加载 SRT、不触发 UAC provision；macOS 装配保持不变。
+    if (process.platform === "win32") {
+      if (!sandboxPort || sandboxPortRoot !== workspaceRoot) {
+        sandboxPort = createNodeHostExecutionSandboxPort();
+        sandboxPortRoot = workspaceRoot;
+      }
+      return sandboxPort;
+    }
     if (!sandboxPort || sandboxPortRoot !== workspaceRoot) {
       sandboxPort = createNodeSandboxPort({
         workspaceRoot,

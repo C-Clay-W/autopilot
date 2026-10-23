@@ -29,8 +29,11 @@ export async function resolveTurnCapabilities(input: {
   }
   let ceiling = restrictCapabilityCeiling(identity, previous?.allowedTools, runtimeDefault.toolAllowlist, override?.toolAllowlist);
   if (identity.productMode === "work") {
-    const capabilities = { ...runtimeDefault, ...override, rag: undefined, chatLoader: undefined, ragSourcePolicy: undefined, rerankPolicy: undefined, focusedPdfFileName: undefined };
+    // Work 预览能力只从受信宿主 runtimeDefault 装配；override 不可注入或替换，
+    // 旧 Turn（冻结缺失/禁用）不开新能力，禁用或宿主移除时明确不可用且不换 OS opener。
+    const capabilities: TurnCapabilities = { ...runtimeDefault, ...override, rag: undefined, chatLoader: undefined, ragSourcePolicy: undefined, rerankPolicy: undefined, focusedPdfFileName: undefined, workPreview: undefined, workPreviewLoader: undefined };
     if (capabilities.webLoader) capabilities.web = await capabilities.webLoader();
+    if (input.frozen.workPreviewEnabled === true) capabilities.workPreview = await runtimeDefault.workPreviewLoader?.();
     return { capabilities, frozen: { ...input.frozen, workContextVersion: 1, ragSourcePolicy: undefined, rerankPolicy: undefined, capabilityCeiling: ceiling } };
   }
   const binding: ChatCapabilityBinding = { sessionId: session.id, turnId, retrievalMode: identity.chatRetrievalMode! };
@@ -67,5 +70,5 @@ export async function resolveTurnCapabilities(input: {
     web,
     chatCapability,
   };
-  return { capabilities, frozen: { ...input.frozen, workspaceRoot: undefined, workspaceTrusted: false, permissionMode: "ask", databaseSearchPolicy: { enabled: false }, ragSourcePolicy: undefined, rerankPolicy: undefined, capabilityCeiling: ceiling, chatAttachmentGrants: grants } };
+  return { capabilities, frozen: { ...input.frozen, workspaceRoot: undefined, workspaceTrusted: false, permissionMode: "ask", workPreviewEnabled: false, databaseSearchPolicy: { enabled: false }, ragSourcePolicy: undefined, rerankPolicy: undefined, capabilityCeiling: ceiling, chatAttachmentGrants: grants } };
 }

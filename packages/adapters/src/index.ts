@@ -23,9 +23,8 @@ export { createNodeSessionResourceStore } from "./node/stores/node-session-resou
 export { createNodeUserQuestionStore } from "./node/stores/node-user-question-store";
 export type { NodeRuntimePortsOptions } from "./node/create-node-runtime-ports";
 export { createNodeSandboxPort, serializePosixCommand, buildSrtRuntimeConfig } from "./node/sandbox/node-sandbox-port";
+export { createNodeHostExecutionSandboxPort } from "./node/sandbox/node-host-execution-sandbox-port";
 export type { NodeSandboxPortOptions } from "./node/sandbox/node-sandbox-port";
-export { readWindowsSandboxCapability, runWindowsSandboxSetup } from "./node/sandbox/windows-sandbox-setup";
-export type { WindowsSandboxSetupOptions } from "./node/sandbox/windows-sandbox-setup";
 export { createNodeCapabilityLoader } from "./node/create-node-capability-loader";
 export type { NodeCapabilityLoader } from "./node/create-node-capability-loader";
 export { createNodeRagRuntime } from "./node/rag/node-rag-runtime";

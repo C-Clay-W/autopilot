@@ -38,7 +38,7 @@ export type { CreateDatabaseSearchCapabilityOptions, DatabaseAggregationKeyword,
 
 // ── Runtime 公开 Facade（Phase 2 / Phase 3）───────────
 export { createAgentRuntime } from "./runtime/public";
-export { JOB_RECORD_VERSION } from "./runtime/domain";
+export { JOB_RECORD_VERSION, normalizeJobServiceUrl, jobServicePort, sameServiceOrigin } from "./runtime/domain";
 export type { AgentRuntime, AgentRuntimeFacade, CreateAgentRuntimeOptions } from "./runtime/public";
 export type {
   Session,
@@ -291,6 +291,7 @@ export type {
 export {
   normalizeProviderBaseUrl,
   resolveAutopilotSettings,
+  isExternalPermissionDiagnostic,
 } from "./runtime/config/autopilot-settings";
 export type {
   AutopilotSettingsScope,
@@ -741,3 +742,4 @@ export type { ExternalExecutionTarget, ExternalExecutionApproval, ExternalExecut
 export type { ExternalFileApproval } from "./runtime/domain/external-permissions";
 export type { SandboxDegradeApproval } from "./runtime/domain/sandbox-policy";
 export type { ChatCapability, ChatCapabilityBinding, ChatAttachmentGrant, ChatKnowledgeCapability, ChatRagEvidence, ChatRagEvidenceBatch } from "./runtime/protocol/chat-capability";
+export type { WorkPreviewCapability, WorkPreviewPrepareRequest, WorkPreviewPrepareResult, WorkPreviewOpenWhen } from "./runtime/protocol/work-preview-capability";

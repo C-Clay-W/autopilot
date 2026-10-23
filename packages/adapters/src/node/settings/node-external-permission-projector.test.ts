@@ -77,6 +77,29 @@ describe("createNodeExternalPermissionProjector", () => {
     expect(resolveAutopilotSettings([{ scope: "local", value: { permissions: { allow: ["Read(C:\\outside\\c.txt)"] } } }]).permissions.allow).toEqual(["Read(C:\\outside\\c.txt)"]);
   });
 
+  it("H3：deny/ask 无法解释时 read 标记 restricted 并拒绝写入", async () => {
+    const { workspaceRoot, home, projector, localPath } = await createProjectorFixture();
+    const userSettingsDir = path.join(home, ".autopilot");
+    await mkdir(userSettingsDir, { recursive: true });
+    await writeFile(path.join(userSettingsDir, "settings.json"), JSON.stringify({ permissions: { deny: ["Bash(rm -rf /)"] } }), "utf8");
+    const snapshot = await projector.read(workspaceRoot);
+    expect(snapshot.restricted).toBe(true);
+    expect(snapshot.deny).toEqual([]);
+
+    await mkdir(path.dirname(localPath), { recursive: true });
+    await writeFile(localPath, JSON.stringify({ permissions: { deny: ["Bash(ls)"] } }), "utf8");
+    await expect(projector.project({ workspaceRoot, rule: "Write(C:\\outside\\a.txt)", action: "add" })).rejects.toThrow("EXTERNAL_RULE_PERMISSIONS_UNSAFE");
+  });
+
+  it("H3：现有 permissions 不是对象时拒绝写入并保留原字节", async () => {
+    const { workspaceRoot, projector, localPath } = await createProjectorFixture();
+    await mkdir(path.dirname(localPath), { recursive: true });
+    const original = JSON.stringify({ permissions: ["Read(C:\\outside\\a.txt)"] });
+    await writeFile(localPath, original, "utf8");
+    await expect(projector.project({ workspaceRoot, rule: "Write(C:\\outside\\a.txt)", action: "add" })).rejects.toThrow("EXTERNAL_RULE_PERMISSIONS_UNSAFE");
+    expect(fs.readFileSync(localPath, "utf8")).toBe(original);
+  });
+
   it("env 真实工作区冒烟：只读 AGENT_WORKSPACE_ROOT 快照与外部规则格式（env 缺失跳过，不写真实配置）", async () => {
     const realWorkspaceRoot = process.env.AGENT_WORKSPACE_ROOT;
     const realOutsideRoot = process.env.AGENT_WORKSPACE_ROOT_OUTSIDE;

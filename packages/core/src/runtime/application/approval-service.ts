@@ -323,6 +323,8 @@ export function createApprovalService(dependencies: ApprovalServiceDependencies)
     const projector = dependencies.externalRuleProjector;
     if (!projector) return false;
     const snapshot = await projector.read(input.workspaceRoot);
+    // 快照无法完整解释 deny/ask 时不能证明收窄范围，任何持久放行都不成立（fail-closed）。
+    if (snapshot.restricted === true) return false;
     const rule = isExternalExecutionConstraint(input.constraint) ? grant.externalRule! : formatExternalFileRule(input.toolName, input.constraint);
     if ([...snapshot.deny, ...(snapshot.ask ?? [])].some((restriction) => externalRuleCoversRule(restriction, rule))) return false;
     if (grant.scope === "allow_session") return true;

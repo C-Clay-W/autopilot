@@ -13,7 +13,7 @@ import type { AgentRuntime } from "../public";
 import type { CreateAgentRuntimeOptions } from "../public/create-agent-runtime";
 import type { RuntimePorts } from "../ports";
 import type { WorkspaceAdapter } from "../ports/workspace-adapter";
-import type { RunConfig, McpCapability, WebCapability } from "../protocol";
+import type { RunConfig, McpCapability, WebCapability, WorkPreviewCapability } from "../protocol";
 import type { AgentContextSnapshot } from "../../internal/agent-context";
 import type { AgentSkillsCapability } from "../../internal/tools/builtins/skill-tool";
 import type { AgentInputInboxCapability } from "../../internal/agent-runtime";
@@ -45,6 +45,9 @@ export interface CapabilityLoader {
 
   /** 加载 durable inbox capability。 */
   loadInputInbox?(workspaceRoot: string): Promise<AgentInputInboxCapability> | AgentInputInboxCapability;
+
+  /** 加载 Work 内置预览能力；只有 Web Work 宿主实现，Trust 后调用，Chat/CLI 不提供。 */
+  loadWorkPreview?(workspaceRoot: string): Promise<WorkPreviewCapability | undefined> | WorkPreviewCapability | undefined;
 }
 
 /** Bootstrap 阶段事件，供宿主观察启动进度。 */
@@ -145,7 +148,7 @@ export function createRuntimeBootstrapService(
     emit({ phase: "runtime", message: "加载 Runtime 依赖与能力", workspaceRoot });
 
     // trust 建立后才能加载 Provider / MCP / Skill / Context 等能力。
-    const [ports, provider, mcp, web, databaseSearch, skills, context, inputInbox] = await Promise.all([
+    const [ports, provider, mcp, web, databaseSearch, skills, context, inputInbox, workPreview] = await Promise.all([
       Promise.resolve(createPorts(workspaceRoot)),
       capabilityLoader?.loadProvider ? Promise.resolve(capabilityLoader.loadProvider(workspaceRoot)) : Promise.resolve(undefined),
       capabilityLoader?.loadMcp ? Promise.resolve(capabilityLoader.loadMcp(workspaceRoot)) : Promise.resolve(undefined),
@@ -154,6 +157,7 @@ export function createRuntimeBootstrapService(
       capabilityLoader?.loadSkills ? Promise.resolve(capabilityLoader.loadSkills(workspaceRoot)) : Promise.resolve(undefined),
       capabilityLoader?.loadContext ? Promise.resolve(capabilityLoader.loadContext(workspaceRoot)) : Promise.resolve(undefined),
       capabilityLoader?.loadInputInbox ? Promise.resolve(capabilityLoader.loadInputInbox(workspaceRoot)) : Promise.resolve(undefined),
+      capabilityLoader?.loadWorkPreview ? Promise.resolve(capabilityLoader.loadWorkPreview(workspaceRoot)) : Promise.resolve(undefined),
     ]);
 
     const runtimeOptions: CreateAgentRuntimeOptions = {
@@ -169,6 +173,7 @@ export function createRuntimeBootstrapService(
         mcp: mcp ?? defaultRunConfig?.mcp,
         rag: undefined,
         web,
+        workPreview: workPreview ?? defaultRunConfig?.workPreview,
         webLoader: capabilityLoader?.loadWeb
           ? async function reloadTrustedWeb() {
               const currentTrust = await trustPolicy.getTrustStatus(workspaceRoot);
@@ -178,6 +183,15 @@ export function createRuntimeBootstrapService(
               return capabilityLoader.loadWeb!(workspaceRoot);
             }
           : defaultRunConfig?.webLoader,
+        workPreviewLoader: capabilityLoader?.loadWorkPreview
+          ? async function reloadTrustedWorkPreview() {
+              const currentTrust = await trustPolicy.getTrustStatus(workspaceRoot);
+              if (!config.skipTrustCheck && currentTrust.status !== "trusted") {
+                throw new WorkspaceTrustError(workspaceRoot, currentTrust.status, "工作区信任已失效");
+              }
+              return capabilityLoader.loadWorkPreview!(workspaceRoot);
+            }
+          : defaultRunConfig?.workPreviewLoader,
         databaseSearch,
         skills,
         context,

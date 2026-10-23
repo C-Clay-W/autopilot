@@ -23,11 +23,14 @@ export interface SandboxExecutionBinding {
   tempRoot?: string;
 }
 
-/** ToolExecutor 解析 capability 后传给进程类工具的执行范围；缺失即无法提供已隔离执行。 */
-export interface SandboxExecutionScope {
-  port: SandboxPort;
-  policy: SandboxPolicy;
-}
+/**
+ * ToolExecutor 解析执行方式后传给进程类工具的执行范围；缺失即无法提供任何受控执行。
+ * Talk-Plan1022 S1：Windows 宿主执行是第二形态——`execution:"host"` 无 port，表示经用户
+ * 逐次审批后在宿主直接执行（无 OS 隔离）；缺省形态仍为沙箱执行，port 必须存在。
+ */
+export type SandboxExecutionScope =
+  | { execution?: "sandboxed"; port: SandboxPort; policy: SandboxPolicy }
+  | { execution: "host"; policy: SandboxPolicy };
 
 export type ToolPermissionDecision = "allow" | "approval_required" | "deny";
 export type ToolApprovalDecision = "allow_once" | "allow_session" | "allow_workspace" | "deny";
@@ -144,6 +147,21 @@ export type ToolDisplayDetail =
       contentType: string;
       /** Adapter 或 Core 是否裁剪了响应。 */
       truncated: boolean;
+    }
+  | {
+      kind: "open_preview";
+      /** 宿主签发的稳定预览引用；opaque ID，可安全进入展示与事件。 */
+      previewId: string;
+      /** 面板展示用的安全主机标签（hostname[:port]），不含路径、凭据或内部映射。 */
+      hostLabel: string;
+      /** 宿主批准的实际页面地址；与导航地址严格一致，供本轮结果尾部复制。 */
+      copyUrl: string;
+      openWhen: import("../../runtime/protocol/work-preview-capability").WorkPreviewOpenWhen;
+      state: "prepared";
+      /** 宿主核验后绑定的后台 Job；机器字段，不要求页面展示。 */
+      jobId?: string;
+      /** false 表示无法证明服务归属，只能由用户显式打开。 */
+      autoOpen?: boolean;
     };
 
 /** 后台 Job 工具的安全展示事实；programLabel 仅为脱敏 executable basename，不包含参数、路径、PID、owner 或输出正文。 */
@@ -192,6 +210,19 @@ export interface ApprovalDisplayFacts {
   cwd?: string;
   /** 命令声明外部效果但未声明精确目标（如解释器 -e 脚本）：修改范围无法精确限定，展示层据此给出未知范围提示，不得宣称"仅覆盖精确目标"。 */
   unknownScope?: boolean;
+  /**
+   * Talk-Plan1022 S3：待审批调用将采用的执行方式（进程类工具由 ToolExecutor 注入）。
+   * unisolated 时展示层必须说明"将在当前用户权限下运行，未启用沙箱隔离"——措辞用"将"，
+   * 待审批不得显示成已执行；缺省表示该审批不携带执行方式事实。
+   */
+  executionMode?: ToolDisplayFacts["executionMode"];
+  /**
+   * Talk-Plan1022 CR C4：本次审批来自受信宿主执行 port 的逐次确认（Windows 停用进程沙箱）。
+   * 只有该分支设置本字段；展示层不得用通用的 executionMode=unisolated 反推平台与授权时长
+   * （macOS 的 danger-full-access 也会产生 unisolated）。同时表示声明目标只是预期范围，
+   * 进程未受该文件范围约束。
+   */
+  hostExecution?: true;
   allowedDecisions: ToolApprovalDecision[];
 }
 
@@ -396,6 +427,8 @@ export interface AgentToolDefinition<TInput, TOutput> {
   createActionFacts(input: TInput, context: ToolExecutionContext): ToolActionFacts | Promise<ToolActionFacts>;
   execute(input: TInput, context: ToolExecutionContext): Promise<TOutput>;
   serializeOutput(output: TOutput): unknown;
+  /** 可选的专用展示明细投影；从原始执行结果生成受控明细，模型 serialized 输出不携带这些字段。 */
+  projectDisplayDetail?(output: TOutput): ToolDisplayDetail | undefined;
   /** 交互型工具可将可信执行结果转换为非 success 终态；普通工具不实现该钩子。 */
   createExecutionResult?(input: TInput, output: TOutput, context: {
     callId: string;

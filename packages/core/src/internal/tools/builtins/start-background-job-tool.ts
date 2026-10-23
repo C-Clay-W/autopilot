@@ -16,6 +16,8 @@ const schema = z.object({
   args: z.array(z.string().max(4_000)).max(50).default([]),
   cwd: z.string().min(1).default("."),
   externalWriteTarget: z.string().min(1).max(4_000).optional(),
+  /** 声明的本机服务地址（loopback http(s) origin）；仅用于预览归属核验，不授予任何权限。 */
+  serviceUrl: z.string().min(1).max(2_048).optional(),
 }).strict();
 /** 审批恢复复用同一严格schema/defaults，不另造输入哈希语义。 */
 export const startBackgroundJobSchema = schema;
@@ -41,7 +43,7 @@ export function createStartBackgroundJobTool(input: { jobs: JobService; workspac
         ...(target ? { externalMutation: true, externalExecutionTarget: target } : {}),
         hardDenyReason: result.decision === "deny" ? result.reason : undefined,
         requiresApproval: result.decision !== "deny",
-        approval: { reason: target ? "后台命令请求修改一个工作区外精确文件，需要明确用户授权" : result.reason, preview: { program: value.program, args: value.args, cwd: value.cwd, background: true, ...(target ? { externalWriteTarget: externalExecutionTargetLabel(target), operation: "write" } : {}) } },
+        approval: { reason: target ? "后台命令请求修改一个工作区外精确文件，需要明确用户授权" : result.reason, preview: { program: value.program, args: value.args, cwd: value.cwd, background: true, ...(value.serviceUrl ? { serviceUrl: value.serviceUrl } : {}), ...(target ? { externalWriteTarget: externalExecutionTargetLabel(target), operation: "write" } : {}) } },
       };
     },
     /** PolicyEngine 放行且沙箱范围已解析后才调用 JobService，防止后台路径绕开命令策略或沙箱。 */
@@ -49,16 +51,18 @@ export function createStartBackgroundJobTool(input: { jobs: JobService; workspac
       // 与 run_command 相同的 fail-closed：绕过 ToolExecutor 的直接调用缺少已解析沙箱范围时不启动进程。
       const sandbox = context.sandboxPolicy;
       if (!sandbox) throw createToolError(SANDBOX_ERROR_CODES.UNAVAILABLE, "沙箱未就绪，无法提供已隔离执行，后台 Job 未启动");
+      // Talk-Plan1022 S2：把 S1 审批链核验后的执行范围原样贯穿 JobService——沙箱形态携带 port，
+      // 宿主形态（Windows 宿主执行）无 port、由 JobService 以受信解析 spawn 并在摘要标记 execution:"host"。
       await claimExternalWriteCapability("start_background_job", value, context);
       let job: Job;
       try {
-        job = await input.jobs.start({ ...input, ...value, toolCallId: context.toolCallId, signal: context.signal, sandbox: { port: sandbox.port, policy: sandbox.policy } });
+        job = await input.jobs.start({ ...input, ...value, toolCallId: context.toolCallId, signal: context.signal, sandbox });
       } catch (error) {
         // JobService 透出的稳定沙箱错误码必须原样投影为工具错误码，不得降级为通用执行失败。
         if (error instanceof SandboxPortError) throw createToolError(error.code, error.message);
         throw error;
       }
-      return { jobId: job.id, status: job.status, startedAt: job.startedAt, sandbox: { mode: sandbox.policy.mode } };
+      return { jobId: job.id, status: job.status, startedAt: job.startedAt, sandbox: { mode: sandbox.policy.mode, ...(sandbox.execution === "host" ? { execution: "host" as const } : {}) } };
     },
     serializeOutput(output) { return output; },
   };

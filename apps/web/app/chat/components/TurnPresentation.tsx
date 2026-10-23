@@ -12,9 +12,12 @@ import ApprovalCard from "./ApprovalCard";
 import AskUserQuestionCard, { type UserQuestionAnswerDraft } from "./AskUserQuestionCard";
 import ToolCard, { collapseRepeatedToolNames, ToolNameLabel } from "./ToolCard";
 import type { WebActivityState } from "../../../lib/runtime-host/web-activity";
+import WorkPreviewResultActions from "./WorkPreviewResultActions";
+import { selectTurnPreviewDelivery, type WorkPreviewViewProps } from "../work-preview-state";
 import {
   selectTurnTimeline,
   selectToolCalls,
+  selectToolProgress,
   type AgentPresentationState,
   type ApprovalItem,
   type ThinkingItem,
@@ -26,6 +29,17 @@ import {
 } from "@autopilot-agent/presentation";
 
 type TurnTimelineItem = Extract<TimelineItem, { turnId: string }>;
+
+/** 简短行动属于用户进展，独立于思考开关；内部标注系统来源且不写回 transcript。 */
+function ToolProgress({ state, item, children, enabled }: { state: AgentPresentationState; item: TimelineItem; children: ReactNode; enabled: boolean }) {
+  if (!enabled) return <>{children}</>;
+  const progress = selectToolProgress(state, item);
+  return <section data-progress-source={progress?.source}>
+    {progress?.action && <p className="mt-3 text-sm text-ink">{progress.action}</p>}
+    {children}
+    {progress?.outcome && <p className="mt-1 text-xs text-muted">{progress.outcome}</p>}
+  </section>;
+}
 
 /** 判断时间线节点是否属于指定 Turn，排除没有 Turn 身份的 Host 通知。 */
 function belongsToTurn(item: TimelineItem, turnId: string): item is TurnTimelineItem {
@@ -49,6 +63,8 @@ interface TurnPresentationProps {
   activity?: WebActivityState;
   /** 打开同一 Work Session 中由安全工具事实引用的后台 Job。 */
   onOpenBackgroundJob?: (jobId: string) => void;
+  /** Work 内置预览接线；未传（Chat）时不渲染结果尾部预览操作。 */
+  workPreview?: WorkPreviewViewProps;
   onApprovalDecision: (approval: ApprovalItem, decision: "allow_once" | "allow_session" | "allow_workspace" | "deny") => void;
   onUserQuestionSubmit: (question: UserQuestionItem, answers: UserQuestionAnswerDraft[]) => Promise<void>;
   onUserQuestionCancel: () => void;
@@ -85,6 +101,18 @@ function formatTermination(termination: AgentTerminationView): string {
     ? `${termination.budget.used} / ${termination.budget.limit} ${termination.budget.unit}`
     : undefined;
   return [reason, canContinue, budget].filter(Boolean).join(" · ");
+}
+
+/** 失败标题按结构化类别区分；沙箱不可用属于环境阻塞，不是模型配置问题。 */
+function getFailureTitle(code: WebTurnFailure["code"]): string {
+  if (code === "MISSING_CREDENTIAL") return "需要配置主模型 API Key";
+  if (code === "SANDBOX_UNAVAILABLE") return "本机沙箱不可用，命令未执行";
+  return "任务执行失败";
+}
+
+/** 只有真实凭据或模型配置错误才引导到设置页；其他失败不把用户带去无关配置。 */
+function needsSettingsEntry(code: WebTurnFailure["code"]): boolean {
+  return code === "MISSING_CREDENTIAL" || code === "PROVIDER_CONFIGURATION_INVALID";
 }
 
 /** 根据工具组展开状态绘制 12px 文件夹图标，固定 viewBox 防止展开前后基线错位。 */
@@ -170,8 +198,8 @@ function ThinkingSummary({ item, toolNames }: { item: ThinkingItem; toolNames: s
 }
 
 /** 将已重置的安全回答按既有正文样式保留在时间线，过程通道只影响数据归属。 */
-function ProcessAnswer({ content }: { content: string }) {
-  return <section className="mt-3"><MarkdownRenderer content={content} /></section>;
+function ProcessAnswer({ content, onOpenInPreview }: { content: string; onOpenInPreview?: (url: string, signal: AbortSignal) => Promise<string | undefined> }) {
+  return <section className="mt-3"><MarkdownRenderer content={content} onOpenInPreview={onOpenInPreview} /></section>;
 }
 
 /** 渲染共享 reducer 生成的 Turn 结构化结束摘要。 */
@@ -205,7 +233,7 @@ function UserQuestionAnswerSummary({ item }: { item: UserQuestionItem }) {
 }
 
 /** 渲染指定 Turn 的完整安全时间线，各分区不混入原始 Runtime 字段。 */
-export default function TurnPresentation({ state, turnId, showThinking, evidence, failure, termination, settingsHref = "/settings", disabled, readOnly = false, productMode = "work", ragEvidence = false, isResuming = false, activity, onOpenBackgroundJob, onApprovalDecision, onUserQuestionSubmit, onUserQuestionCancel }: TurnPresentationProps) {
+export default function TurnPresentation({ state, turnId, showThinking, evidence, failure, termination, settingsHref = "/settings", disabled, readOnly = false, productMode = "work", ragEvidence = false, isResuming = false, activity, onOpenBackgroundJob, workPreview, onApprovalDecision, onUserQuestionSubmit, onUserQuestionCancel }: TurnPresentationProps) {
   const timeline = selectTurnTimeline(state, turnId).filter((item): item is TurnTimelineItem => belongsToTurn(item, turnId) && (productMode !== "chat" || !["approval", "user_question", "undo", "todo", "input_notice"].includes(item.kind)));
   const turnSummary = timeline.find((item): item is TurnSummaryItem => item.kind === "turn_summary");
   let backgroundJobId: string | undefined;
@@ -222,6 +250,10 @@ export default function TurnPresentation({ state, turnId, showThinking, evidence
   const isRunning = !readOnly && !failure && Boolean(disabled) && state.turnId === turnId && (!turnSummary || isResuming || hasRequiredUserQuestion);
   const hideTurnSummary = isResuming || hasRequiredUserQuestion;
   const startedAt = Date.parse(state.turnStartedAt[turnId] ?? "");
+  /** 结果尾部只在稳定终态区出现：运行中、恢复中、失败、终止与等待回答都不提供正常结果入口（AC-8）。 */
+  const showResultArea = Boolean(workPreview) && !readOnly && productMode === "work" && !failure && !termination && !isResuming && !hasRequiredUserQuestion;
+  /** 本轮最终结果交付；只读历史与 Chat 不渲染结果尾部操作。 */
+  const turnDelivery = showResultArea ? selectTurnPreviewDelivery(state, turnId) : undefined;
 
   return (
     <div className="space-y-2">
@@ -233,21 +265,21 @@ export default function TurnPresentation({ state, turnId, showThinking, evidence
         if (item.kind === "thinking") {
           if (!showThinking) return null;
           const followingToolNames = getFollowingToolNames(timeline, state, index);
-          if (nextItem?.kind === "tool_call") return <ToolCard key={item.id} tool={nextItem} content={item.summary} toolNames={followingToolNames} />;
-          if (nextItem?.kind === "tool_group") return <ToolGroup key={item.id} group={nextItem} state={state} content={item.summary} />;
+          if (nextItem?.kind === "tool_call") return <ToolProgress key={nextItem.id} state={state} item={nextItem} enabled={productMode === "work"}><ToolCard tool={nextItem} content={item.summary} toolNames={followingToolNames} /></ToolProgress>;
+          if (nextItem?.kind === "tool_group") return <ToolProgress key={nextItem.id} state={state} item={nextItem} enabled={productMode === "work"}><ToolGroup group={nextItem} state={state} content={item.summary} /></ToolProgress>;
           return <ThinkingSummary key={item.id} item={item} toolNames={followingToolNames} />;
         }
-        if (item.kind === "tool_call") return showThinking && previousItem?.kind === "thinking" ? null : <ToolCard key={item.callId} tool={item} />;
-        if (item.kind === "tool_group") return showThinking && previousItem?.kind === "thinking" ? null : <ToolGroup key={item.id} group={item} state={state} />;
+        if (item.kind === "tool_call") return showThinking && previousItem?.kind === "thinking" ? null : <ToolProgress key={item.id} state={state} item={item} enabled={productMode === "work"}><ToolCard tool={item} /></ToolProgress>;
+        if (item.kind === "tool_group") return showThinking && previousItem?.kind === "thinking" ? null : <ToolProgress key={item.id} state={state} item={item} enabled={productMode === "work"}><ToolGroup group={item} state={state} /></ToolProgress>;
         if (item.kind === "approval" && readOnly) return <p key={item.id} className="text-xs text-muted">历史审批记录（仅查看）</p>;
         if (item.kind === "approval") return item.state === "required" ? <ApprovalCard key={item.approvalId} approval={item} disabled={disabled} onDecision={(decision) => onApprovalDecision(item, decision)} /> : null;
         if (item.kind === "user_question" && readOnly) return <p key={item.id} className="text-xs text-muted">历史提问记录（仅查看）</p>;
         if (item.kind === "user_question") return item.state === "required" ? <AskUserQuestionCard key={item.id} question={item} disabled={disabled} onSubmit={(answers) => onUserQuestionSubmit(item, answers)} onCancel={onUserQuestionCancel} /> : item.state === "answered" ? <UserQuestionAnswerSummary key={item.id} item={item} /> : null;
         if (item.kind === "undo") return <UndoNotice key={item.transactionId} item={item} />;
         if (item.kind === "assistant_answer") return item.channel === "process"
-          ? <ProcessAnswer key={item.id} content={item.content} />
+          ? <ProcessAnswer key={item.id} content={item.content} onOpenInPreview={workPreview?.onOpenInPreview} />
           : <section key={item.id} className="mt-3">
-            <MarkdownRenderer content={item.content} ragEvidence={productMode === "chat" && ragEvidence} />
+            <MarkdownRenderer content={item.content} ragEvidence={productMode === "chat" && ragEvidence} onOpenInPreview={workPreview?.onOpenInPreview} />
             {productMode === "work" && backgroundJobId && onOpenBackgroundJob && <button type="button" onClick={function openBackgroundJob() { onOpenBackgroundJob(backgroundJobId); }} className="mt-3 border-2 border-ink bg-card px-3 py-1.5 text-xs font-semibold hover:bg-ink hover:text-ink-on-dark">查看后台任务</button>}
           </section>;
         if (item.kind === "turn_summary") return null;
@@ -256,8 +288,16 @@ export default function TurnPresentation({ state, turnId, showThinking, evidence
       <ActivityIndicator activeOperation={activeOperation} toolStartedAt={activeTool?.startedAt} activity={turnActivity} running={isRunning} startedAt={Number.isFinite(startedAt) ? startedAt : undefined} />
       {evidence}
       {timeline.filter(function todo(item): item is Extract<TurnTimelineItem, { kind: "todo" }> { return item.kind === "todo"; }).map(function card(item) { return <TodoListCard key={item.id} item={item} />; })}
-      {failure && <section role="alert" className="mt-3 border-2 border-error bg-error/10 px-4 py-3 text-sm"><p className="font-semibold text-error">{failure.code === "MISSING_CREDENTIAL" ? "需要配置主模型 API Key" : "任务执行失败"}</p><p className="mt-2 text-ink">{failure.message}</p><Link href={settingsHref} className="mt-3 inline-block border-2 border-ink px-3 py-1.5 font-semibold text-accent hover:bg-ink hover:text-ink-on-dark">前往配置</Link></section>}
+      {failure && <section role="alert" className="mt-3 border-2 border-error bg-error/10 px-4 py-3 text-sm"><p className="font-semibold text-error">{getFailureTitle(failure.code)}</p><p className="mt-2 text-ink">{failure.message}</p>{needsSettingsEntry(failure.code) && <Link href={settingsHref} className="mt-3 inline-block border-2 border-ink px-3 py-1.5 font-semibold text-accent hover:bg-ink hover:text-ink-on-dark">前往配置</Link>}</section>}
       {termination && <p role="status" className="mt-3 border-l-2 border-accent bg-accent/5 px-3 py-2 text-xs text-muted">{formatTermination(termination)}</p>}
+      {turnDelivery && workPreview && (
+        <WorkPreviewResultActions
+          delivery={turnDelivery}
+          open={workPreview.panelPreviewId === turnDelivery.previewId}
+          busy={workPreview.resolvingPreviewId === turnDelivery.previewId}
+          onToggle={function togglePreview() { workPreview?.onTogglePreview(turnDelivery.previewId); }}
+        />
+      )}
       {!hideTurnSummary && turnSummary && <TurnSummary summary={turnSummary} />}
     </div>
   );

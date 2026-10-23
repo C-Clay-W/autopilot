@@ -73,6 +73,8 @@ export function createNodeExternalPermissionProjector(options: CreateNodeExterna
       if (!isSafeSettingsFile(filePath)) throw new Error("EXTERNAL_RULE_TARGET_UNSAFE");
       return withFileLock(filePath, async function projectUnderLock() {
         const source = readScopeValue(filePath, true);
+        // 现有 permissions 不是对象时无法证明写入不会丢掉 deny/ask，拒绝覆盖（fail-closed）。
+        if (source.permissions !== undefined && (!source.permissions || typeof source.permissions !== "object" || Array.isArray(source.permissions))) throw new Error("EXTERNAL_RULE_PERMISSIONS_UNSAFE");
         const current = readPermissionList(source, "allow");
         const next = action === "add"
           ? (current.includes(rule) ? current : [...current, rule])
@@ -83,7 +85,9 @@ export function createNodeExternalPermissionProjector(options: CreateNodeExterna
         };
         const updated: Record<string, unknown> = { ...source, permissions };
         // 通过 Core schema resolver 做一次纯数据校验（含规则语法与来源约束），失败则不落盘。
-        resolveAutopilotSettings([{ scope: "local", value: updated }]);
+        const resolved = resolveAutopilotSettings([{ scope: "local", value: updated }]);
+        // deny/ask 无法完整解释时写入投影也不会产生授权，直接拒绝而不是留下不可信规则。
+        if (resolved.permissions.restricted === true) throw new Error("EXTERNAL_RULE_PERMISSIONS_UNSAFE");
         if (next.length === 0 && Object.keys(permissions).length === 1) delete updated.permissions;
         // 写入前检查链接安全：目标已存在但非安全实际文件时拒绝（防链接逃逸）。
         if (fs.existsSync(filePath) && !isSafeSettingsFile(filePath)) throw new Error("EXTERNAL_RULE_TARGET_UNSAFE");
@@ -100,7 +104,8 @@ export function createNodeExternalPermissionProjector(options: CreateNodeExterna
         { scope: "project", value: readScopeValue(paths.project) },
         { scope: "local", value: readScopeValue(paths.local) },
       ]);
-      return { allow: resolved.permissions.allow, deny: resolved.permissions.deny, ask: resolved.permissions.ask } as ExternalPermissionSnapshot & { ask: readonly string[] };
+      // deny/ask 无法解释时把不可信事实交给 Core，由 Core 按 deny 处理而不是当成“无限制”。
+      return { allow: resolved.permissions.allow, deny: resolved.permissions.deny, ask: resolved.permissions.ask, ...(resolved.permissions.restricted === true ? { restricted: true } : {}) } as ExternalPermissionSnapshot & { ask: readonly string[] };
     },
   };
 }

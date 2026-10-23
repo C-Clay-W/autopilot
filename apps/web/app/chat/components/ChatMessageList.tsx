@@ -11,6 +11,7 @@ import type { UserQuestionAnswerDraft } from "./AskUserQuestionCard";
 import type { AgentPresentationState, ApprovalItem, UserQuestionItem } from "@autopilot-agent/presentation";
 import type { ChatRetrievalMode } from "@autopilot-agent/core";
 import type { Message, SourceItem } from "../chat-page-types";
+import type { WorkPreviewViewProps } from "../work-preview-state";
 import type { WebSessionPinnedSkill as SessionPinnedSkill } from "@/lib/runtime-host/web-ui-dto";
 import type { WebActivityState } from "@/lib/runtime-host/web-activity";
 import type { AgentStorageQuotaView } from "./StorageQuotaPanel";
@@ -53,6 +54,8 @@ interface ChatMessageListProps {
   handleUserQuestion: (messageId: string, question: UserQuestionItem, answers: UserQuestionAnswerDraft[]) => Promise<void>;
   cancelCurrentTurn: () => Promise<void>;
   handleContinueTurn: (messageId: string) => Promise<void>;
+  /** 停止请求在途：继续入口显示忙状态，避免服务端未确认停止时抢跑（H2）。 */
+  stopping: boolean;
   editingPrompt: { messageId: string; content: string } | null;
   setEditingPrompt: Dispatch<SetStateAction<{ messageId: string; content: string } | null>>;
   handleResendEditedPrompt: () => void;
@@ -61,10 +64,12 @@ interface ChatMessageListProps {
   handleEditPrompt: (messageId: string, content: string) => void;
   setSelectedImage: Dispatch<SetStateAction<{ url: string; alt: string } | null>>;
   readOnlyReason: string | undefined;
+  /** Work 内置预览接线；未传（Chat）时沿用原链接弹窗行为。 */
+  workPreview?: WorkPreviewViewProps;
 }
 
 /** 渲染消息滚动容器与浮动提示；所有状态与动作由装配层注入。 */
-function ChatMessageList({ isChat, messages, sessionId, loading, submissionActivity, currentRetrieval, knowledgeProgress, pinnedSkills, getSkillDisplayName, togglePinnedSkill, storageQuota, setStorageQuotaPanelOpen, presentation, refreshTransport, isPinned, unreadCount, showLatest, pendingApproval, pendingUserQuestion, focusPendingApproval, focusPendingUserQuestion, containerRef, contentRef, handleScroll, workspaceId, workspace, canWrite, showProcess, renderEvidence, activity, setRequestedJobId, handleApproval, handleUserQuestion, cancelCurrentTurn, handleContinueTurn, editingPrompt, setEditingPrompt, handleResendEditedPrompt, handleCopyMessage, copiedMessageId, handleEditPrompt, setSelectedImage, readOnlyReason }: ChatMessageListProps) {
+function ChatMessageList({ isChat, messages, sessionId, loading, submissionActivity, currentRetrieval, knowledgeProgress, pinnedSkills, getSkillDisplayName, togglePinnedSkill, storageQuota, setStorageQuotaPanelOpen, presentation, refreshTransport, isPinned, unreadCount, showLatest, pendingApproval, pendingUserQuestion, focusPendingApproval, focusPendingUserQuestion, containerRef, contentRef, handleScroll, workspaceId, workspace, canWrite, showProcess, renderEvidence, activity, setRequestedJobId, handleApproval, handleUserQuestion, cancelCurrentTurn, handleContinueTurn, stopping, editingPrompt, setEditingPrompt, handleResendEditedPrompt, handleCopyMessage, copiedMessageId, handleEditPrompt, setSelectedImage, readOnlyReason, workPreview }: ChatMessageListProps) {
   const previousPresentationRef = useRef(presentation);
   useLayoutEffect(function recordPresentationCommit() {
     if (previousPresentationRef.current === presentation) return;
@@ -120,6 +125,7 @@ function ChatMessageList({ isChat, messages, sessionId, loading, submissionActiv
             handleUserQuestion={handleUserQuestion}
             cancelCurrentTurn={cancelCurrentTurn}
             handleContinueTurn={handleContinueTurn}
+            stopping={stopping}
             editingPrompt={editingPrompt}
             setEditingPrompt={setEditingPrompt}
             handleResendEditedPrompt={handleResendEditedPrompt}
@@ -127,6 +133,7 @@ function ChatMessageList({ isChat, messages, sessionId, loading, submissionActiv
             copiedMessageId={copiedMessageId}
             handleEditPrompt={handleEditPrompt}
             setSelectedImage={setSelectedImage}
+            workPreview={workPreview}
           />
         ))}
         </div>
@@ -186,12 +193,14 @@ function areChatMessageListPropsEqual(previous: ChatMessageListProps, next: Chat
     && previous.workspaceId === next.workspaceId
     && previous.workspace === next.workspace
     && previous.canWrite === next.canWrite
+    && previous.stopping === next.stopping
     && previous.showProcess === next.showProcess
     && previous.renderEvidence === next.renderEvidence
     && previous.activity === next.activity
     && previous.editingPrompt === next.editingPrompt
-    && previous.copiedMessageId === next.copiedMessageId
-    && previous.readOnlyReason === next.readOnlyReason;
+  && previous.copiedMessageId === next.copiedMessageId
+  && previous.readOnlyReason === next.readOnlyReason
+  && previous.workPreview === next.workPreview;
 }
 
 export default memo(ChatMessageList, areChatMessageListPropsEqual);

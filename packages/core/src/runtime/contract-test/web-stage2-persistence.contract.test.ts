@@ -150,6 +150,27 @@ describe("Web Search Stage 2 persistence", function webSearchPersistenceSuite() 
     expect("checkpoint" in serialized ? serialized.checkpoint : undefined).not.toHaveProperty("pendingCalls");
   });
 
+  /** H1：终态只公开登记过的沙箱失败类别，其他内部错误码不进入公开事件。 */
+  it("终态只放行登记的沙箱错误码", function projectsSafeTerminalErrorCode() {
+    const sandbox = sanitizeEventForExternal({
+      type: "turn_failed",
+      turnId: "turn-terminal-sandbox",
+      error: "沙箱不可用，无法提供已隔离执行，本次任务已停止，不会无沙箱直接执行。",
+      errorCode: "SANDBOX_UNAVAILABLE",
+      checkpoint: { turnId: "turn-terminal-sandbox", status: "failed", stepCount: 1, messages: [], completedCallIds: [] },
+    } as unknown as AgentLoopEvent);
+    expect(sandbox).toMatchObject({ errorCode: "SANDBOX_UNAVAILABLE" });
+
+    const internal = sanitizeEventForExternal({
+      type: "turn_failed",
+      turnId: "turn-terminal-internal",
+      error: "Agent Loop 执行失败",
+      errorCode: "PRIVATE_INTERNAL_CODE",
+      checkpoint: { turnId: "turn-terminal-internal", status: "failed", stepCount: 1, messages: [], completedCallIds: [] },
+    } as unknown as AgentLoopEvent);
+    expect(JSON.stringify(internal)).not.toContain("PRIVATE_INTERNAL_CODE");
+  });
+
   /** 旧事件没有预算投影时保留可恢复事实，但不从等待时间补算预算数值。 */
   it("旧终态事件只按 Core checkpoint 状态确定恢复性", function keepsLegacyTerminalProjectionMinimal() {
     const event = sanitizeEventForExternal({

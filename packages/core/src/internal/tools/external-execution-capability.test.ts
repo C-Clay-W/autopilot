@@ -14,6 +14,7 @@ import type { JobService } from "../../runtime/application/job-service";
 import { ToolExecutor } from "./tool-executor";
 import { ToolRegistry } from "./tool-registry";
 import type { ExternalExecutionAuthority, ToolApprovalDecision, ToolExecutionRequest, ToolExecutionResult, ToolPermissionMode } from "./types";
+import { SANDBOX_START_MAX_ATTEMPTS } from "./process-utils";
 import { claimExternalWriteCapability, issueExternalWriteCapability } from "./permissions/external-execution-policy";
 import { createJobService } from "../../runtime/application/job-service";
 
@@ -55,8 +56,9 @@ async function fixture() {
     await ports.sessionStore.save({ id: sessionId, status: "waiting_approval", persistenceMode: "durable", createdAt: 1, updatedAt: 1, activeTurnId: turnId });
     await ports.turnStore.save({ id: turnId, sessionId, status: "waiting_approval", frozenRunConfig: { workspaceRoot }, startedAt: 1 });
     const registry = new ToolRegistry();
-    registry.register(toolName === "run_command" ? createRunCommandTool() : createStartBackgroundJobTool({ workspaceRoot, workspaceId: workspaceRoot, sessionId, turnId, jobs: {
-      async start(input: import("../../runtime/domain/job").StartJobInput) { await input.sandbox!.port.prepare({ commandId: input.sandbox!.policy.externalWriteCapability!.executionId, program: input.program, args: input.args, cwd: workspaceRoot, policy: input.sandbox!.policy }); throw new Error("prepare必须拒绝"); },
+    if (toolName === "run_command") registry.register(createRunCommandTool());
+    else registry.register(createStartBackgroundJobTool({ workspaceRoot, workspaceId: workspaceRoot, sessionId, turnId, jobs: {
+      async start(input: import("../../runtime/domain/job").StartJobInput) { if (input.sandbox.execution !== "host") await input.sandbox.port.prepare({ commandId: input.sandbox.policy.externalWriteCapability!.executionId, program: input.program, args: input.args, cwd: workspaceRoot, policy: input.sandbox.policy }); throw new Error("prepare必须拒绝"); },
     } as unknown as JobService }));
     const authority: ExternalExecutionAuthority = authorityOverride ?? {
       async freeze(input) { await approvals.freezeExecutionApproval({ workspaceRoot, sessionId, turnId, ...input }); },
@@ -86,7 +88,11 @@ describe("Stage3 单目标执行能力", function executionCapabilities() {
       const executor = await f.executor(`s-${mode}`, mode);
       const result = await executor.execute(f.request);
       expect(result.status).toBe("approval_required");
-      if (result.status === "approval_required") expect(result.approval.allowedDecisions).toEqual(["allow_once", "allow_session", "allow_workspace", "deny"]);
+      if (result.status === "approval_required") {
+        expect(result.approval.allowedDecisions).toEqual(["allow_once", "allow_session", "allow_workspace", "deny"]);
+        // 沙箱形态审批卡携带 sandboxed 执行方式事实（S3）。
+        expect(result.approval.display?.executionMode).toBe("sandboxed");
+      }
     }
     expect(f.prepared).toHaveLength(0);
     expect(createRunCommandTool().inputSchema.safeParse({ ...(f.request.input as object), allowedExternalWriteRoots: [path.dirname(f.target)] }).success).toBe(false);
@@ -98,22 +104,32 @@ describe("Stage3 单目标执行能力", function executionCapabilities() {
     const approval = await f.record(await first.execute(f.request), f.request, decision);
     const restored = await f.executor();
     const result = await restored.execute({ ...f.request, approval });
-    expect(result).toMatchObject({ status: "error", error: { code: "SANDBOX_UNAVAILABLE" } });
+    // CR 20261016 R4：prepare 可用性失败在 SANDBOX_START_MAX_ATTEMPTS 内重试，耗尽后按
+    // fail-closed deny 终态化（code 仍为 SANDBOX_UNAVAILABLE），不再以普通 error 表达。
+    expect(result).toMatchObject({ status: "denied", error: { code: "SANDBOX_UNAVAILABLE" } });
     const capability = f.prepared[0]!.policy.externalWriteCapability!;
     expect(capability).toMatchObject({ schemaVersion: 1, lifetime: decision, toolName: "run_command", callId: "c1", target: { canonicalTarget: f.target, scope: "file", operation: "write" } });
-    expect(f.prepared[0]!.commandId).toBe(capability.executionId);
+    // 同一次调用的三次准备重试共用一次签发的能力与 executionId；三次重试不等于三次执行。
+    expect(f.prepared).toHaveLength(SANDBOX_START_MAX_ATTEMPTS);
+    expect(f.prepared.every(function sameCall(entry) { return entry.commandId === capability.executionId && entry.policy.externalWriteCapability === capability; })).toBe(true);
     expect(f.prepared[0]!.policy.allowedDomains).toEqual([]);
     const second = await (await f.executor()).execute({ ...f.request, callId: "c2" });
     if (decision === "allow_once") {
       expect(second.status).toBe("approval_required");
       expect(await (await f.executor()).execute({ ...f.request, approval })).toMatchObject({ status: "error", error: { code: "APPROVAL_MISMATCH" } });
-      expect(f.prepared).toHaveLength(1);
+      // 重放被拒后不得进入准备流程：prepared 仍只有第一次调用的重试记录。
+      expect(f.prepared).toHaveLength(SANDBOX_START_MAX_ATTEMPTS);
     } else {
-      expect(second).toMatchObject({ status: "error", error: { code: "SANDBOX_UNAVAILABLE" } });
-      expect(f.prepared[1]!.policy.externalWriteCapability).not.toBe(capability);
-      expect(f.prepared[1]!.commandId).not.toBe(capability.executionId);
+      expect(second).toMatchObject({ status: "denied", error: { code: "SANDBOX_UNAVAILABLE" } });
+      // 不同新调用签发新能力与 executionId；按 commandId 区分调用，避免把重试误判成新执行。
+      const secondCall = f.prepared.filter(function fresh(entry) { return entry.commandId !== capability.executionId; });
+      expect(secondCall).toHaveLength(SANDBOX_START_MAX_ATTEMPTS);
+      expect(new Set(secondCall.map(function id(entry) { return entry.commandId; })).size).toBe(1);
+      expect(secondCall[0]!.policy.externalWriteCapability).not.toBe(capability);
+      expect(secondCall[0]!.commandId).not.toBe(capability.executionId);
       const anotherSession = await (await f.executor("s2")).execute({ ...f.request, callId: "c3" });
-      expect(anotherSession.status).toBe(decision === "allow_workspace" ? "error" : "approval_required");
+      expect(anotherSession.status).toBe(decision === "allow_workspace" ? "denied" : "approval_required");
+      if (anotherSession.status === "denied") expect(anotherSession).toMatchObject({ error: { code: "SANDBOX_UNAVAILABLE" } });
     }
   });
 
@@ -123,13 +139,17 @@ describe("Stage3 单目标执行能力", function executionCapabilities() {
     const first = await f.executor();
     const second = await f.executor();
     const results = await Promise.all([first.execute({ ...f.request, approval }), second.execute({ ...f.request, approval })]);
-    expect(results.map(function code(result) { return result.status === "error" ? result.error.code : result.status; }).sort()).toEqual(["APPROVAL_MISMATCH", "SANDBOX_UNAVAILABLE"]);
-    expect(f.prepared).toHaveLength(1);
+    // 并发恢复只消费一次：胜者进入准备流程（重试耗尽后 denied/SANDBOX_UNAVAILABLE），败者 APPROVAL_MISMATCH。
+    expect(results.map(function code(result) { return result.status === "error" || result.status === "denied" ? result.error.code : result.status; }).sort()).toEqual(["APPROVAL_MISMATCH", "SANDBOX_UNAVAILABLE"]);
+    // 只有一个调用进入准备流程：三次记录是同一 commandId 的准备重试，不是三次执行。
+    expect(f.prepared).toHaveLength(SANDBOX_START_MAX_ATTEMPTS);
+    expect(new Set(f.prepared.map(function id(entry) { return entry.commandId; })).size).toBe(1);
     const freshRequest = { ...f.request, callId: "expired" };
     const freshApproval = await f.record(await (await f.executor()).execute(freshRequest), freshRequest);
     vi.spyOn(f.ports.clock, "timestamp").mockReturnValue("2099-01-01T00:00:00Z");
     expect(await (await f.executor()).execute({ ...freshRequest, approval: freshApproval })).toMatchObject({ status: "error", error: { code: "APPROVAL_MISMATCH" } });
-    expect(f.prepared).toHaveLength(1);
+    // TTL 过期调用不得进入准备流程：prepared 仍只有并发胜者的重试记录。
+    expect(f.prepared).toHaveLength(SANDBOX_START_MAX_ATTEMPTS);
   });
 
   it("主体、命令、目标、工作区隔离；文件grant/孤儿Write投影不能给命令权", async function separatesSubjects() {

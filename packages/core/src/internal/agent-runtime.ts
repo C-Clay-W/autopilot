@@ -50,6 +50,8 @@ import type { McpCapability } from "../runtime/protocol";
 import type { CredentialStore, FileMutationStore } from "../runtime/ports";
 import { McpStdioRuntime } from "./tools/mcp-runtime";
 import { createStartBackgroundJobTool } from "./tools/builtins/start-background-job-tool";
+import { createOpenPreviewTool } from "./tools/builtins/open-preview-tool";
+import type { WorkPreviewCapability } from "../runtime/protocol/work-preview-capability";
 import { createListBackgroundJobsTool, createReadBackgroundJobTool, createStopBackgroundJobTool } from "./tools/builtins/background-job-tools";
 import type { JobService } from "../runtime/application/job-service";
 import { createAskUserQuestionTool } from "./tools/builtins/ask-user-question-tool";
@@ -84,6 +86,8 @@ export interface AgentOptions {
   rag?: RagCapability;
   /** Trust 后由宿主注入的公开网络能力；Search 与 Fetch 子能力独立控制工具可见性。 */
   web?: WebCapability;
+  /** Trust 后由宿主注入的 Work 内置预览能力；缺失时不向模型注册 open_preview。 */
+  workPreview?: WorkPreviewCapability;
   /** 与文档 RAG 并列的只读数据库能力；是否注册由 Turn 冻结策略决定。 */
   databaseSearch?: DatabaseSearchCapability;
   /** @deprecated 仅保留旧调用方类型兼容，不影响当前工具或上下文。 */
@@ -347,6 +351,8 @@ export type AgentLoopEvent =
       turnId: string;
       checkpoint: AgentCheckpoint;
       error?: string;
+      /** 可公开的结构化失败类别；当前只登记沙箱可用性失败，未登记的错误码不会带出。 */
+      errorCode?: string;
       /** 仅供 Core 序列化器读取并白名单化；宿主事件使用 AgentTerminationView。 */
       termination?: { reason?: AgentTerminationReason; budget?: AgentTerminationBudget };
     };
@@ -427,6 +433,10 @@ export function createAgentRuntime(options: AgentOptions = {}) {
     registry.register(createReadBackgroundJobTool(scopedJobs));
     registry.register(createStopBackgroundJobTool(scopedJobs));
   }
+  // Work 内置预览（Talk-Plan0908 Stage1）：仅受信宿主注入能力且存在 Turn 绑定时注册；Chat/CLI 永不注册。
+  if (!isChat && options.workPreview && options.jobBinding && options.workspaceRoot) {
+    registry.register(createOpenPreviewTool({ capability: options.workPreview, workspaceId: options.jobBinding.workspaceId, sessionId: options.jobBinding.sessionId, turnId: options.jobBinding.turnId }));
+  }
   if (options.visionAnalyzer) registry.register(createVisionAnalyzeTool());
   if (options.userQuestions) registry.register(createAskUserQuestionTool(options.userQuestions));
   registry.register(createTodoWriteTool());
@@ -492,17 +502,23 @@ export function createAgentRuntime(options: AgentOptions = {}) {
     const webWorkflowContext = webWorkflowInstructions
       ? createAgentTextMessage("system", webWorkflowInstructions)
       : undefined;
+    // Work 内置预览指引（Talk-Plan0908 Stage4）：仅宿主注入 WorkPreviewCapability 的 Runtime 注入；
+    // CLI 无该能力不注入，Chat 走独立分支不受影响。按意图判断，示例不是触发词规则。
+    const previewWorkflowContext = options.workPreview
+      ? createAgentTextMessage("system", "【内置预览】open_preview 由你根据用户意图、会话上下文与当前成果判断是否有展示必要并准备内置浏览器预览；不依赖固定触发词或句式，示例不是调用规则。用户明确要求打开页面时可以调用；用户明确不预览、缺少展示必要或没有可靠目标时不调用，也不为完成任务而调用。url 必须来自可靠信息，缺地址或存在多个候选时先询问。时机：页面已就绪且适合立即向用户展示时选 now；页面需要随本轮成果完成后交付时选 after_turn（缺省）。准备成功只表示预览请求已就绪，实际显示由用户端处理；页面经修复或变更后需重新调用以刷新预览。")
+      : undefined;
     registerContributions(environmentContext, [{ kind: "system", weight: weightOf(environmentContext) }]);
     registerContributions(behaviorContext, [{ kind: "system", weight: weightOf(behaviorContext) }]);
     registerContributions(mutationWorkflowContext, [{ kind: "system", weight: weightOf(mutationWorkflowContext) }]);
     registerContributions(todoWorkflowContext, [{ kind: "system", weight: weightOf(todoWorkflowContext) }]);
     if (webWorkflowContext) registerContributions(webWorkflowContext, [{ kind: "system", weight: weightOf(webWorkflowContext) }]);
+    if (previewWorkflowContext) registerContributions(previewWorkflowContext, [{ kind: "system", weight: weightOf(previewWorkflowContext) }]);
     const hasRuntimeSystemContext = result.some(function isExistingRuntimeSystemContext(message) {
       return message.role === "system" && getAgentMessageText(message).startsWith("【产品身份】");
     });
     const firstSystemIndex = result.findIndex((message) => message.role === "system");
     if (!hasRuntimeSystemContext) {
-      const runtimeContexts = [environmentContext, behaviorContext, mutationWorkflowContext, todoWorkflowContext, ...(webWorkflowContext ? [webWorkflowContext] : [])];
+      const runtimeContexts = [environmentContext, behaviorContext, mutationWorkflowContext, todoWorkflowContext, ...(webWorkflowContext ? [webWorkflowContext] : []), ...(previewWorkflowContext ? [previewWorkflowContext] : [])];
       if (firstSystemIndex === -1) result.unshift(...runtimeContexts);
       else result.splice(firstSystemIndex + 1, 0, ...runtimeContexts);
     }

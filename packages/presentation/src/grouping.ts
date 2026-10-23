@@ -22,7 +22,7 @@ export function groupToolCalls(items: AgentPresentationItem[]): TimelineItem[] {
     const group = [item];
     while (true) {
       const nextItem = items[index + group.length];
-      if (!nextItem || !isGroupableTool(nextItem) || nextItem.turnId !== item.turnId) break;
+      if (!nextItem || !isGroupableTool(nextItem) || nextItem.turnId !== item.turnId || nextItem.stepId !== item.stepId) break;
       group.push(nextItem);
     }
     if (group.length === 1) result.push(item);

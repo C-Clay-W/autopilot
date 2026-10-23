@@ -64,7 +64,17 @@ export function readSrtVersion(): string | undefined {
   }
 }
 
-/** 生产默认加载器：非字面量动态 import，运行时由 Node 原生解析 ESM 包。 */
+/**
+ * 生产默认加载器：把 ESM 解析完全交给 Node 原生加载器。
+ *
+ * 打包器会把源码中任何 `import(表达式)` 改写成对所在目录的异步上下文；Adapter 被打进
+ * Next Work Route 时该上下文为空（webpackEmptyAsyncContext），SRT 必然 MODULE_NOT_FOUND。
+ * 这里与 Web `core-loader` 的 `eval("require")` 同一受控边界：用运行时函数构造动态 import，
+ * 打包器无法静态分析该语法，Node 在服务端按 node_modules 原生解析 ESM 包。
+ */
+const importSrtRuntime = new Function("specifier", "return import(specifier);") as unknown as (specifier: string) => Promise<SrtRuntimeSurface>;
+
+/** 生产默认加载器：非打包器可见的动态 import，运行时由 Node 原生解析 ESM 包。 */
 export function loadSrtRuntimeSurface(): Promise<SrtRuntimeSurface> {
-  return import(SRT_MODULE_SPECIFIER) as Promise<SrtRuntimeSurface>;
+  return importSrtRuntime(SRT_MODULE_SPECIFIER);
 }

@@ -184,6 +184,15 @@ function SettingsCenter() {
       </nav>
       <div className="min-w-0 space-y-4">
         {error && <div role="alert" className="border-2 border-error bg-error/10 p-4 text-error">{error}</div>}
+        {status && status.diagnostics.length > 0 && <section role="alert" className="border-2 border-error bg-error/10 p-4">
+          <p className="font-semibold text-error">权限配置未生效（模型字段不受影响）</p>
+          <ul className="mt-2 space-y-1 text-xs">
+            {status.diagnostics.map(function item(diagnostic) { return <li key={`${diagnostic.code}:${diagnostic.field ?? ""}`}>错误码 <span className="font-semibold">{diagnostic.code}</span>{diagnostic.field ? <>，字段 <span className="font-semibold">{diagnostic.field}</span></> : null}（作用域 {diagnostic.scope}）</li>; })}
+          </ul>
+          <p className="mt-2 text-xs leading-relaxed">本项目不消费 Claude Code 的 defaultMode、Bash 等工具权限写法，也不会据此授权；如需外部文件授权，请使用 Write|Edit|Read(绝对路径) 写法。</p>
+          {status.diagnostics.some(function restricted(diagnostic) { return diagnostic.code === "SETTINGS_PERMISSIONS_UNSAFE" || diagnostic.code === "SETTINGS_PERMISSIONS_INVALID"; }) && <p className="mt-1 text-xs font-semibold leading-relaxed">deny/ask 无法解释，外部文件操作一律拒绝，直到修正该字段。</p>}
+          <p className="mt-1 text-xs leading-relaxed">请直接编辑 ~/.autopilot/settings.json 后刷新本页；保存模型配置不会删除或改写该段。</p>
+        </section>}
         {savedCategory === category && <div role="status" className="border-2 border-accent bg-accent/10 p-4 font-semibold">主模型配置已保存</div>}
         {!status && !error && <p role="status" className="text-muted">正在读取配置…</p>}
         {status && category === "main" && main && search && <form onSubmit={saveMain} className="space-y-5">

@@ -49,6 +49,10 @@ npm run test -w packages/core -- src/internal/tools/builtins/todo-write-tool.tes
 
 Trust、工具授权和沙箱各有职责。拒绝不支持的路径/协议不等于证明 OS 隔离成功；平台实机限制见主入口包手册。
 
+## 源码 0.2.0 与 npm 版本
+
+本次源码版本为 0.2.0，不表示 npm 已发布该版本；上面的 npm 0.1.0 安装示例继续对应旧归档。Windows 源码已移除进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
+
 ## 许可证
 
 MIT，见 LICENSE。第三方依赖采用各自授权。

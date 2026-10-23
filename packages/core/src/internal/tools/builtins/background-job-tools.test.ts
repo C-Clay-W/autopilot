@@ -29,6 +29,7 @@ function createScopedJobs(): { jobs: SessionJobService; stops: ReturnType<typeof
       async list() { return { jobs: [jobView()], nextPageCursor: "opaque" }; },
       async read(): Promise<JobReadView> { return { job: jobView(), output: emptyOutput(), waitOutcome: "snapshot" }; },
       stop: stops,
+      async verifyServiceOwnership() { return "unverifiable"; },
     },
   };
 }

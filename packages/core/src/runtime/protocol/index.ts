@@ -25,6 +25,7 @@ export type { McpCapability, McpServerConfig } from "./mcp-capability";
 export { parseMcpConfig, getMcpServerConfigHash, getMcpServerGrantConstraint } from "./mcp-capability";
 export { WebFetchCapabilityError, WebSearchCapabilityError } from "./web-capability";
 export type { WebCapability, WebFetchCapability, WebFetchCapabilityErrorCode, WebFetchResult, WebSearchCapability, WebSearchCapabilityErrorCode, WebSearchResult, WebSearchSource } from "./web-capability";
+export type { WorkPreviewCapability, WorkPreviewPrepareRequest, WorkPreviewPrepareResult, WorkPreviewOpenWhen } from "./work-preview-capability";
 export type { CompactTurnInput, CompactTurnResult } from "./compact-turn-input";
 export type { AgentTerminationBudget, AgentTerminationReason, AgentTerminationView, RecoverableTurnStatus, RecoverableApprovalView, RecoverableTurnView } from "./recoverable-turn-view";
 export { sanitizeAgentTerminationView } from "./recoverable-turn-view";

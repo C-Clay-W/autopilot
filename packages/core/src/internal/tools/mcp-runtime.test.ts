@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { getMcpServerConfigHash, getMcpServerGrantConstraint, parseMcpConfig, type McpServerConfig } from "../../runtime/protocol";
 import { SANDBOX_ERROR_CODES, type SandboxExecutionRequest, type SandboxPreparedCommand } from "../../runtime/domain/sandbox-policy";
 import { SandboxPortError, type SandboxPort } from "../../runtime/ports";
-import { McpStdioRuntime, createMcpServerStartActionFacts } from "./mcp-runtime";
+import { McpStdioRuntime, createMcpServerStartActionFacts, resolveHostServerCommand } from "./mcp-runtime";
 
 const fixture = "const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',line=>{const q=JSON.parse(line);if(q.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:q.id,result:{}}));else if(q.method==='tools/list')console.log(JSON.stringify({jsonrpc:'2.0',id:q.id,result:{tools:[{name:'echo.value',description:'fixture',inputSchema:{type:'object',properties:{value:{type:'string'}},required:['value'],additionalProperties:false}}]}}));else if(q.method==='tools/call')console.log(JSON.stringify({jsonrpc:'2.0',id:q.id,result:{content:[{type:'text',text:q.params.arguments.value}]}}));else if(q.method==='shutdown')console.log(JSON.stringify({jsonrpc:'2.0',id:q.id,result:{}}));});";
 const environmentFixture = "const rl=require('node:readline').createInterface({input:process.stdin});rl.on('line',line=>{const q=JSON.parse(line);if(q.method==='initialize')console.log(JSON.stringify({jsonrpc:'2.0',id:q.id,result:{}}));else if(q.method==='tools/list')console.log(JSON.stringify({jsonrpc:'2.0',id:q.id,result:{tools:[{name:'read.environment',description:'fixture',inputSchema:{type:'object',properties:{},additionalProperties:false}}]}}));else if(q.method==='tools/call')console.log(JSON.stringify({jsonrpc:'2.0',id:q.id,result:{content:[{type:'text',text:JSON.stringify({TEMP:process.env.TEMP??null,temp:process.env.temp??null,keys:Object.keys(process.env).filter(key=>key.toUpperCase()==='TEMP')})}]}}));else if(q.method==='shutdown')console.log(JSON.stringify({jsonrpc:'2.0',id:q.id,result:{}}));});";
@@ -425,5 +425,26 @@ describe("McpStdioRuntime", () => {
         else process.env[key] = value;
       }
     }
+  });
+});
+
+describe("resolveHostServerCommand（Talk-Plan1022 CR R3）", function hostServerCommandSuite() {
+  it("Windows 包管理器解析为受信 node.exe + CLI 脚本，不把 .cmd 交给 shell:false", function resolvesTrustedPackageManager() {
+    const resolved = resolveHostServerCommand("npx", ["--version"]);
+    if (process.platform === "win32") {
+      expect(resolved.executable).toBe(process.execPath);
+      expect(resolved.executable.endsWith(".cmd")).toBe(false);
+      expect(resolved.args[0]).toMatch(/npx-cli\.js$/i);
+      expect(resolved.args.slice(1)).toEqual(["--version"]);
+    } else {
+      // 非 Windows 保持原程序：Windows 专属解析不外溢到 macOS/Linux。
+      expect(resolved).toEqual({ executable: "npx", args: ["--version"] });
+    }
+  });
+
+  it("非包管理器命令保持平台可执行名与原 argv", function keepsPlainProgram() {
+    const resolved = resolveHostServerCommand(process.execPath, ["-e", "0"]);
+    expect(resolved.executable).toBe(process.execPath);
+    expect(resolved.args).toEqual(["-e", "0"]);
   });
 });

@@ -7,7 +7,7 @@
 
 import type { AgentCheckpoint, RunConfig, StartTurnInput } from "../../protocol";
 import { AgentRuntimeError as RuntimeError, migrateAgentMessages, validateAgentMessages } from "../../protocol";
-import { createAgentTextMessage, getAgentMessageText, type AgentMessage } from "../../../internal/types/agent-message";
+import { createAgentTextMessage, getAgentMessageText, scanAgentToolPairing, type AgentMessage } from "../../../internal/types/agent-message";
 import type { TodoItem } from "../../domain";
 import type { Turn } from "../../domain";
 import type { RuntimePorts } from "../../ports";
@@ -16,9 +16,9 @@ import type { RuntimePorts } from "../../ports";
 export interface TurnConversationBuilder {
   buildInitialMessages(input: StartTurnInput): AgentMessage[];
   refreshContext(capabilities: RunConfig, content: string | undefined): Promise<void>;
-  getLatestCompletedTurn(sessionId: string): Promise<Turn | undefined>;
-  buildCanonicalSessionMessages(latestCompleted: Turn | undefined, initial: AgentMessage[]): Promise<AgentMessage[]>;
-  inheritPreviousUsageAnchor(sessionId: string, latestCompleted: Turn | undefined, canonical: AgentMessage[], initial: AgentMessage[]): Promise<AgentCheckpoint["usageAnchor"]>;
+  getConversationBaselineTurn(sessionId: string): Promise<Turn | undefined>;
+  buildCanonicalSessionMessages(baseline: Turn | undefined, initial: AgentMessage[]): Promise<AgentMessage[]>;
+  inheritPreviousUsageAnchor(sessionId: string, baseline: Turn | undefined, canonical: AgentMessage[], initial: AgentMessage[]): Promise<AgentCheckpoint["usageAnchor"]>;
   injectTodoSnapshot(sessionId: string, todoChainId: string, messages: AgentMessage[]): Promise<AgentMessage[]>;
 }
 
@@ -41,18 +41,32 @@ export function createTurnConversationBuilder(ports: RuntimePorts): TurnConversa
     }
   }
 
-  /** 查找上一安全完成的 Turn。 */
-  async function getLatestCompletedTurn(sessionId: string): Promise<Turn | undefined> {
-    return (await ports.turnStore.list(sessionId))
-      .filter((turn) => turn.status === "completed")
-      .sort((left, right) => right.startedAt - left.startedAt)[0];
+  /**
+   * 查找最近一个可安全重建的会话基线 Turn（H1）：
+   * 已完成、失败与中断轮都属于可延续的会话事实，不能只为 status=completed 跳过原任务；
+   * 只接受 checkpoint 身份一致、消息可迁移且工具调用配对完整的记录，配对不完整时
+   * 回退到更早可重建轮，不改写任何 durable 数据。
+   */
+  async function getConversationBaselineTurn(sessionId: string): Promise<Turn | undefined> {
+    const candidates = (await ports.turnStore.list(sessionId))
+      .filter((turn) => CONVERSATION_BASELINE_STATUSES.has(turn.status))
+      .sort((left, right) => right.startedAt - left.startedAt);
+    for (const turn of candidates) {
+      const checkpoint = await ports.checkpointStore.getByTurn(sessionId, turn.id);
+      if (!checkpoint || checkpoint.turnId !== turn.id) continue;
+      const migrated = migrateAgentMessages({ messageSchemaVersion: checkpoint.messageSchemaVersion, messages: checkpoint.messages, allowPending: true });
+      if (!migrated.ok) continue;
+      if (scanAgentToolPairing(migrated.messages).pendingCallIds.length > 0) continue;
+      return turn;
+    }
+    return undefined;
   }
 
   /** 重建不含 provider 私有状态的跨宿主 canonical conversation。 */
-  async function buildCanonicalSessionMessages(latestCompleted: Turn | undefined, initial: AgentMessage[]): Promise<AgentMessage[]> {
-    if (!latestCompleted) return initial;
-    const checkpoint = await ports.checkpointStore.getByTurn(latestCompleted.sessionId, latestCompleted.id);
-    if (!checkpoint || checkpoint.turnId !== latestCompleted.id) return initial;
+  async function buildCanonicalSessionMessages(baseline: Turn | undefined, initial: AgentMessage[]): Promise<AgentMessage[]> {
+    if (!baseline) return initial;
+    const checkpoint = await ports.checkpointStore.getByTurn(baseline.sessionId, baseline.id);
+    if (!checkpoint || checkpoint.turnId !== baseline.id) return initial;
     const systemMessages = initial.filter((message) => message.role === "system");
     const remainingMessages = initial.filter((message) => message.role !== "system");
     const migrated = migrateAgentMessages({
@@ -66,13 +80,13 @@ export function createTurnConversationBuilder(ports: RuntimePorts): TurnConversa
   /** 在消息完整重建时继承上一 Turn 的私有 usage anchor，否则安全回退估算。 */
   async function inheritPreviousUsageAnchor(
     sessionId: string,
-    latestCompleted: Turn | undefined,
+    baseline: Turn | undefined,
     canonical: AgentMessage[],
     initial: AgentMessage[],
   ): Promise<AgentCheckpoint["usageAnchor"]> {
-    if (!latestCompleted) return undefined;
+    if (!baseline) return undefined;
     const previous = await ports.checkpointStore.getLatest(sessionId);
-    if (!previous || previous.turnId !== latestCompleted.id || !previous.usageAnchor) return undefined;
+    if (!previous || previous.turnId !== baseline.id || !previous.usageAnchor) return undefined;
     const previousConversationCount = (previous.messages ?? []).filter((message) => message.role !== "system").length;
     const inheritedConversationCount = canonical.filter((message) => message.role !== "system").length
       - initial.filter((message) => message.role !== "system").length;
@@ -102,8 +116,11 @@ export function createTurnConversationBuilder(ports: RuntimePorts): TurnConversa
     return [...messages, createAgentTextMessage("system", `【Todo 快照】上一任务链最近待办（来自本 Session durable 事件）：\n${lines.join("\n")}\n若新任务与上一任务链连续，请在此基础上用 todo_write 整表替换更新；若是独立任务，请直接用全新列表整表替换。`)];
   }
 
-  return { buildInitialMessages, refreshContext, getLatestCompletedTurn, buildCanonicalSessionMessages, inheritPreviousUsageAnchor, injectTodoSnapshot };
+  return { buildInitialMessages, refreshContext, getConversationBaselineTurn, buildCanonicalSessionMessages, inheritPreviousUsageAnchor, injectTodoSnapshot };
 }
+
+/** 可作为新 Turn 会话基线的终态：完成、失败与中断都保留原请求与已确认操作（H1）。 */
+const CONVERSATION_BASELINE_STATUSES: ReadonlySet<Turn["status"]> = new Set(["completed", "failed", "interrupted"]);
 
 /** 只保留已通过 V2 配对校验的历史；新 V2 损坏不得静默丢弃。 */
 function normalizeConversationMessages(messages: AgentMessage[]): AgentMessage[] {

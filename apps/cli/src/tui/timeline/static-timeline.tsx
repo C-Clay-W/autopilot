@@ -2,7 +2,7 @@
 
 import { type ReactNode } from "react";
 import { Box, Text } from "ink";
-import { TUI_ACCENT_COLOR } from "../../design-tokens.js";
+import { TUI_ACCENT_COLOR, TUI_TOOL_ERROR_TEXT_COLOR } from "../../design-tokens.js";
 import { TUI_AGENT_LABEL } from "../constants.js";
 import { formatTuiDuration, formatTuiInputConsumed, getTuiApprovalDecisionLabel, getTuiToolLabel, getTuiTerminationSummary, getTuiTurnFailureReason } from "../format.js";
 import { TuiMarkdown } from "../markdown/markdown.js";
@@ -87,6 +87,7 @@ export function renderTimeline(events: CliTuiTimelineEvent[], useColor: boolean,
           <Text bold color={useColor ? TUI_ACCENT_COLOR : undefined}>Approval required</Text>
           <Text>操作：{getTuiToolLabel(event.toolName)}</Text>
           <Text>原因：{event.reason}</Text>
+          {event.display?.executionMode === "unisolated" && <Text color={useColor ? TUI_TOOL_ERROR_TEXT_COLOR : undefined}>将在当前用户权限下运行（未启用沙箱隔离）</Text>}
           <Text dimColor={useColor}>[y] 本次  [s] 本次会话  [w] 此工作区  [n] 拒绝</Text>
         </Box>,
       );

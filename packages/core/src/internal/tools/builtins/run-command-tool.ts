@@ -79,11 +79,14 @@ export function createRunCommandTool(): AgentToolDefinition<z.infer<typeof runCo
       // （CR 20261016 R2：2.5 无沙箱降级直执已撤，沙箱不可用时 read-only 与 workspace-write 一律 fail-closed）。
       const sandbox = context.sandboxPolicy;
       if (!sandbox && context.sandboxExecutionOverride !== "direct") throw createToolError(SANDBOX_ERROR_CODES.UNAVAILABLE, "沙箱未就绪，无法提供已隔离执行，命令未启动");
+      // Talk-Plan1022 S1：宿主执行范围（execution:"host"）由 ToolExecutor 在用户逐次批准后
+      // 注入 sandboxExecutionOverride:"direct"，经下方无隔离直执分支运行；未批准时绕过
+      // ToolExecutor 的直接调用没有 override 与 scope，仍保持 fail-closed。
       await claimExternalWriteCapability("run_command", input, context);
       // 平台可执行名解析先于沙箱包装完成（Windows npm/npx → .cmd），prepare 只消费解析后的 argv。
       const program = getPlatformExecutable(input.program);
       let prepared: SandboxPreparedCommand;
-      if (sandbox) {
+      if (sandbox && sandbox.execution !== "host") {
         // CR 20261016 R4：prepare（Adapter initialize/wrap，发生在目标 spawn 之前）失败时，
         // 仅"确定未启动"的可用性失败（UNAVAILABLE/NOT_PROVISIONED/RUNNER_FAILED）在
         // SANDBOX_START_MAX_ATTEMPTS 内重试并累积逐次脱敏诊断；POLICY_DENIED/SCOPE_CONFLICT/
@@ -131,10 +134,12 @@ export function createRunCommandTool(): AgentToolDefinition<z.infer<typeof runCo
         });
         // 所有终态（close、error、超时、取消）都必须释放沙箱执行资源；release 幂等不抛。
         let released = false;
+        // 宿主执行范围没有沙箱 port，也不存在需要释放的沙箱执行资源。
+        const sandboxPort = sandbox && sandbox.execution !== "host" ? sandbox.port : undefined;
         const releaseOnce = (): void => {
           if (released) return;
           released = true;
-          if (sandbox) void sandbox.port.release(prepared.executionId);
+          if (sandboxPort) void sandboxPort.release(prepared.executionId);
         };
         const stdout = new BoundedOutputBuffer(outputLimit);
         const stderr = new BoundedOutputBuffer(outputLimit);

@@ -412,6 +412,7 @@ describe("工具专用展示明细契约", function toolDisplayDetailContractSui
         case "grep_counts": return detail.shownFileCount;
         case "web_search": return detail.sourceCount;
         case "web_fetch": return 1;
+        case "open_preview": return 1;
         default: {
           const exhaustive: never = detail;
           return exhaustive;

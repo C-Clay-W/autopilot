@@ -52,11 +52,17 @@ export function TuiApprovalPrompt(props: { pendingApproval: NonNullable<CliProje
       <Text>原因：{props.pendingApproval.reason}</Text>
       {props.pendingApproval.display?.resource ? <Text>影响：{props.pendingApproval.display.resource}</Text> : null}
       {props.pendingApproval.display?.cwd ? <Text>工作目录：{props.pendingApproval.display.cwd}</Text> : null}
-      {props.pendingApproval.display?.effect === "external" && props.pendingApproval.display?.unknownScope ? (
+      {props.pendingApproval.display?.effect === "external" && props.pendingApproval.display?.hostExecution === true ? (
+        <Text color={props.useColor ? TUI_ACCENT_COLOR : undefined}>⚠ 外部路径：命令声明了工作区外目标，但宿主进程不受该文件范围约束，可能同时影响其他文件；批准不构成精确范围保证</Text>
+      ) : null}
+      {props.pendingApproval.display?.effect === "external" && props.pendingApproval.display?.hostExecution !== true && props.pendingApproval.display?.unknownScope ? (
         <Text color={props.useColor ? TUI_ACCENT_COLOR : undefined}>⚠ 修改范围无法精确限定：该命令未声明精确外部目标，请审查完整命令后再决定</Text>
       ) : null}
-      {props.pendingApproval.display?.effect === "external" && !props.pendingApproval.display?.unknownScope ? (
+      {props.pendingApproval.display?.effect === "external" && props.pendingApproval.display?.hostExecution !== true && !props.pendingApproval.display?.unknownScope ? (
         <Text color={props.useColor ? TUI_ACCENT_COLOR : undefined}>⚠ 外部路径：目标位于工作区之外，授权仅覆盖上述精确目标</Text>
+      ) : null}
+      {props.pendingApproval.display?.hostExecution === true ? (
+        <Text color={props.useColor ? TUI_ACCENT_COLOR : undefined}>Windows 宿主执行：本次命令将在当前用户权限下直接运行，未启用沙箱隔离；批准仅对本次调用有效，拒绝则不执行</Text>
       ) : null}
       {props.pendingApproval.toolName === "run_command" && options.some(function hasWorkspaceOption(option) { return option.decision === "allow_workspace"; }) ? (
         <Text dimColor={props.useColor}>选择“记住此命令”会记住本条命令（程序、参数与工作目录完全一致），此后在本工作区自动放行；参数或目录不同的命令仍会重新询问</Text>

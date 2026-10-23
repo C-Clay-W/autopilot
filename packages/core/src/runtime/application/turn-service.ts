@@ -159,12 +159,15 @@ export function createTurnService(
       turnOverride: input.runConfig,
       runtimeDefault,
     });
+    // Talk-Plan1022 R2：把受信宿主的有效进程执行方式随 Turn 一并冻结，恢复时据此拒绝跨执行方式继续。
+    frozenRunConfig = { ...frozenRunConfig, processExecution: readProcessExecution(ports) };
 
     const turnId = input.turnId ?? randomUUID();
     if (await ports.turnStore.get(turnId)) throw new RuntimeError("TURN_FROZEN_MISMATCH", "Turn ID 已存在，不能覆盖冻结身份");
-    const latestCompletedTurn = await conversationBuilder.getLatestCompletedTurn(input.sessionId);
+    // H1：会话延续以最近可安全重建的终态轮为基线（含失败/中断），不只为 completed 跳过原任务。
+    const baselineTurn = await conversationBuilder.getConversationBaselineTurn(input.sessionId);
     const todoChainId = input.continuity?.source === "claimed_queue"
-      ? latestCompletedTurn?.todoChainId ?? latestCompletedTurn?.id ?? turnId
+      ? baselineTurn?.todoChainId ?? baselineTurn?.id ?? turnId
       : turnId;
     const resolved = await resolveTurnCapabilities({ session, turnId, runtimeDefault, override: input.runConfig, frozen: frozenRunConfig, now: ports.clock.now() });
     const capabilities = resolved.capabilities;
@@ -182,9 +185,9 @@ export function createTurnService(
     };
     const initialMessages = conversationBuilder.buildInitialMessages(input);
     await conversationBuilder.refreshContext(capabilities, input.content);
-    let messages = await conversationBuilder.buildCanonicalSessionMessages(latestCompletedTurn, initialMessages);
+    let messages = await conversationBuilder.buildCanonicalSessionMessages(baselineTurn, initialMessages);
     // P1-a：新 Turn 继承上一 Turn 私有 anchor，避免首采样退化为全量估算；不满足条件时为 undefined。
-    const inheritedUsageAnchor = await conversationBuilder.inheritPreviousUsageAnchor(input.sessionId, latestCompletedTurn, messages, initialMessages);
+    const inheritedUsageAnchor = await conversationBuilder.inheritPreviousUsageAnchor(input.sessionId, baselineTurn, messages, initialMessages);
     // claimed queue 连续路径注入最近 Todo 快照；普通新 Turn 不设置 continuity，不注入。
     // 注入放在 anchor 校验之后，避免 reminder 消息破坏 anchor 长度一致性校验。
     if (session.productMode !== "chat" && input.continuity?.source === "claimed_queue") {
@@ -193,7 +196,7 @@ export function createTurnService(
     const lease = await leaseCoordinator.acquire(input.sessionId, turnId);
     try {
       await ports.turnStore.save(turn);
-      yield* executionCoordinator.execute({ sessionId: input.sessionId, turnId, frozen: frozenRunConfig, capabilities, providerConfig: frozenProviderConfig, previousContextWindowTokens: latestCompletedTurn?.frozenProviderConfig?.contextWindowTokens ?? latestCompletedTurn?.frozenProviderConfig?.compactThresholdTokens, lease, makeRuntimeInput: () => ({
+      yield* executionCoordinator.execute({ sessionId: input.sessionId, turnId, frozen: frozenRunConfig, capabilities, providerConfig: frozenProviderConfig, previousContextWindowTokens: baselineTurn?.frozenProviderConfig?.contextWindowTokens ?? baselineTurn?.frozenProviderConfig?.compactThresholdTokens, lease, makeRuntimeInput: () => ({
         turnId,
         todoChainId,
         messages,
@@ -230,6 +233,8 @@ export function createTurnService(
     await assertWorkHistoryWritable(ports, session);
     const recovered = await recoveryService.getContinuation(input.sessionId, input.turnId);
     const turn = recovered.turn;
+    // Talk-Plan1022 R2：执行方式在 Turn 冻结，恢复先比对；不匹配时不进入执行链，旧审批零消费。
+    assertFrozenProcessExecution(turn, ports);
     const checkpoint = webInputs.restore(recovered.checkpoint);
 
     const turnId = input.turnId ?? checkpoint.turnId;
@@ -370,4 +375,26 @@ export function createTurnService(
   async function getContextUsage(input: { sessionId: string; turnId?: string }): Promise<ContextUsageView | null> {
     return recoveryService.getContextUsage(input);
   }
+}
+
+/** 读取受信宿主当前声明的有效进程执行方式；只有宿主执行 Port 声明 host，其余按沙箱。 */
+function readProcessExecution(ports: RuntimePorts): "sandbox" | "host" {
+  return ports.sandboxPort.execution === "host" ? "host" : "sandbox";
+}
+
+/**
+ * Talk-Plan1022 R2：恢复前比对 Turn 冻结的有效执行方式与当前宿主。旧沙箱记录缺省按沙箱处理，
+ * 在宿主执行 Runtime 上必须停止——否则旧沙箱审批会以当前用户完整权限执行。反向（宿主 Turn
+ * 落到沙箱 Runtime）同样拒绝，避免把宿主批准当成沙箱批准重放。
+ */
+function assertFrozenProcessExecution(turn: Turn, ports: RuntimePorts): void {
+  const current = readProcessExecution(ports);
+  const frozen = turn.frozenRunConfig.processExecution ?? "sandbox";
+  if (frozen === current) return;
+  throw new RuntimeError(
+    "TURN_FROZEN_MISMATCH",
+    current === "host"
+      ? "该任务创建于沙箱执行方式，当前已停用 Windows 进程沙箱；旧审批不能转为宿主执行，请新建任务重新审批"
+      : "该任务创建于宿主执行方式，当前运行时要求沙箱执行；旧审批不能转为沙箱执行，请新建任务重新审批",
+  );
 }

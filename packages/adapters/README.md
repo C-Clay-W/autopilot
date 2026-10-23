@@ -9,7 +9,7 @@ Autopilot 的共享 Node.js 宿主适配层，为 Core 的 RuntimePorts 提供�
 - settings loader/writer/user service、CredentialStore 和受信的延迟凭据解析。
 - createNodeCapabilityLoader：指令、Skills、MCP、上下文和 Web 搜索/抓取；createNodeRagRuntime 提供 RAG 连接装配。
 - createNodeChatStorage、附件存储和 Chat capability loader，为无工作区 Chat 与 Work 隔离状态。
-- createNodeSandboxPort、Windows capability/status/setup 等平台适配。
+- createNodeSandboxPort（macOS Seatbelt）与 Windows 宿主执行 port（`createNodeHostExecutionSandboxPort`）等平台适配。
 
 本包不提供 Web HTTP/SSE/React UI，也不负责 CLI 的终端生命周期；这些由具体宿主承担。
 
@@ -41,8 +41,12 @@ npm run test -w packages/adapters -- test/node-credential-store.test.ts
 
 从 monorepo 根运行。输出 CJS/ESM 和声明；Core、Node 内置模块及 Anthropic sandbox-runtime 保持 external。0.1.0 精确依赖 sandbox-runtime 0.0.78；不要因安装成功就声称系统隔离、原生 Job 全树回收或跨平台实机验证完成。
 
-native/srt-win 保留原生候选、补丁和来源指纹，并非默认 npm runner 的替代品。参考 [Core API](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/Core-API.md)、[构建说明](https://github.com/C-Clay-W/autopilot/blob/main/BUILD.md) 和主包的平台限制。
+Windows 不加载 sandbox-runtime：进程工具经逐次审批后以当前用户权限直接执行，没有 OS 沙箱，`sandbox status` / `sandbox setup` 返回宿主执行停用报告；不要把它描述为隔离执行。参考 [Core API](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/Core-API.md)、[构建说明](https://github.com/C-Clay-W/autopilot/blob/main/BUILD.md) 和主包的平台限制。
+
+## 源码 0.2.0 与 npm 版本
+
+本次源码版本为 0.2.0，不表示 npm 已发布该版本；上面的 npm 0.1.0 安装示例继续对应旧归档。Windows 源码已移除进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
 
 ## 许可证
 
-项目代码为 MIT。Anthropic sandbox-runtime 及其派生补丁保留 Apache-2.0 授权，见 native/srt-win/LICENSE-APACHE-2.0 与仓库 THIRD_PARTY_NOTICES.md。
+项目代码为 MIT。macOS 沙箱所依赖的 Anthropic sandbox-runtime 0.0.78 仍为 Apache-2.0 授权，许可证副本见 native/srt-win/LICENSE-APACHE-2.0 与仓库 THIRD_PARTY_NOTICES.md；本项目不再包含针对该上游的 Windows 派生补丁。

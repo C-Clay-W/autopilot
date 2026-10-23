@@ -82,6 +82,8 @@ interface UseConversationSubmissionOptions {
   queueExecutionRequestedRef: RefObject<boolean>;
   awaitingApprovalRef: RefObject<boolean>;
   awaitingUserInputRef: RefObject<boolean>;
+  /** 执行代次：开始/停止/继续共用，旧请求的 finally 只能清理自己的执行段（H2）。 */
+  executionEpochRef: RefObject<number>;
   transportDisconnectedRef: RefObject<boolean>;
 }
 
@@ -136,6 +138,7 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
     queueExecutionRequestedRef,
     awaitingApprovalRef,
     awaitingUserInputRef,
+    executionEpochRef,
     transportDisconnectedRef,
   } = options;
   const { manager, refreshSessions } = useSessionTaskContext();
@@ -210,7 +213,11 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
     if (awaitingUserInputRef.current) return;
     const content = (overrideContent ?? inputRef.current).trim();
     if (!content && selectedFiles.length === 0) return;
-    if (cancelInFlightRef.current) return;
+    if (cancelInFlightRef.current) {
+      // 停止在途时不得抢跑，也不能静默丢弃用户动作（H2）。
+      notice.warning("任务正在停止，请等待服务端确认后再发送");
+      return;
+    }
     // 查找那条可续跑的消息
     const resumableMessage = [...messages].reverse().find((message) => message.role === "assistant" && message.canContinue && Boolean(message.turnId));
     if (!isChat && !loading && !overrideContent && sessionId && selectedFiles.length === 0 && selectedSkills.length === 0 && isContinueCommand(content) && resumableMessage) {
@@ -227,6 +234,8 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
     const files = selectedFiles;
     const selectedSkillsForRequest = selectedSkills;
     const mkId = (p: string) => `${p}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    /** 本函数认领的执行代次；只有发起新 Turn 的发送才拥有执行段（steer/queue 追加不认领）。 */
+    let ownedExecutionEpoch: number | null = null;
     const submittedAt = Date.now();
     const inputPosition = isSubmittingToActiveTurn ? capturePresentationInputPosition(options.presentation, activeTurnId, inputOrderRef.current++) : undefined;
     const hasUploadFiles = files.length > 0;
@@ -381,6 +390,8 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
         return;
       }
       const aiId = mkId("a");
+      ownedExecutionEpoch = executionEpochRef.current + 1;
+      executionEpochRef.current = ownedExecutionEpoch;
       const abortController = getSessionController(sid).createAbortController();
       requestAbortRef.current = abortController;
       cancelRequestedRef.current = false;
@@ -478,18 +489,22 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
             : m
         )));
       } finally {
-        setStreamingMessageId("");
         if (requestAbortRef.current === abortController) requestAbortRef.current = null;
-        cancelRequestedRef.current = false;
         if (locallyCreatedSessionRef.current === sid) locallyCreatedSessionRef.current = null;
-        if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
+        // 旧发送的收尾只清理自己认领的执行段，不覆盖后来续接的 loading/active（H2）。
+        if (executionEpochRef.current === ownedExecutionEpoch) {
+          setStreamingMessageId("");
+          cancelRequestedRef.current = false;
+          if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
+        }
       }
     }
     if (!agentContent && locallyCreatedSessionRef.current === sid) {
       locallyCreatedSessionRef.current = null;
       void loadHistory(sid);
     }
-    setLoading(false);
+    // 旧发送结束后不得清掉后来续接的执行 loading（H2）。
+    if (ownedExecutionEpoch === null || executionEpochRef.current === ownedExecutionEpoch) setLoading(false);
     if (queueExecutionRequestedRef.current) {
       queueExecutionRequestedRef.current = false;
       window.setTimeout(() => { void requestNextQueuedTurn(); }, 0);

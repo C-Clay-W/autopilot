@@ -171,6 +171,8 @@ export function createTurnRuntimeConfigResolver(
       permissionMode: frozen.permissionMode ?? capabilities.permissionMode ?? "ask",
       workspaceTrusted: !isChat && (frozen.workspaceTrusted ?? capabilities.workspaceTrusted ?? false),
       web: isChat && frozen.capabilityCeiling?.chatRetrievalMode !== "web" ? undefined : capabilities.web,
+      // Work 内置预览能力仅在 Work Turn 由能力上限解析阶段装配；Chat 恒为 undefined。
+      workPreview: isChat ? undefined : (capabilities as TurnCapabilities).workPreview,
       databaseSearch: !isChat && frozen.databaseSearchPolicy?.enabled === true ? capabilities.databaseSearch : undefined,
       context: isChat ? undefined : capabilities.context,
       skills: isChat ? undefined : capabilities.skills,

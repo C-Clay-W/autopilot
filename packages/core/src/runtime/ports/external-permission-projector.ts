@@ -11,6 +11,8 @@ export interface ExternalPermissionSnapshot {
   deny: readonly string[];
   /** 最新显式 ask 同样收窄持久放行；旧投影器未提供时按无额外 ask。 */
   ask?: readonly string[];
+  /** deny/ask 无法完整解释时置位：Core 按 deny 处理，持久放行一律不成立。 */
+  restricted?: boolean;
 }
 
 /** 外部权限规则投影端口；写失败抛错，由调用方把 grant 标记为 pending。 */

@@ -12,6 +12,7 @@ const chatMessageListSource = readFileSync(path.resolve(__dirname, "../../../app
 const chatComposerSource = readFileSync(path.resolve(__dirname, "../../../app/chat/components/ChatComposer.tsx"), "utf8");
 const chatMessageItemSource = readFileSync(path.resolve(__dirname, "../../../app/chat/components/ChatMessageItem.tsx"), "utf8");
 const sessionConversationSource = readFileSync(path.resolve(__dirname, "../../../app/chat/hooks/useSessionConversation.ts"), "utf8");
+const sessionTaskContextSource = readFileSync(path.resolve(__dirname, "../../../app/chat/session-task-context.tsx"), "utf8");
 
 describe("resolveProvisionalSessionView", function provisionalSessionViewSuite() {
   it("已有临时会话时点击新建仍显示空白草稿", function keepsBlankDraftVisible() {
@@ -66,6 +67,13 @@ describe("resolveProvisionalSessionView", function provisionalSessionViewSuite()
   it("只有真实可恢复的 Agent Turn 才显示继续执行", function onlyShowsContinueForRecoverableTurn() {
     expect(sessionConversationSource).toContain("canContinue: Boolean(m.turnId && recoverableTurnId && m.turnId === recoverableTurnId)");
     expect(sessionConversationSource).not.toContain("canContinue: m.turnId === recoverableTurnId");
+  });
+
+  it("空闲恢复校准合并连发事件且同代次请求在途复用（P17 问题3）", function mergesRestoreRefreshFanout() {
+    // focus 与 visibilitychange 连发时由最小间隔节流；同代次同 scope 复用在途请求，registry 内容未变保留引用。
+    expect(sessionTaskContextSource).toContain("now - lastRestoreRefreshAtRef.current < RESTORE_REFRESH_MIN_INTERVAL_MS");
+    expect(sessionTaskContextSource).toContain("if (reusable) return reusable;");
+    expect(sessionTaskContextSource).toContain("if (!sameWorkspaceList(workspacesRef.current, next))");
   });
 
   it("较旧 History 不覆盖尚未持久化的首发实时回答", function keepsRealtimeAnswerVisible() {

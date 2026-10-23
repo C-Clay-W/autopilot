@@ -29,6 +29,8 @@ import {
 import type { SessionImageAttachment } from "@/lib/session-attachment-store";
 import type { SessionPinnedSkill } from "@/lib/session-store";
 import { createSettingsRunConfig } from "./settings/runtime-settings";
+import { createWorkPreviewService, type WebWorkPreviewService } from "./workspace-host/work-preview-service";
+import { extractWorkPreviewToolFacts } from "./workspace-host/work-preview-facts";
 import { loadCore } from "./core-loader";
 import { getWorkspaceRequestContext } from "./workspace-host/web-workspace-session";
 
@@ -135,6 +137,9 @@ export interface WebCompositionRoot {
   /** 返回未启动的 RuntimeBootstrapService（用于分阶段测试）。 */
   getBootstrapService(): RuntimeBootstrapService;
 
+  /** 当前 Workspace Context 的 Work 预览服务；工具能力与受限 Route 共用同一实例。 */
+  workPreview: WebWorkPreviewService;
+
   /** Trust 后从 capability catalog 冻结本轮显式选择的 Skill。 */
   resolveSelectedSkills(selectedSkills: WebSelectedSkillInput[], pinnedSkills: SessionPinnedSkill[]): Promise<{
     skills: WebResolvedSelectedSkill[];
@@ -166,6 +171,13 @@ export async function getSharedWebRuntime(): Promise<AgentRuntimeFacade> {
   const context = getWorkspaceRequestContext();
   if (!context) throw new (loadCore().AgentRuntimeError)("WORKSPACE_REQUIRED", "请先选择工作区");
   return context.runtime;
+}
+
+/** 收集 Agent 自身监听端口的回环 authority；预览目标策略据此拒绝把管理 API/页面嵌入预览。 */
+function previewAgentAuthorities(): string[] {
+  const rawPort = process.env.PORT?.trim();
+  const port = rawPort && /^\d+$/.test(rawPort) ? rawPort : "3000";
+  return ["127.0.0.1:" + port, "localhost:" + port, "[::1]:" + port];
 }
 
 /** 创建 Web Composition Root。 */
@@ -203,12 +215,33 @@ export function createWebCompositionRoot(
   };
 
   const capabilityLoader = options.capabilityLoader ?? defaultCapabilityLoader;
+  // Work 内置预览：每 Workspace Context 单例；Job 与权威工具事实都延迟取自同一 Runtime，bootstrap 前不触达。
+  let runtimeFacade: AgentRuntimeFacade | undefined;
+  const workPreview = createWorkPreviewService({
+    workspaceRoot,
+    agentAuthorities: previewAgentAuthorities(),
+    jobsOf: function scopedJobs(sessionId) {
+      if (!runtimeFacade) throw new Error("预览服务尚未完成 bootstrap，无法访问后台任务");
+      return runtimeFacade.jobs.forSession({ workspaceId: workspaceRoot, sessionId });
+    },
+    factsOf: async function sessionPreviewFacts(sessionId) {
+      if (!runtimeFacade) throw new Error("预览服务尚未完成 bootstrap，无法读取会话事实");
+      const state = await runtimeFacade.turns.getState({ sessionId });
+      return extractWorkPreviewToolFacts(state.events);
+    },
+  });
+  const capabilityLoaderWithPreview: CapabilityLoader = {
+    ...capabilityLoader,
+    loadWorkPreview() {
+      return workPreview;
+    },
+  };
   const bootstrapOptions: CreateRuntimeBootstrapServiceOptions = {
     config,
     enableUserQuestions: true,
     workspaceAdapter,
     trustPolicy,
-    capabilityLoader,
+    capabilityLoader: capabilityLoaderWithPreview,
     createPorts: (trustedWorkspace) => {
       // 只有 trust 建立后才创建 manifest；不在未信任 workspace 的快路径写状态根。
       const loadedSettings = settingsLoader.load(trustedWorkspace);
@@ -295,11 +328,14 @@ export function createWebCompositionRoot(
 
     bootstrap: async () => {
       const runtime = await bootstrapService.bootstrap();
+      runtimeFacade = runtime;
       trustedWorkspaceRoot = await workspaceAdapter.canonicalizeWorkspaceRoot(await workspaceAdapter.resolveWorkspaceRoot());
       return runtime;
     },
 
     getBootstrapService: () => bootstrapService,
+
+    workPreview,
 
     resolveSelectedSkills,
 

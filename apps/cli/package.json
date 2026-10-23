@@ -1,6 +1,6 @@
 {
   "name": "@autopilot-agent/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
@@ -41,9 +41,9 @@
     "test:watch": "vitest --config vitest.config.ts"
   },
   "dependencies": {
-    "@autopilot-agent/adapters": "0.1.0",
-    "@autopilot-agent/core": "0.1.0",
-    "@autopilot-agent/presentation": "0.1.0",
+    "@autopilot-agent/adapters": "0.2.0",
+    "@autopilot-agent/core": "0.2.0",
+    "@autopilot-agent/presentation": "0.2.0",
     "ink": "6.8.0",
     "react": "19.2.4",
     "string-width": "^8.1.1",

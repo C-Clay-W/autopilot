@@ -107,7 +107,7 @@ export function createRuntimeAgentStream(input: {
           });
 
         for await (const event of eventStream) {
-          if (event.type === "turn_failed") terminalFailure = toWebTurnFailure(event.error);
+          if (event.type === "turn_failed") terminalFailure = toWebTurnFailure(event.error, event.errorCode);
           const browserEvent = event.type === "turn_failed" ? { ...event, error: terminalFailure!.message, failure: terminalFailure } : event as Record<string, unknown>;
           if (["turn_completed", "turn_failed", "turn_limit_reached", "turn_interrupted"].includes(event.type)) terminalEvent = browserEvent;
           else send(browserEvent);

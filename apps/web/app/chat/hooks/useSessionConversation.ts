@@ -5,7 +5,7 @@ import { useState, useRef, useEffect, useCallback, type Dispatch, type SetStateA
 import { createPresentationState, type AgentPresentationState, type TransportState } from "@autopilot-agent/presentation";
 import { reduceWebActivityState, type WebActivityState } from "@/lib/runtime-host/web-activity";
 import { reduceWebPresentationEvent, reduceWebTransportEvent } from "@/lib/runtime-host/web-presentation-adapter";
-import { toWebTurnFailure } from "@/lib/runtime-host/web-turn-failure";
+import { isWebTurnFailure, toWebTurnFailure } from "@/lib/runtime-host/web-turn-failure";
 import { sessionApiUrl } from "../conversation-target";
 import { mapHistoryMessage, shouldRetryHistoryFailure, type HistoryErrorPhase } from "../history-restore";
 import type {
@@ -112,6 +112,8 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
   const transportDisconnectedRef = useRef(false);
   const awaitingApprovalRef = useRef(false);
   const awaitingUserInputRef = useRef(false);
+  /** 执行代次：开始/停止/继续各自认领一段执行，旧请求的 finally 只能清理自己的执行段（H2）。 */
+  const executionEpochRef = useRef(0);
   const queueExecutionRequestedRef = useRef(false);
   const presentationFrameBatcherRef = useRef<WebPresentationFrameBatcher | null>(null);
   const presentationFrameBatcherKeyRef = useRef("");
@@ -313,12 +315,22 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
       setHistoryReady(true);
       setHistoryError(null);
       setPresentation(restoredPresentation);
+      const agent = !isChat && !data.readOnlyReason ? data.agent as SessionAgentState | undefined : undefined;
+      /**
+       * 服务端终态优先于 Presentation 里可能残留的 activeOperation：
+       * 旧活动快照不得把已失败/已完成/已中断的 Turn 重新恢复成运行中（H2）。
+       */
+      const serverSettled = data.meta.runtimeStatus === "idle"
+        || data.meta.runtimeStatus === "completed"
+        || data.meta.runtimeStatus === "failed"
+        || data.meta.runtimeStatus === "interrupted"
+        || agent?.status === "failed";
+      const restoredActiveOperation = data.readOnlyReason || serverSettled ? undefined : restoredPresentation.activeOperation;
       const restoredStart = restoredPresentation.turnId ? Date.parse(restoredPresentation.turnStartedAt[restoredPresentation.turnId] ?? "") : Number.NaN;
-      setActivity(!data.readOnlyReason && Number.isFinite(restoredStart) && restoredPresentation.activeOperation ? { turnId: restoredPresentation.turnId, startedAt: restoredStart, phase: "waiting", lastProgressAt: Date.now(), hasActiveTool: restoredPresentation.activeOperation.kind === "tool", stallable: false } : undefined);
+      setActivity(Number.isFinite(restoredStart) && restoredActiveOperation ? { turnId: restoredPresentation.turnId, startedAt: restoredStart, phase: "waiting", lastProgressAt: Date.now(), hasActiveTool: restoredActiveOperation.kind === "tool", stallable: false } : undefined);
       const restoredPins = (data.meta as SessionMeta).pinnedSkills ?? [];
       setPinnedSkills(restoredPins);
       setSelectedSkills(restoredPins.map((skill) => ({ skillRef: skill.skillRef, pinned: true })));
-      const agent = !isChat && !data.readOnlyReason ? data.agent as SessionAgentState | undefined : undefined;
       manager.updateRuntimeState(createWorkspaceSessionKey(workspaceId, sid), data.meta.runtimeStatus, data.meta.activeTurnId ?? agent?.turnId);
       const recoverableTurnId = agent?.recoverable && (agent.status === "interrupted_recoverable" || agent.status === "limit_reached")
         ? agent.turnId
@@ -326,7 +338,7 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
       const mapped: Message[] = data.messages.map(function mapMessage(m) { return mapHistoryMessage(m, agent, recoverableTurnId); });
       const restoredPendingInputs = (data.pendingInputs as PendingAgentInput[] | undefined) ?? [];
       const restoredTurnId = typeof data.turnId === "string" ? data.turnId : restoredPresentation.turnId;
-      const hasRestoredActiveTurn = !data.readOnlyReason && Boolean(restoredTurnId && restoredPresentation.activeOperation);
+      const hasRestoredActiveTurn = Boolean(restoredActiveOperation && restoredTurnId);
       setPendingInputs(restoredPendingInputs);
       pendingInputsRef.current = restoredPendingInputs;
       joinedInputIdsRef.current = new Set(restoredPresentation.items.flatMap(function consumed(item) { return item.kind === "input_notice" && item.state !== "queued" ? [item.inputId] : []; }));
@@ -431,7 +443,8 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
       manager.applyTerminalEvent(sessionKey, "turn_completed");
     }
     if (data.type === "turn_failed") {
-      const failure = toWebTurnFailure(data.failure ?? data.error);
+      // Host 已构建并持久化的 DTO 直接沿用；只有裸错误文本才重新分类（沙箱类别不降级）。
+      const failure = isWebTurnFailure(data.failure) ? data.failure : toWebTurnFailure(data.error ?? data.failure);
       setMessages((current) => current.map((message) => message.id === messageId ? { ...message, failure } : message));
       manager.updateRuntimeState(sessionKey, "failed");
       manager.applyTerminalEvent(sessionKey, "turn_failed");
@@ -469,7 +482,9 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
         ...message,
         activity: undefined,
         canContinue,
-        ...(termination ? { termination } : {}),
+        recoveryError: undefined,
+        // 新终态整体覆盖旧 termination：完成/失败不带 termination 时清掉上一段恢复留下的旧停止提示（P17 问题2）。
+        termination,
       } : message));
       clearActiveTurn();
     }
@@ -552,6 +567,7 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
     transportDisconnectedRef,
     awaitingApprovalRef,
     awaitingUserInputRef,
+    executionEpochRef,
     queueExecutionRequestedRef,
     getSessionController,
     setTransportState,

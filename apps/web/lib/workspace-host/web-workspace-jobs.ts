@@ -6,6 +6,7 @@
 
 import type { JobListView, JobReadView, JobView, SessionJobService } from "@autopilot-agent/core";
 import { readHttpErrorCode } from "../runtime-host/web-http-error";
+import { expectedRequestOrigin, isLoopbackHost } from "./request-source-origin";
 import { runWorkspaceSessionRoute } from "./workspace-session-route";
 import { workSessionErrorResponse } from "./work-session-error";
 
@@ -28,33 +29,29 @@ function failure(code: Parameters<typeof workSessionErrorResponse>[0]): Response
   return response;
 }
 
-/** 判断请求 URL 是否属于允许无 Origin 的本机回环 Host。 */
-function isLoopbackUrl(url: URL): boolean {
-  const hostname = url.hostname.toLowerCase();
-  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "[::1]";
-}
-
 /** 校验浏览器来源；写操作必须显式同源，读操作缺 Origin 时只允许回环 Host。 */
 export function validateWorkJobRequestSource(request: Request, mutation: boolean): Response | undefined {
   const requestUrl = new URL(request.url);
   const origin = request.headers.get("origin");
   const fetchSite = request.headers.get("sec-fetch-site")?.toLowerCase();
   if (origin === "null" || fetchSite === "cross-site") return failure("WORK_REQUEST_ORIGIN_INVALID");
+  // 内嵌预览页可把 Work API 当导航目标直取（dest=document/iframe/frame、mode=navigate）；
+  // 浏览器提供的 Fetch-Metadata 出现导航形态时拒绝，无该头的旧客户端保持原有判定不变。
+  const fetchDest = request.headers.get("sec-fetch-dest")?.toLowerCase();
+  const fetchMode = request.headers.get("sec-fetch-mode")?.toLowerCase();
+  if (fetchDest === "document" || fetchDest === "iframe" || fetchDest === "frame" || fetchMode === "navigate") {
+    return failure("WORK_REQUEST_ORIGIN_INVALID");
+  }
   if (origin) {
+    // Next 开发宿主可能把 request.url 规范成 localhost；仅对同端口回环 Host 恢复浏览器真实 origin。
+    const expectedOrigin = expectedRequestOrigin(requestUrl, request.headers.get("host"));
+    if (!expectedOrigin) return failure("WORK_REQUEST_ORIGIN_INVALID");
     try {
-      // Next 开发宿主可能把 request.url 规范成 localhost；仅对同端口回环 Host 恢复浏览器真实 origin。
-      let expectedOrigin = requestUrl.origin;
-      const host = request.headers.get("host");
-      if (host && host !== requestUrl.host) {
-        const actualUrl = new URL(`${requestUrl.protocol}//${host}`);
-        if (!isLoopbackUrl(requestUrl) || !isLoopbackUrl(actualUrl) || actualUrl.port !== requestUrl.port || actualUrl.host !== host) return failure("WORK_REQUEST_ORIGIN_INVALID");
-        expectedOrigin = actualUrl.origin;
-      }
       if (new URL(origin).origin !== expectedOrigin) return failure("WORK_REQUEST_ORIGIN_INVALID");
     } catch {
       return failure("WORK_REQUEST_ORIGIN_INVALID");
     }
-  } else if (mutation || !isLoopbackUrl(requestUrl)) {
+  } else if (mutation || !isLoopbackHost(requestUrl.hostname)) {
     return failure("WORK_REQUEST_ORIGIN_INVALID");
   }
   return undefined;

@@ -103,6 +103,8 @@ export interface ExternalRestrictionSnapshot {
   allow: readonly string[];
   deny: readonly string[];
   ask?: readonly string[];
+  /** deny/ask 无法完整解释时置位：任何外部目标按 deny 处理，不能只警告后放行。 */
+  restricted?: boolean;
 }
 
 /**
@@ -112,6 +114,8 @@ export interface ExternalRestrictionSnapshot {
  */
 export function classifyExternalRestriction(snapshot: ExternalRestrictionSnapshot, toolName: string, constraint: string): "allow" | "ask" | "deny" {
   if (!isExternalFileConstraint(constraint)) return "allow";
+  // 快照无法完整解释时无法证明收窄范围，直接按 deny 处理（fail-closed）。
+  if (snapshot.restricted === true) return "deny";
   const rule = formatExternalFileRule(toolName, constraint);
   if (snapshot.deny.some(function denied(restriction) { return externalRuleCoversRule(restriction, rule); })) return "deny";
   if ((snapshot.ask ?? []).some(function asked(restriction) { return externalRuleCoversRule(restriction, rule); })) return "ask";

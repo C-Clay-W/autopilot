@@ -45,12 +45,21 @@ export type CredentialSettingsInput =
   | { category: "main"; revision?: string; main: MainSettingsInput; search: SearchSettingsInput }
   | { category: "rag"; revision?: string; rag: Partial<Record<RagRole, RagConnectionInput | null>> };
 
+/** 权限段脱敏诊断：只有错误码、字段路径与作用域，不含配置值。 */
+export interface CredentialSettingsDiagnostic {
+  code: string;
+  field?: string;
+  scope: string;
+}
+
 /** Web 设置中心安全状态，不包含凭据正文或凭据引用。 */
 export interface CredentialSettingsStatus {
   revision: string;
   main: Omit<MainSettingsInput, "apiKey"> & { configured: boolean };
   search: Omit<SearchSettingsInput, "apiKey"> & { configured: boolean };
   rag: Record<RagRole, RagConnectionInput & { configured: boolean }>;
+  /** 权限段单独隔离展示；不影响模型字段的读取与保存。 */
+  diagnostics: CredentialSettingsDiagnostic[];
 }
 
 /** 设置 API 只暴露稳定错误码。 */

@@ -1,7 +1,7 @@
 /** chat-page-content.tsx — 单 Session 装配层：组合四组现有 Hook 与叶子 UI 组件，只保留必要装配与跨区域派生值，不新增业务判断。 */
 "use client";
 
-import { useCallback, useState, useRef, useEffect, type ReactNode } from "react";
+import { useCallback, useMemo, useState, useRef, useEffect, type ReactNode } from "react";
 import PermissionPanel from "./components/PermissionPanel";
 import StorageQuotaPanel from "./components/StorageQuotaPanel";
 import SkillPicker from "./components/SkillPicker";
@@ -11,7 +11,34 @@ import ChatComposer from "./components/ChatComposer";
 import ChatImagePreview from "./components/ChatImagePreview";
 import DiffSidebar from "./components/DiffSidebar";
 import DiffSidebarDivider from "./components/DiffSidebarDivider";
+import WorkPreviewPanel from "./components/WorkPreviewPanel";
+import WorkPreviewLayout from "./components/WorkPreviewLayout";
 import { selectDiffSections } from "./components/diff-sidebar-model";
+import {
+  admitAutoOpenPreview,
+  closedPreview,
+  createPreviewAutoOpenSuppression,
+  createPreviewRatioMemory,
+  createRequestGeneration,
+  evaluateAfterTurnCandidate,
+  canAutoOpenPreview,
+  findPreviewCandidateTurnId,
+  invalidatePendingAutoCandidates,
+  isDualPaneCapable,
+  listPreviewCandidates,
+  listStartedPreviewCalls,
+  previewEmbeddingUnknown,
+  previewFailed,
+  previewLoaded,
+  previewTargetReady,
+  startPreviewResolve,
+  suppressAutoOpenTurn,
+  type PreviewCandidate,
+  type PreviewStartedCall,
+  type WorkPreviewPanelState,
+  type WorkPreviewViewProps,
+} from "./work-preview-state";
+
 import { useNotice } from "./components/Notice";
 import { useSmartScroll } from "./hooks/useSmartScroll";
 import { useSidebar } from "./sidebar-context";
@@ -75,6 +102,54 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
       return Math.min(diffSidebarMax, Math.max(DIFF_SIDEBAR_MIN, current));
     });
   }, [diffSidebarMax]);
+  /** Work 内置预览面板状态：绑定打开时所在 sessionId；会话切换关闭，返回不补打开。 */
+  const [preview, setPreview] = useState<{ sessionId: string; state: WorkPreviewPanelState }>(function initialPreviewState() { return { sessionId: "", state: closedPreview() }; });
+  const previewRef = useRef(preview);
+  useEffect(function syncPreviewRef() { previewRef.current = preview; });
+  /** 左栏会话内存比例（0–100）：宽度按当前容器派生，容器变化比例不变。 */
+  const [previewLeftRatio, setPreviewLeftRatio] = useState(50);
+  const previewRatioMemoryRef = useRef(createPreviewRatioMemory());
+  const previewGenerationRef = useRef(createRequestGeneration());
+  const previewToolbarRef = useRef<HTMLDivElement | null>(null);
+  /** now/after_turn 自动打开的一次性消费记录（判定 4）。 */
+  const autoOpenedPreviewRef = useRef<Set<string>>(new Set());
+  /** 用户动作抑制：手动选择淘汰的更早候选、关闭后的整轮抑制（判定 6/AC-7）。 */
+  const previewSuppressionRef = useRef(createPreviewAutoOpenSuppression());
+  /** 最近一次渲染的工具交付候选快照：用户动作以此刻已存在的候选为边界。 */
+  const previewCandidatesRef = useRef<PreviewCandidate[]>([]);
+  /** 此刻已开始的 open_preview 调用快照：动作前已开始、动作后才完成的调用不得覆盖用户选择。 */
+  const previewStartedCallsRef = useRef<PreviewStartedCall[]>([]);
+  /** 当前工具交付导航的 previewId；resolving 阶段面板尚无目标，关闭时用它反查 Turn。 */
+  const panelPreviewIdRef = useRef<string | null>(null);
+  /** 待执行的自动展开定时器；实例失活或卸载时必须清除（AC-5）。 */
+  const previewTimersRef = useRef<Set<number>>(new Set());
+  const [resolvingPreviewId, setResolvingPreviewId] = useState<string | null>(null);
+  /** 当前实例是否可见活动：异步响应落地前重核，隐藏实例不得改写面板或挂载 iframe（AC-5）。 */
+  const previewActiveRef = useRef(active);
+  useEffect(function syncPreviewActiveRef() { previewActiveRef.current = active; }, [active]);
+  /** 清除全部待执行的自动展开定时器（幂等）。 */
+  const clearPreviewTimers = useCallback(function clearPreviewTimers() {
+    for (const timerId of previewTimersRef.current) window.clearTimeout(timerId);
+    previewTimersRef.current.clear();
+  }, []);
+  /**
+   * 用户显式预览动作（手动打开、结果内切换、关闭面板）：清除待执行自动展开，
+   * 淘汰此刻已存在的自动候选；关闭时另把抑制提升到 Turn 身份（AC-7/判定 6）。
+   */
+  const markUserPreviewAction = useCallback(function markUserPreviewAction(options: { suppressTurn: boolean }) {
+    clearPreviewTimers();
+    const candidates = previewCandidatesRef.current;
+    invalidatePendingAutoCandidates(previewSuppressionRef.current, candidates, previewStartedCallsRef.current);
+    if (!options.suppressTurn) return;
+    const target = previewRef.current.state.target;
+    const previewId = target?.source === "tool_delivery" ? target.previewId : panelPreviewIdRef.current ?? undefined;
+    const turnId = target?.turnId ?? findPreviewCandidateTurnId(candidates, previewId);
+    if (turnId) suppressAutoOpenTurn(previewSuppressionRef.current, turnId);
+  }, [clearPreviewTimers]);
+  const previewOpen = !isChat && hasWorkspace && active && preview.sessionId === sessionId && preview.state.phase !== "closed";
+  const previewDual = previewOpen && isDualPaneCapable(diffRowWidth);
+  /** 本挂载实例内经历 Live 流的轮次集合；历史回放轮不在其中（判定 2/G6）。 */
+  const liveTurnIdsRef = useRef<Set<string>>(new Set());
   const [compactConfirmOpen, setCompactConfirmOpen] = useState(false);
   const [compacting, setCompacting] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState<{ messageId: string; content: string } | null>(null);
@@ -138,6 +213,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     transportDisconnectedRef,
     awaitingApprovalRef,
     awaitingUserInputRef,
+    executionEpochRef,
     queueExecutionRequestedRef,
     getSessionController,
     setTransportState,
@@ -152,6 +228,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
   const currentRetrieval = sessionMeta?.chatRetrievalMode ?? retrievalMode;
 
   const {
+    stopping,
     cancelCurrentTurn,
     handleContinueTurn,
     handleApproval,
@@ -193,6 +270,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     transportDisconnectedRef,
     awaitingApprovalRef,
     awaitingUserInputRef,
+    executionEpochRef,
     pendingInputsRef,
     joinedInputIdsRef,
     currentSessionIdRef,
@@ -264,8 +342,13 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     queueExecutionRequestedRef,
     awaitingApprovalRef,
     awaitingUserInputRef,
+    executionEpochRef,
     transportDisconnectedRef,
   });
+
+  /** 空输入时的 Continue 入口复用既有恢复动作；只按结构化可恢复事实选择最近一条 Turn（H2）。 */
+  const resumableMessage = [...messages].reverse().find((message) => message.role === "assistant" && message.canContinue && Boolean(message.turnId));
+  const resumableMessageId = resumableMessage?.id;
 
   /** 按当前视口切换移动端抽屉或桌面端侧边栏。 */
   function handleSidebarToggle(): void {
@@ -279,6 +362,8 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
   /** 切换 Diff 侧边栏；窄屏打开前先收起会话抽屉，避免双 overlay 叠加（Plan 风险缓解）。 */
   function handleDiffSidebarToggle(): void {
     if (!diffSidebarOpen && !window.matchMedia("(min-width: 768px)").matches && sidebarOpen) closeSidebar();
+    // Diff 与预览互斥占用右侧：打开 Diff 前先关闭预览（用户显式切换，计入关闭抑制）。
+    if (!diffSidebarOpen) closePreviewPanel();
     setDiffSidebarOpenSessionId(diffSidebarOpen ? null : sessionId);
   }
 
@@ -287,6 +372,154 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     setDiffSidebarOpenSessionId(null);
     document.getElementById("diff-sidebar-trigger")?.focus();
   }
+
+  /** 关闭预览面板：取消在途请求，淘汰更早候选并把关闭抑制提升到 Turn（判定 6），保留会话比例。 */
+  const closePreviewPanel = useCallback(function closePreviewPanel() {
+    previewGenerationRef.current.next();
+    // 已关闭时只是幂等收尾，不把无关的用户动作记成对预览的关闭抑制。
+    if (previewRef.current.state.phase !== "closed") markUserPreviewAction({ suppressTurn: true });
+    setPreview(function close(current) { return { sessionId: current.sessionId, state: closedPreview() }; });
+    setResolvingPreviewId(null);
+    panelPreviewIdRef.current = null;
+  }, [markUserPreviewAction]);
+
+  /** 解析工具交付引用并打开面板；结果内按钮与 now 交付共用，不抢焦点。 */
+  const openPreviewDelivery = useCallback(async function openPreviewDelivery(targetPreviewId: string) {
+    if (isChat || !hasWorkspace) return;
+    const generation = previewGenerationRef.current.next();
+    panelPreviewIdRef.current = targetPreviewId;
+    setDiffSidebarOpenSessionId(null);
+    setResolvingPreviewId(targetPreviewId);
+    setPreview({ sessionId, state: startPreviewResolve(null) });
+    setPreviewLeftRatio(previewRatioMemoryRef.current.get(sessionId) ?? 50);
+    try {
+      const response = await fetch(getWorkspaceSessionUrl(workspaceId, sessionId, "/previews/" + encodeURIComponent(targetPreviewId)));
+      const payload = await response.json().catch(function emptyBody() { return {}; }) as { code?: string; error?: string; previewId?: string; turnId?: string; hostLabel?: string; navigationUrl?: string; sandboxProfile?: string; serviceState?: string; canStop?: boolean };
+      if (!previewGenerationRef.current.isCurrent(generation) || !previewActiveRef.current) return;
+      if (!response.ok || !payload.navigationUrl || !payload.hostLabel) {
+        setPreview(function fail(current) { return { sessionId: current.sessionId, state: previewFailed(current.state, payload.error || "预览引用不存在或不属于当前会话") }; });
+        return;
+      }
+      setPreview({ sessionId, state: previewTargetReady({
+        source: "tool_delivery",
+        previewId: payload.previewId ?? targetPreviewId,
+        turnId: payload.turnId,
+        hostLabel: payload.hostLabel,
+        navigationUrl: payload.navigationUrl,
+        sandboxProfile: payload.sandboxProfile === "strict_public" ? "strict_public" : "trusted_local",
+        serviceState: payload.serviceState === "ready" || payload.serviceState === "redirect_pending" || payload.serviceState === "unavailable" ? payload.serviceState : "unchecked",
+        canStop: payload.canStop === true,
+      }) });
+    } catch {
+      if (previewGenerationRef.current.isCurrent(generation) && previewActiveRef.current) {
+        setPreview(function fail(current) { return { sessionId: current.sessionId, state: previewFailed(current.state, "预览面板连接失败，请稍后重试") }; });
+      }
+    } finally {
+      if (previewGenerationRef.current.isCurrent(generation) && previewActiveRef.current) setResolvingPreviewId(null);
+    }
+  }, [isChat, hasWorkspace, workspaceId, sessionId]);
+
+  /** 延后一拍执行自动展开：避免 effect 内同步 setState；定时器登记以便失活/卸载时清除并重核可见身份。 */
+  const schedulePreviewOpen = useCallback(function schedulePreviewOpen(previewId: string) {
+    const timerId = window.setTimeout(function openScheduledPreview() {
+      previewTimersRef.current.delete(timerId);
+      if (!previewActiveRef.current) return;
+      void openPreviewDelivery(previewId);
+    }, 0);
+    previewTimersRef.current.add(timerId);
+  }, [openPreviewDelivery]);
+
+  /** Work 弹窗内置打开：POST open-link 校验并打开面板；取消/退出时中止请求并回滚本次导航。 */
+  const openPreviewLink = useCallback(async function openPreviewLink(url: string, signal?: AbortSignal): Promise<string | undefined> {
+    if (isChat || !hasWorkspace) return "预览仅在 Work 任务中可用";
+    const generation = previewGenerationRef.current.next();
+    // 手动打开是用户显式选择：淘汰此刻已存在的自动候选，迟到的自动结果不得覆盖（AC-7）。
+    panelPreviewIdRef.current = null;
+    markUserPreviewAction({ suppressTurn: false });
+    // 取消只回滚本次请求打开的解析态，不覆盖用户已经切到的其他目标（AC-7）。
+    const previousState = previewRef.current.sessionId === sessionId ? previewRef.current.state : closedPreview();
+    const resolveState = startPreviewResolve(null);
+    let settled = false;
+    signal?.addEventListener("abort", function cancelPreviewNavigation() {
+      if (settled) return;
+      previewGenerationRef.current.next();
+      setPreview(function restore(current) {
+        return current.state === resolveState ? { sessionId: current.sessionId, state: previousState } : current;
+      });
+    }, { once: true });
+    setDiffSidebarOpenSessionId(null);
+    setResolvingPreviewId(null);
+    setPreview({ sessionId, state: resolveState });
+    setPreviewLeftRatio(previewRatioMemoryRef.current.get(sessionId) ?? 50);
+    try {
+      const response = await fetch(getWorkspaceSessionUrl(workspaceId, sessionId, "/previews/open-link"), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }), signal });
+      const payload = await response.json().catch(function emptyBody() { return {}; }) as { code?: string; error?: string; hostLabel?: string; navigationUrl?: string; sandboxProfile?: string };
+      if (!previewGenerationRef.current.isCurrent(generation) || !previewActiveRef.current || signal?.aborted) return "预览请求已被新操作取代";
+      if (!response.ok || !payload.navigationUrl || !payload.hostLabel) {
+        const message = payload.error || "预览目标当前无法在宿主内打开";
+        setPreview(function fail(current) { return { sessionId: current.sessionId, state: previewFailed(current.state, message) }; });
+        return message;
+      }
+      setPreview({ sessionId, state: previewTargetReady({ source: "user_link", hostLabel: payload.hostLabel, navigationUrl: payload.navigationUrl, sandboxProfile: payload.sandboxProfile === "strict_public" ? "strict_public" : "trusted_local", serviceState: "unchecked", canStop: false }) });
+      // 弹窗关闭并恢复原焦点之后再聚焦侧栏工具栏（M13 人工验收焦点顺序）。
+      window.setTimeout(function focusPreviewToolbar() { previewToolbarRef.current?.focus(); }, 0);
+      return undefined;
+    } catch {
+      return signal?.aborted ? "预览请求已取消" : "预览面板连接失败，请稍后重试";
+    } finally {
+      // 本次导航已有结论：此后弹窗卸载触发的 abort 不再回滚已打开的面板。
+      settled = true;
+    }
+  }, [isChat, hasWorkspace, workspaceId, sessionId, markUserPreviewAction]);
+
+  /** 结果内切换按钮：本结果已显示时关闭，否则解析并切换到该结果（用户显式选择优先于旧自动候选）。 */
+  const togglePreviewDelivery = useCallback(function togglePreviewDelivery(targetPreviewId: string) {
+    const current = previewRef.current;
+    if (current.sessionId === sessionId && current.state.target?.source === "tool_delivery" && current.state.target.previewId === targetPreviewId) {
+      closePreviewPanel();
+      return;
+    }
+    markUserPreviewAction({ suppressTurn: false });
+    void openPreviewDelivery(targetPreviewId);
+  }, [sessionId, closePreviewPanel, openPreviewDelivery, markUserPreviewAction]);
+
+  /** 刷新按来源重走受限接口：工具交付重新 GET，手动链接重新 POST。 */
+  const refreshPreview = useCallback(function refreshPreview() {
+    const target = previewRef.current.state.target;
+    if (!target) return;
+    if (target.source === "tool_delivery" && target.previewId) void openPreviewDelivery(target.previewId);
+    else if (target.source === "user_link") void openPreviewLink(target.navigationUrl);
+  }, [openPreviewDelivery, openPreviewLink]);
+
+  /** 停止该引用拥有的受管 Job；取得确认终态后才提示"服务已停止"并关闭面板。 */
+  const stopPreviewJob = useCallback(async function stopPreviewJob() {
+    const target = previewRef.current.state.target;
+    if (!target?.previewId) return;
+    try {
+      const response = await fetch(getWorkspaceSessionUrl(workspaceId, sessionId, "/previews/" + encodeURIComponent(target.previewId) + "/stop"), { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      if (!response.ok) { notice.error("预览服务停止失败"); return; }
+      closePreviewPanel();
+      notice.success("服务已停止");
+    } catch {
+      notice.error("预览服务停止失败");
+    }
+  }, [workspaceId, sessionId, closePreviewPanel, notice]);
+
+  /** 拖动/键盘调整左栏比例并写入会话内存（不进入 Runtime、SSE、History 或 settings）。 */
+  const handlePreviewLeftRatioChange = useCallback(function handlePreviewLeftRatioChange(nextRatio: number) {
+    setPreviewLeftRatio(nextRatio);
+    if (sessionId) previewRatioMemoryRef.current.set(sessionId, nextRatio);
+  }, [sessionId]);
+
+  /** iframe load：只结束等待动画。 */
+  const handlePreviewLoad = useCallback(function handlePreviewLoad() {
+    setPreview(function markLoaded(current) { return { sessionId: current.sessionId, state: previewLoaded(current.state) }; });
+  }, []);
+
+  /** 界面等待超时：保留 iframe 与手动入口，不断言被 CSP 阻止。 */
+  const handlePreviewEmbeddingTimeout = useCallback(function handlePreviewEmbeddingTimeout() {
+    setPreview(function markUnknown(current) { return { sessionId: current.sessionId, state: previewEmbeddingUnknown(current.state) }; });
+  }, []);
 
   /** 将 RAG 的已持久化证据独立为 Turn 的 Evidence 分区，不混入 Runtime 工具输出。 */
   const renderEvidence = useCallback(function renderEvidence(sources?: SourceItem[]): ReactNode {
@@ -358,6 +591,91 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
   // eslint-disable-next-line react-hooks/exhaustive-deps -- 依赖数组与原 page.tsx 一致：仅在工作区切换时清空引用，setter 为稳定引用无需列入。
   }, [workspaceId]);
 
+  /** 会话/任务切换或实例失活：取消在途导航、清除待执行定时器并关闭面板；结果与比例保留，回来不补打开（判定 7/AC-5）。 */
+  useEffect(function closePreviewOnSessionChange() {
+    if (!active) clearPreviewTimers();
+    setPreview(function closeIfHidden(current) {
+      if ((current.sessionId === sessionId && active) || current.state.phase === "closed") return current;
+      previewGenerationRef.current.next();
+      setResolvingPreviewId(null);
+      return { sessionId: current.sessionId, state: closedPreview() };
+    });
+  }, [sessionId, active, clearPreviewTimers]);
+
+  /** 卸载清理：作废在途导航并清除待执行定时器，隐藏实例的迟到响应不会再落地面板（AC-5）。 */
+  useEffect(function cleanupPreviewOnUnmount() {
+    const generation = previewGenerationRef.current;
+    return function cleanup() {
+      generation.next();
+      clearPreviewTimers();
+    };
+  }, [clearPreviewTimers]);
+
+  /** 同步工具交付候选快照：用户动作以此刻已存在的候选为边界，动作之后的新请求仍按实时规则判定（AC-7）。 */
+  useEffect(function syncPreviewCandidates() {
+    previewCandidatesRef.current = listPreviewCandidates(presentation);
+    previewStartedCallsRef.current = listStartedPreviewCalls(presentation);
+  }, [presentation]);
+
+  /** now 交付自动展开：仅活动轮与可见实例展开；后台到达、被用户动作淘汰或本轮已关闭的候选只留结果入口（判定 2/4/5/6）。 */
+  useEffect(function autoOpenNowDeliveries() {
+    if (isChat || !activeTurnId) return;
+    const visible = canAutoOpenPreview({
+      active,
+      readOnly: Boolean(readOnlyReason),
+      documentVisible: typeof document === "undefined" || document.visibilityState === "visible",
+    });
+    for (const item of presentation.items) {
+      if (item.kind !== "tool_call" || item.state !== "completed" || item.turnId !== activeTurnId) continue;
+      const detail = item.detail;
+      if (detail?.kind !== "open_preview" || detail.openWhen !== "now") continue;
+      // 宿主无法证明服务归属时只保留结果入口，不自动展开（R1）。
+      if (detail.autoOpen === false) continue;
+      const admitted = admitAutoOpenPreview({
+        suppression: previewSuppressionRef.current,
+        consumed: autoOpenedPreviewRef.current,
+        turnId: item.turnId,
+        previewId: detail.previewId,
+        callId: item.callId,
+        visible,
+      });
+      if (admitted) schedulePreviewOpen(detail.previewId);
+    }
+  }, [presentation, activeTurnId, active, isChat, readOnlyReason, sessionId, schedulePreviewOpen]);
+
+  /** Live 轮次追踪：start/continue/恢复置位期间记录轮次，供 after_turn 终态评估区分实时与历史回放。 */
+  useEffect(function trackLiveTurns() {
+    if (!activeTurnId) return;
+    liveTurnIdsRef.current.add(activeTurnId);
+  }, [activeTurnId]);
+
+  /** after_turn 自动展开：仅本挂载 Live 轮的精确正常终态评估一次；后台/文档隐藏完成、被用户动作淘汰或本轮已关闭的候选只留结果尾部入口（判定 2/3/5/6/7）。 */
+  useEffect(function autoOpenAfterTurnDeliveries() {
+    if (isChat) return;
+    const visible = canAutoOpenPreview({
+      active,
+      readOnly: Boolean(readOnlyReason),
+      documentVisible: typeof document === "undefined" || document.visibilityState === "visible",
+    });
+    for (const item of presentation.items) {
+      if (item.kind !== "turn_summary" || item.state !== "completed") continue;
+      if (!liveTurnIdsRef.current.has(item.turnId)) continue;
+      const delivery = evaluateAfterTurnCandidate(presentation, item.turnId);
+      if (!delivery || delivery.autoOpen === false) continue;
+      const admitted = admitAutoOpenPreview({
+        suppression: previewSuppressionRef.current,
+        consumed: autoOpenedPreviewRef.current,
+        turnId: item.turnId,
+        previewId: delivery.previewId,
+        callId: delivery.callId,
+        visible,
+      });
+      if (!admitted) continue;
+      // 延后一拍触发，避免 effect 内同步 setState 造成级联渲染；终态评估仍在本效果内一次性完成。
+      schedulePreviewOpen(delivery.previewId);
+    }
+  }, [presentation, isChat, active, readOnlyReason, schedulePreviewOpen]);
+
   /** 复制用户 Prompt 或模型回复，并为浏览器权限失败提供明确的短暂反馈。 */
   async function handleCopyMessage(messageId: string, content: string, label: "Prompt" | "回复"): Promise<void> {
     try {
@@ -383,6 +701,19 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     setEditingPrompt(null);
     void handleSend(content);
   }
+
+  /** 消息链路的预览接线；对象引用随面板状态变化，驱动新旧回答 memo 刷新。 */
+  const workPreviewView = useMemo(function buildWorkPreviewView(): WorkPreviewViewProps | undefined {
+    if (isChat) return undefined;
+    const target = preview.sessionId === sessionId ? preview.state.target : null;
+    return {
+      panelPreviewId: preview.state.phase !== "closed" && target?.source === "tool_delivery" ? target.previewId ?? null : null,
+      resolvingPreviewId: preview.sessionId === sessionId ? resolvingPreviewId : null,
+      onTogglePreview: togglePreviewDelivery,
+      onOpenInPreview: openPreviewLink,
+    };
+  // preview 进入依赖：面板打开/关闭/换目标都刷新消息链路的按钮状态。
+  }, [isChat, sessionId, preview, resolvingPreviewId, togglePreviewDelivery, openPreviewLink]);
 
   const pendingApprovals = (isChat || readOnlyReason ? [] : presentation.items).filter((item): item is ApprovalItem => item.kind === "approval" && item.state === "required");
   const pendingApproval = pendingApprovals[pendingApprovals.length - 1];
@@ -466,9 +797,27 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
         </div>
       )}
 
-      {/* 消息列表与输入区：md+ 与 Diff 侧边栏并排；窄屏 Diff 为全屏 overlay，不占布局位 */}
+      {/* 消息列表与输入区：md+ 与 Diff/预览右侧面板并排；预览打开时按会话比例分配双栏 */}
       <div ref={diffRowRef} className="flex min-h-0 flex-1 flex-row">
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <WorkPreviewLayout
+          containerWidth={diffRowWidth}
+          leftRatio={previewLeftRatio}
+          onLeftRatioChange={handlePreviewLeftRatioChange}
+          active={previewOpen}
+          narrow={previewOpen && !previewDual}
+          panel={previewOpen ? (
+            <WorkPreviewPanel
+              state={preview.state}
+              narrow={!previewDual}
+              toolbarRef={previewToolbarRef}
+              onLoad={handlePreviewLoad}
+              onEmbeddingTimeout={handlePreviewEmbeddingTimeout}
+              onRefresh={refreshPreview}
+              onClose={closePreviewPanel}
+              onStop={function stopPreview() { void stopPreviewJob(); }}
+            />
+          ) : null}
+        >
       <ChatMessageList
         isChat={isChat}
         messages={messages}
@@ -503,6 +852,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
         setRequestedJobId={setRequestedJobId}
         handleApproval={handleApproval}
         handleUserQuestion={handleUserQuestion}
+        stopping={stopping}
         cancelCurrentTurn={cancelCurrentTurn}
         handleContinueTurn={handleContinueTurn}
         editingPrompt={editingPrompt}
@@ -513,6 +863,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
         handleEditPrompt={handleEditPrompt}
         setSelectedImage={setSelectedImage}
         readOnlyReason={readOnlyReason}
+        workPreview={workPreviewView}
       />
 
       {/* 输入区：粗黑边框 + 直角 */}
@@ -560,13 +911,16 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
          handleKeyDown={handleKeyDown}
         activeTurnId={activeTurnId}
         handleSend={handleSend}
+        handleContinueTurn={handleContinueTurn}
+        resumableMessageId={resumableMessageId}
+        stopping={stopping}
         cancelCurrentTurn={cancelCurrentTurn}
         databaseSyncMessage={databaseSyncMessage}
         databaseSyncing={databaseSyncing}
         databaseSyncElapsedSeconds={databaseSyncElapsedSeconds}
         inputDelivery={inputDelivery}
       />
-        </div>
+        </WorkPreviewLayout>
         {diffSidebarOpen && <DiffSidebarDivider width={diffSidebarWidth} onChange={handleDiffSidebarWidthChange} />}
         {!isChat && <DiffSidebar open={diffSidebarOpen} onClose={closeDiffSidebar} width={diffSidebarWidth} items={presentation.items} activeTurnId={activeTurnId} />}
       </div>

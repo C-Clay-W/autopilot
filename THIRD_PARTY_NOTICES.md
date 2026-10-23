@@ -11,7 +11,7 @@ Upstream: https://github.com/JetBrains/JetBrainsMono
 
 ## Anthropic sandbox-runtime
 
-Adapters depends on @anthropic-ai/sandbox-runtime 0.0.78, licensed under Apache-2.0. Native candidate patches under packages/adapters/native/srt-win are derived from its Windows sources; they are modified material, not an unmodified upstream release. source-manifest.json identifies the source commit and file fingerprints. The upstream Apache-2.0 license is retained there as LICENSE-APACHE-2.0.
+Adapters depends on @anthropic-ai/sandbox-runtime 0.0.78, licensed under Apache-2.0. The dependency serves the macOS sandbox path only; Windows process tools run on the host after per-call approval and have no OS sandbox. A copy of the upstream Apache-2.0 license is retained as packages/adapters/native/srt-win/LICENSE-APACHE-2.0. The project no longer ships derived Windows patches, candidate build scripts or a source manifest for that upstream package.
 Upstream: https://github.com/anthropic-experimental/sandbox-runtime
 
 ## npm dependencies

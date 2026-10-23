@@ -4,7 +4,10 @@
  * durable 记录只含安全 policy 摘要、缺范围 fail-closed）。
  */
 
+import net from "node:net";
+import os from "node:os";
 import path from "node:path";
+import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import * as processUtils from "../../internal/tools/process-utils";
 import { SANDBOX_ERROR_CODES, type SandboxExecutionRequest, type SandboxPolicy, type SandboxPreparedCommand } from "../domain/sandbox-policy";
@@ -13,6 +16,7 @@ import type { StartJobInput } from "../domain";
 import { createMemoryPorts } from "../adapters/memory";
 import { createSessionService } from "./session-service";
 import { createJobService } from "./job-service";
+import type { JobServiceOwnershipProbe } from "./job-service-ownership";
 
 /** 真实子进程只允许在 env 指向的测试工作区运行。 */
 function getTestWorkspaceRoot(): string {
@@ -269,5 +273,142 @@ describe.skipIf(!hasWorkspaceRoot)("JobService 沙箱生命周期", function san
     await expect(f.jobs.start(input)).rejects.toMatchObject({ code: SANDBOX_ERROR_CODES.UNAVAILABLE });
     expect(await f.ports.jobStore.list(f.workspaceRoot)).toEqual([]);
     expect(f.sandbox.prepared).toHaveLength(0);
+  });
+});
+
+describe("JobService 声明服务地址（Talk-Plan0908 R1）", function suite() {
+  /** 端口检查发生在会话校验之后、cwd 解析与 spawn 之前，因此无需真实工作区或子进程。 */
+  async function createUrlFixture(serviceProbe: JobServiceOwnershipProbe) {
+    const workspaceRoot = "C:\\ws-url-fixture";
+    const ports = createMemoryPorts(workspaceRoot);
+    await createSessionService(ports).create({ id: "s-url" });
+    const sandbox = createFakeSandboxPort();
+    const jobs = createJobService({ store: ports.jobStore, ownerProbe: ports.jobOwnerProbe, sessionStore: ports.sessionStore, projectStore: ports.projectStore, serviceProbe });
+    /** 沙箱范围仅用于通过启动前置检查；端口检查先于 spawn，不会真正创建进程。 */
+    function sandboxBinding(): StartJobInput["sandbox"] {
+      const policy: SandboxPolicy = { mode: "workspace-write", workspaceRoot, allowedDomains: [], deniedRead: [], deniedWrite: [] };
+      return { port: sandbox.port, policy };
+    }
+    return { workspaceRoot, ports, jobs, sandboxBinding };
+  }
+
+  /** 构造带声明服务地址的后台启动输入；cwd 不会被解析（端口检查先于目录解析）。 */
+  function startInputWith(workspaceRoot: string, serviceUrl: string, sandboxBinding: () => StartJobInput["sandbox"]): StartJobInput {
+    return { workspaceId: workspaceRoot, workspaceRoot, sessionId: "s-url", program: process.execPath, args: ["--version"], cwd: ".", serviceUrl, sandbox: sandboxBinding() } as unknown as StartJobInput;
+  }
+
+  it("声明的服务端口已被占用时拒绝启动，不创建任何 Job 记录", async function rejectsOccupiedDeclaredPort() {
+    const serviceProbe: JobServiceOwnershipProbe = {
+      async listenerPids(port) { return port === 5199 ? [4242] : []; },
+      async ancestry() { return undefined; },
+    };
+    const { workspaceRoot, ports, jobs, sandboxBinding } = await createUrlFixture(serviceProbe);
+    await expect(jobs.start(startInputWith(workspaceRoot, "http://127.0.0.1:5199/", sandboxBinding))).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(await ports.jobStore.list(workspaceRoot)).toEqual([]);
+  });
+
+  it("声明地址非法或非 loopback 时拒绝启动", async function rejectsIllegalServiceUrl() {
+    const { workspaceRoot, jobs, sandboxBinding } = await createUrlFixture({ async listenerPids() { return []; }, async ancestry() { return undefined; } });
+    await expect(jobs.start(startInputWith(workspaceRoot, "http://192.168.1.2:5199/", sandboxBinding))).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    await expect(jobs.start(startInputWith(workspaceRoot, "not a url", sandboxBinding))).rejects.toMatchObject({ code: "INVALID_INPUT" });
+  });
+});
+
+/** Talk-Plan1022 S2 宿主执行合成夹具：无需真实工作区与子进程的 host 范围启动检查。 */
+describe("JobService 宿主执行（Talk-Plan1022 S2 合成）", function suite() {
+  async function createHostUrlFixture(serviceProbe: JobServiceOwnershipProbe) {
+    const workspaceRoot = "C:\\ws-host-fixture";
+    const ports = createMemoryPorts(workspaceRoot);
+    await createSessionService(ports).create({ id: "s-host" });
+    const sandbox = createFakeSandboxPort();
+    const jobs = createJobService({ store: ports.jobStore, ownerProbe: ports.jobOwnerProbe, sessionStore: ports.sessionStore, projectStore: ports.projectStore, serviceProbe });
+    function hostBinding(): StartJobInput["sandbox"] {
+      const policy: SandboxPolicy = { mode: "workspace-write", workspaceRoot, allowedDomains: [], deniedRead: [], deniedWrite: [] };
+      return { execution: "host", policy };
+    }
+    return { workspaceRoot, ports, jobs, sandbox, hostBinding };
+  }
+
+  it("宿主范围同样执行启动前端口占用检查，prepare 零调用", async function hostRejectsOccupiedPort() {
+    const serviceProbe: JobServiceOwnershipProbe = {
+      async listenerPids(port) { return port === 5211 ? [4242] : []; },
+      async ancestry() { return undefined; },
+    };
+    const { workspaceRoot, ports, jobs, sandbox, hostBinding } = await createHostUrlFixture(serviceProbe);
+    const input: StartJobInput = { workspaceId: workspaceRoot, workspaceRoot, sessionId: "s-host", program: process.execPath, args: ["--version"], cwd: ".", serviceUrl: "http://127.0.0.1:5211/", sandbox: hostBinding() } as unknown as StartJobInput;
+    await expect(jobs.start(input)).rejects.toMatchObject({ code: "INVALID_INPUT" });
+    expect(await ports.jobStore.list(workspaceRoot)).toEqual([]);
+    expect(sandbox.prepared).toHaveLength(0);
+  });
+
+  it("宿主范围启动失败时按 host_spawn_failed 记录真实执行方式，不伪造 wrapper 事实", async function hostSpawnFailurePhase() {
+    // workspaceRoot 必须 realpath 存在：start 在端口检查后解析 canonical cwd。
+    const root = await mkdtemp(path.join(os.tmpdir(), "plan1022-hostfail-"));
+    try {
+      const workspaceRoot = await realpath(root);
+      const ports = createMemoryPorts(workspaceRoot);
+      await createSessionService(ports).create({ id: "s-host" });
+      const local = createJobService({ store: ports.jobStore, ownerProbe: ports.jobOwnerProbe, sessionStore: ports.sessionStore, serviceProbe: { async listenerPids() { return []; }, async ancestry() { return undefined; } } });
+      const policy: SandboxPolicy = { mode: "workspace-write", workspaceRoot, allowedDomains: [], deniedRead: [], deniedWrite: [] };
+      const input: StartJobInput = { workspaceId: workspaceRoot, workspaceRoot, sessionId: "s-host", program: "missing-host-tool-xyz", args: [], cwd: ".", sandbox: { execution: "host", policy } } as unknown as StartJobInput;
+      await expect(local.start(input)).rejects.toMatchObject({ code: "JOB_SPAWN_FAILED" });
+      const stored = (await ports.jobStore.list(workspaceRoot)).at(-1);
+      expect(stored).toMatchObject({ status: "failed", failureCode: "JOB_SPAWN_FAILED" });
+      expect(stored?.sandbox).toMatchObject({ mode: "workspace-write", execution: "host" });
+      expect(stored?.execution?.phase).toBe("host_spawn_failed");
+      expect(stored?.execution?.targetState).toBe("not_started");
+      await local.shutdown();
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+});
+
+describe.skipIf(!hasWorkspaceRoot)("JobService 宿主执行实机组（Talk-Plan1022 S2）", function suite() {
+  it("批准启动→running→owned→stop 确认关闭，零 prepare，摘要标记 execution host", async function hostJobLifecycle() {
+    const f = await createFixture("host-lifecycle");
+    const port = 18100 + Math.floor(Math.random() * 1000);
+    const serviceUrl = `http://127.0.0.1:${port}`;
+    const policy: SandboxPolicy = { mode: "workspace-write", workspaceRoot: f.workspaceRoot, allowedDomains: [], deniedRead: [], deniedWrite: [] };
+    try {
+      const job = await f.jobs.start({ workspaceId: f.workspaceRoot, workspaceRoot: f.workspaceRoot, sessionId: f.sessionId, program: process.execPath, args: ["-e", `require('http').createServer(function (req, res) { res.end('ok'); }).listen(${port}, '127.0.0.1');`], cwd: ".", serviceUrl, sandbox: { execution: "host", policy } });
+      expect(job.status).toBe("running");
+      expect(job.sandbox).toMatchObject({ mode: "workspace-write", execution: "host" });
+      expect(f.sandbox.prepared).toHaveLength(0);
+      // ready：宿主服务真实监听并响应。
+      await waitFor(async function ready() {
+        try { return (await fetch(serviceUrl)).status === 200; } catch { return false; }
+      });
+      const session = f.jobs.forSession({ workspaceId: f.workspaceRoot, sessionId: f.sessionId });
+      const listView = await session.list();
+      expect(listView.jobs.find(function same(candidate) { return candidate.jobId === job.id; })).toMatchObject({ controlState: "owned", canStop: true, serviceUrl });
+      // 归属核验走 R1 既有链路：监听 PID 属于 Job 进程树 → owned，自动展开候选成立。
+      await expect(session.verifyServiceOwnership({ jobId: job.id, serviceUrl })).resolves.toBe("owned");
+      const stopped = await session.stop({ jobId: job.id, source: "agent" });
+      expect(stopped.status).toBe("stopped");
+      expect(stopped.lastControl).toMatchObject({ action: "stop", source: "agent" });
+      await expect(fetch(serviceUrl)).rejects.toThrow();
+    } finally { await f.jobs.shutdown(); }
+  });
+
+  it("非本 Job 监听与无法核验都不放行自动交付", async function hostOwnershipFailClosed() {
+    // 归属核验只在 owner Runtime 内进行（非 owner 视角 processes.has 不成立即 unowned），
+    // 因此两个场景各自用注入 probe 的 owner jobs：外部监听 PID 不在 Job 进程树 → unowned；
+    // probe 无法核验 → unverifiable。两者都不产生自动展开候选。
+    const f = await createFixture("host-unowned");
+    const policy: SandboxPolicy = { mode: "workspace-write", workspaceRoot: f.workspaceRoot, allowedDomains: [], deniedRead: [], deniedWrite: [] };
+    // probe 同时服务启动前端口检查与归属核验：serviceUp 之前返回空闲，之后才呈现外部监听/无法核验。
+    let foreignServiceUp = false;
+    let unverifiableServiceUp = false;
+    const foreign: JobServiceOwnershipProbe = { async listenerPids() { return foreignServiceUp ? [999999] : []; }, async ancestry() { return [999999]; } };
+    const unverifiable: JobServiceOwnershipProbe = { async listenerPids() { return unverifiableServiceUp ? undefined : []; }, async ancestry() { return undefined; } };
+    const foreignJobs = createJobService({ store: f.ports.jobStore, ownerProbe: f.ports.jobOwnerProbe, sessionStore: f.ports.sessionStore, projectStore: f.ports.projectStore, serviceProbe: foreign });
+    const unverifiableJobs = createJobService({ store: f.ports.jobStore, ownerProbe: f.ports.jobOwnerProbe, sessionStore: f.ports.sessionStore, projectStore: f.ports.projectStore, serviceProbe: unverifiable });
+    try {
+      const foreignJob = await foreignJobs.start({ workspaceId: f.workspaceRoot, workspaceRoot: f.workspaceRoot, sessionId: f.sessionId, program: process.execPath, args: ["-e", "setInterval(function tick(){},1000)"], cwd: ".", serviceUrl: "http://127.0.0.1:18200/", sandbox: { execution: "host", policy } });
+      foreignServiceUp = true;
+      await expect(foreignJobs.forSession({ workspaceId: f.workspaceRoot, sessionId: f.sessionId }).verifyServiceOwnership({ jobId: foreignJob.id, serviceUrl: "http://127.0.0.1:18200/" })).resolves.toBe("unowned");
+      const unverifiableJob = await unverifiableJobs.start({ workspaceId: f.workspaceRoot, workspaceRoot: f.workspaceRoot, sessionId: f.sessionId, program: process.execPath, args: ["-e", "setInterval(function tick(){},1000)"], cwd: ".", serviceUrl: "http://127.0.0.1:18201/", sandbox: { execution: "host", policy } });
+      unverifiableServiceUp = true;
+      await expect(unverifiableJobs.forSession({ workspaceId: f.workspaceRoot, sessionId: f.sessionId }).verifyServiceOwnership({ jobId: unverifiableJob.id, serviceUrl: "http://127.0.0.1:18201/" })).resolves.toBe("unverifiable");
+    } finally { await foreignJobs.shutdown(); await unverifiableJobs.shutdown(); await f.jobs.shutdown(); }
   });
 });

@@ -16,13 +16,20 @@ function failure(error: unknown) {
   const messages: Record<string, string> = {
     INVALID_SETTINGS_INPUT: "配置内容无效，请检查供应商、模型、服务地址、维度和 Key。",
     SETTINGS_INPUT_INVALID: "配置内容无效，请检查供应商、模型、服务地址、维度和 Key。",
-    SETTINGS_INVALID: "现有模型配置无法读取，请先修复配置后重试。",
+    SETTINGS_INVALID: "现有配置存在无法读取的字段，请先修复该字段后重试。",
     SETTINGS_KEY_REQUIRED: "请填写当前连接的 API Key；更换供应商或地址后不能沿用旧 Key。",
     SETTINGS_MIGRATION_CONFLICT: "检测到多份不同的旧主模型 Key，请填写新的主 Key 后再保存。",
     SETTINGS_CHANGED: "配置已在其他位置更新，请刷新后重试。",
   };
   const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
-  return response({ code: Object.hasOwn(messages, code) ? code : "SETTINGS_SAVE_FAILED", error: messages[code] ?? "配置暂时无法保存，请稍后重试。" }, code === "SETTINGS_CHANGED" ? 409 : Object.hasOwn(messages, code) ? 400 : 500);
+  // 只透出错误码与字段路径，绝不回显配置值；权限段诊断不进入该错误（设置页单独展示）。
+  const detail = error && typeof error === "object" && "diagnostic" in error ? error.diagnostic as { code?: unknown; field?: unknown } | undefined : undefined;
+  const field = typeof detail?.field === "string" ? `（${String(detail.code)}：${detail.field}）` : typeof detail?.code === "string" ? `（${detail.code}）` : "";
+  return response({
+    code: Object.hasOwn(messages, code) ? code : "SETTINGS_SAVE_FAILED",
+    error: `${messages[code] ?? "配置暂时无法保存，请稍后重试。"}${field}`,
+    ...(field ? { diagnostic: { code: detail?.code, field: detail?.field } } : {}),
+  }, code === "SETTINGS_CHANGED" ? 409 : Object.hasOwn(messages, code) ? 400 : 500);
 }
 
 /** 返回已配置状态，绝不返回已保存 Key。 */

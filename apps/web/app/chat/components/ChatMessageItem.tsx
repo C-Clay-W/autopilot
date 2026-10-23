@@ -12,6 +12,7 @@ import type { UserQuestionAnswerDraft } from "./AskUserQuestionCard";
 import { selectAssistantAnswers, type AgentPresentationState, type ApprovalItem, type UserQuestionItem } from "@autopilot-agent/presentation";
 import type { ChatRetrievalMode } from "@autopilot-agent/core";
 import { conversationUrl } from "../conversation-target";
+import type { WorkPreviewViewProps } from "../work-preview-state";
 import { formatSize, getSessionImageUrl } from "../chat-page-helpers";
 import type { Message, SourceItem } from "../chat-page-types";
 import type { WebActivityState } from "@/lib/runtime-host/web-activity";
@@ -36,6 +37,8 @@ interface ChatMessageItemProps {
   handleUserQuestion: (messageId: string, question: UserQuestionItem, answers: UserQuestionAnswerDraft[]) => Promise<void>;
   cancelCurrentTurn: () => Promise<void>;
   handleContinueTurn: (messageId: string) => Promise<void>;
+  /** 停止请求在途：继续入口显示忙状态而不是静默失效（H2）。 */
+  stopping: boolean;
   editingPrompt: { messageId: string; content: string } | null;
   setEditingPrompt: Dispatch<SetStateAction<{ messageId: string; content: string } | null>>;
   handleResendEditedPrompt: () => void;
@@ -43,10 +46,12 @@ interface ChatMessageItemProps {
   copiedMessageId: string | null;
   handleEditPrompt: (messageId: string, content: string) => void;
   setSelectedImage: Dispatch<SetStateAction<{ url: string; alt: string } | null>>;
+  /** Work 内置预览接线；未传（Chat）时沿用原链接弹窗行为。 */
+  workPreview?: WorkPreviewViewProps;
 }
 
 /** 渲染单条消息气泡；展示顺序、条件分支和回调接线与原页面保持一致。 */
-function ChatMessageItem({ msg, workspaceId, workspace, sessionId, isChat, currentRetrieval, presentation, showProcess, renderEvidence, loading, canWrite, readOnlyReason, activity, setRequestedJobId, handleApproval, handleUserQuestion, cancelCurrentTurn, handleContinueTurn, editingPrompt, setEditingPrompt, handleResendEditedPrompt, handleCopyMessage, copiedMessageId, handleEditPrompt, setSelectedImage }: ChatMessageItemProps) {
+function ChatMessageItem({ msg, workspaceId, workspace, sessionId, isChat, currentRetrieval, presentation, showProcess, renderEvidence, loading, canWrite, readOnlyReason, activity, setRequestedJobId, handleApproval, handleUserQuestion, cancelCurrentTurn, handleContinueTurn, stopping, editingPrompt, setEditingPrompt, handleResendEditedPrompt, handleCopyMessage, copiedMessageId, handleEditPrompt, setSelectedImage, workPreview }: ChatMessageItemProps) {
   const assistantAnswers = msg.role === "assistant" && msg.turnId ? selectAssistantAnswers(presentation, msg.turnId) : [];
   const assistantReplyContent = assistantAnswers[assistantAnswers.length - 1]?.content ?? (msg.role === "assistant" && !msg.turnId ? msg.content : undefined);
 
@@ -104,6 +109,7 @@ function ChatMessageItem({ msg, workspaceId, workspace, sessionId, isChat, curre
             settingsHref={`/settings?returnTo=${encodeURIComponent(conversationUrl(workspaceId, sessionId))}`}
             readOnly={Boolean(readOnlyReason)}
             productMode={isChat ? "chat" : "work"}
+            workPreview={workPreview}
             ragEvidence={isChat && currentRetrieval === "rag"}
             disabled={loading || !canWrite}
             isResuming={msg.activity === "answer"}
@@ -120,16 +126,21 @@ function ChatMessageItem({ msg, workspaceId, workspace, sessionId, isChat, curre
           <KnowledgeIngestCard readOnly={!isChat} items={msg.knowledgeIngestItems} workspaceName={workspace?.displayName || "当前"} />
         )}
         {msg.content && msg.role === "assistant" && !msg.turnId && (
-          <MarkdownRenderer content={msg.content} ragEvidence={isChat && currentRetrieval === "rag"} />
+          <MarkdownRenderer content={msg.content} ragEvidence={isChat && currentRetrieval === "rag"} onOpenInPreview={workPreview?.onOpenInPreview} />
+        )}
+        {/* 继续/停止的失败原因在当前消息内结构化展示，不依赖不可见的普通 content（H2）。 */}
+        {!isChat && !readOnlyReason && msg.role === "assistant" && msg.recoveryError && (
+          <p role="alert" className="mt-3 border-l-4 border-error bg-error/10 px-3 py-2 text-xs text-ink">{msg.recoveryError}</p>
         )}
         {!isChat && !readOnlyReason && msg.role === "assistant" && msg.canContinue && (
           <button
             type="button"
             onClick={() => void handleContinueTurn(msg.id)}
-            disabled={loading || !canWrite}
+            disabled={loading || !canWrite || stopping}
+            title={stopping ? "正在停止任务，请等待服务端确认后再继续" : undefined}
             className="mt-3 inline-flex items-center gap-2 border-2 border-accent bg-accent/10 px-3 py-1.5 text-xs font-semibold text-accent transition hover:bg-accent hover:text-ink-on-dark disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            继续执行
+            {stopping ? "正在停止…" : "继续执行"}
           </button>
         )}
         {msg.role === "assistant" && assistantReplyContent && (
@@ -230,11 +241,13 @@ function areChatMessageItemPropsEqual(previous: ChatMessageItemProps, next: Chat
     && previous.renderEvidence === next.renderEvidence
     && previous.loading === next.loading
     && previous.canWrite === next.canWrite
+    && previous.stopping === next.stopping
     && previous.readOnlyReason === next.readOnlyReason
     && presentationUnchanged
     && activityUnchanged
-    && previous.editingPrompt === next.editingPrompt
-    && previous.copiedMessageId === next.copiedMessageId;
+  && previous.editingPrompt === next.editingPrompt
+  && previous.copiedMessageId === next.copiedMessageId
+  && previous.workPreview === next.workPreview;
 }
 
 export default memo(ChatMessageItem, areChatMessageItemPropsEqual);

@@ -53,7 +53,7 @@ async function createApprovalFixture(options: { constraint?: string; toolName?: 
 }
 
 /** 可编程假投影器：记录 project 调用并按脚本回答 read。 */
-function createFakeProjector(script: { allow?: string[]; deny?: string[]; ask?: string[]; failProject?: boolean } = {}): ExternalPermissionProjector & { projects: Array<{ rule: string; action: string }> } {
+function createFakeProjector(script: { allow?: string[]; deny?: string[]; ask?: string[]; restricted?: boolean; failProject?: boolean } = {}): ExternalPermissionProjector & { projects: Array<{ rule: string; action: string }> } {
   const projects: Array<{ rule: string; action: string }> = [];
   return {
     projects,
@@ -62,7 +62,7 @@ function createFakeProjector(script: { allow?: string[]; deny?: string[]; ask?: 
       if (script.failProject) throw new Error("SETTINGS_IO_FAILED");
     },
     async read() {
-      return { allow: script.allow ?? [], deny: script.deny ?? [], ask: script.ask ?? [] };
+      return { allow: script.allow ?? [], deny: script.deny ?? [], ask: script.ask ?? [], ...(script.restricted ? { restricted: true } : {}) };
     },
   };
 }
@@ -102,6 +102,14 @@ describe("ApprovalService 外部授权（Talk-Plan1013 Stage 2）", () => {
     const approvals = createApprovalService({ ...ports, externalRuleProjector: createFakeProjector({ allow: [] }) });
     await approvals.submit({ sessionId, turnId, approvalId: "a-ext", decision: "allow_workspace" });
     await expect(approvals.hasPersistentGrant({ workspaceRoot: "C:\\ws", sessionId, toolName: "write_file", constraint: "ext-file:C:\\outside\\a.txt" })).resolves.toBe(false);
+  });
+
+  it("H3：快照无法解释 deny/ask 时持久放行不成立，限制判定按 deny", async () => {
+    const { ports, sessionId, turnId } = await createApprovalFixture({ constraint: "ext-file:C:\\outside\\a.txt" });
+    const approvals = createApprovalService({ ...ports, externalRuleProjector: createFakeProjector({ allow: ["Write(C:\\outside\\a.txt)"], restricted: true }) });
+    await approvals.submit({ sessionId, turnId, approvalId: "a-ext", decision: "allow_workspace" });
+    await expect(approvals.hasPersistentGrant({ workspaceRoot: "C:\\ws", sessionId, toolName: "write_file", constraint: "ext-file:C:\\outside\\a.txt" })).resolves.toBe(false);
+    await expect(approvals.resolveExternalRestriction({ workspaceRoot: "C:\\ws", toolName: "write_file", constraint: "ext-file:C:\\outside\\a.txt" })).resolves.toBe("deny");
   });
 
   it("deny 并集收窄：deny 目录递归规则覆盖 grant 目标时不放行", async () => {

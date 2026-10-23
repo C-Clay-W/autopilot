@@ -15,18 +15,21 @@ import { projectPublicContextUsage } from "../../internal/kernel/context-budget"
 import type { AgentEvent } from "./event-envelope";
 import type { AgentLoopEvent } from "../../internal/agent-runtime";
 import { sanitizeAgentTerminationView } from "./recoverable-turn-view";
+import { isSandboxAvailabilityFailureCode } from "../domain/sandbox-policy";
 
-/** 将 Web 工具调用与结果改成可恢复的安全占位；完整工具消息仍只保留在 Core 私有 checkpoint。 */
+/** 将 Web 工具与 open_preview 的调用与结果改成可恢复的安全占位；完整工具消息仍只保留在 Core 私有 checkpoint。 */
 export function redactWebCheckpoint(checkpoint: AgentCheckpoint): AgentCheckpoint {
+  /** Web 与 Work 预览的原始输入都不进入 durable checkpoint；同进程 restore 缝隙负责回填。 */
+  const isRedactedCallName = (name: string): boolean => name === "web_search" || name === "web_fetch" || name === "open_preview";
   const webCallIds = new Set<string>();
   for (const message of checkpoint.messages) {
     for (const block of message.content) {
-      if (block.type === "tool-call" && (block.name === "web_search" || block.name === "web_fetch")) webCallIds.add(block.id);
+      if (block.type === "tool-call" && isRedactedCallName(block.name)) webCallIds.add(block.id);
     }
   }
   const hasPendingWeb = checkpoint.pendingCalls?.some(
-    /** 判断暂停调用中是否存在尚未执行的 Web 工具。 */
-    function isPendingWebCall(call) { return call.name === "web_search" || call.name === "web_fetch"; },
+    /** 判断暂停调用中是否存在尚未执行的受脱敏工具。 */
+    function isPendingWebCall(call) { return isRedactedCallName(call.name); },
   ) === true;
   if (webCallIds.size === 0 && !hasPendingWeb) return checkpoint;
   const messages: AgentMessage[] = checkpoint.messages.map(
@@ -34,13 +37,13 @@ export function redactWebCheckpoint(checkpoint: AgentCheckpoint): AgentCheckpoin
     function redactWebMessage(message) {
       const containsWebCall = message.content.some(
         /** 判断当前消息是否发起 Web 调用，以便同时删除同一消息的内部推理块。 */
-        function isWebCall(block) { return block.type === "tool-call" && (block.name === "web_search" || block.name === "web_fetch"); },
+        function isWebCall(block) { return block.type === "tool-call" && isRedactedCallName(block.name); },
       );
       const content: AgentMessage["content"] = message.content.flatMap(
         /** 替换 Web 参数/结果，并删除同一 Web 消息的内部推理块。 */
         function redactWebBlock(block) {
           if (containsWebCall && block.type === "reasoning") return [];
-          if (block.type === "tool-call" && (block.name === "web_search" || block.name === "web_fetch")) {
+          if (block.type === "tool-call" && isRedactedCallName(block.name)) {
             return [{ ...block, input: { redacted: true } }];
           }
           if (block.type === "tool-result" && webCallIds.has(block.toolCallId)) {
@@ -55,7 +58,7 @@ export function redactWebCheckpoint(checkpoint: AgentCheckpoint): AgentCheckpoin
   const pendingCalls = checkpoint.pendingCalls?.map(
     /** 替换尚未执行的 Web 工具输入，同时保留调用身份和顺序。 */
     function redactPendingWebCall(call) {
-      return (call.name === "web_search" || call.name === "web_fetch") ? { ...call, input: { redacted: true } } : call;
+      return isRedactedCallName(call.name) ? { ...call, input: { redacted: true } } : call;
     },
   );
   return { ...checkpoint, messages, ...(pendingCalls ? { pendingCalls } : {}) };
@@ -180,6 +183,12 @@ function sanitizeExternalError(value: string): string {
   return safeMessages.find(function findKnownMessage(message) { return value === message; }) ?? "Agent Loop 执行失败";
 }
 
+/** 终态结构化失败类别只放行沙箱可用性失败，避免内部错误码扩散为公开协议面。 */
+function sanitizeTerminalErrorCode(event: AgentLoopEvent): AgentLoopEvent {
+  if (!("errorCode" in event) || typeof event.errorCode !== "string") return event;
+  return isSandboxAvailabilityFailureCode(event.errorCode) ? event : { ...event, errorCode: undefined };
+}
+
 /** 终态可继续状态只由 Core checkpoint 状态计算。 */
 function isRecoverableCheckpointStatus(status: AgentCheckpoint["status"]): boolean {
   return status === "awaiting_approval"
@@ -214,7 +223,7 @@ function projectTermination(event: AgentLoopEvent): ReturnType<typeof sanitizeAg
  */
 export function sanitizeEventForExternal(event: AgentLoopEvent | AgentEvent): AgentEvent {
   const internalEvent = event as AgentLoopEvent;
-  const safeEvent = sanitizeContextUsageEvent(sanitizeWebToolResult(sanitizeTodoToolResult(internalEvent)));
+  const safeEvent = sanitizeContextUsageEvent(sanitizeWebToolResult(sanitizeTodoToolResult(sanitizeTerminalErrorCode(internalEvent))));
   const eventWithoutRawError = "error" in safeEvent && typeof safeEvent.error === "string"
     ? { ...safeEvent, error: sanitizeExternalError(safeEvent.error) } as AgentLoopEvent
     : safeEvent;

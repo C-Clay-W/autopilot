@@ -826,7 +826,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
         if (rejectedUsageEvent) yield rejectedUsageEvent;
         yield { type: "tool_result", turnId, stepId, callId: item.id, toolName: item.name, result, retryCount: 0, summary: result.error.code };
       }
-      yield { type: "turn_failed", turnId, error: rejected.error.code, checkpoint: { turnId, status: "failed", stepCount, messages, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) } };
+      yield { type: "turn_failed", turnId, error: rejected.error.code, errorCode: isSandboxAvailabilityFailureCode(rejected.error.code) ? rejected.error.code : undefined, checkpoint: { turnId, status: "failed", stepCount, messages, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) } };
       return true;
     }
     return false;
@@ -969,10 +969,11 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
             yield { type: "tool_result", turnId, stepId, callId: skippedCall.id, toolName: skippedCall.name, result: skippedResult, retryCount: 0, ...skippedDisplay };
           }
           await persistSafeToolBatchCheckpoint([]);
-          const deniedMessage = getDeniedTerminalMessage(result.status === "denied" ? result.error.code : undefined);
+          const resumeDeniedCode = result.status === "denied" ? result.error.code : undefined;
+          const deniedMessage = getDeniedTerminalMessage(resumeDeniedCode);
           yield { type: "answer_delta", turnId, stepId, delta: deniedMessage };
           const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages: [...messages, createAgentTextMessage("assistant", deniedMessage)], completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
-          yield { type: "turn_failed", turnId, error: deniedMessage, checkpoint };
+          yield { type: "turn_failed", turnId, error: deniedMessage, errorCode: isSandboxAvailabilityFailureCode(resumeDeniedCode ?? "") ? resumeDeniedCode : undefined, checkpoint };
           return;
         }
         resumeApprovalAvailable = false;
@@ -1393,7 +1394,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
           const deniedMessage = getDeniedTerminalMessage(deniedErrorCode);
           yield { type: "answer_delta", turnId, stepId, delta: deniedMessage };
           const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages: [...messages, createAgentTextMessage("assistant", deniedMessage)], completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
-          yield { type: "turn_failed", turnId, error: deniedMessage, checkpoint };
+          yield { type: "turn_failed", turnId, error: deniedMessage, errorCode: isSandboxAvailabilityFailureCode(deniedErrorCode ?? "") ? deniedErrorCode : undefined, checkpoint };
           return;
         }
         if (guardrailAction) {

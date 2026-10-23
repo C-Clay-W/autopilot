@@ -13,6 +13,8 @@ interface Props {
   content: string;
   /** 仅 Chat RAG 的回答启用知识图片与 canonical 表格格式化。 */
   ragEvidence?: boolean;
+  /** 可选的 Work 内置打开回调；未传时沿用现有两项操作（Chat 不传）。signal 随弹窗取消/退出中止。 */
+  onOpenInPreview?: (url: string, signal: AbortSignal) => Promise<string | undefined>;
 }
 
 /** 图片仅允许当前站点的知识预览端点，不加载模型提供的外部网址或任意本地路径。 */
@@ -61,7 +63,7 @@ function KnowledgeImage({ src, alt }: { src: string; alt: string }) {
 }
 
 /** 使用标准语法解析器，保留受限 URL 策略且不执行原始 HTML。 */
-export default function MarkdownRenderer({ content, ragEvidence = false }: Props) {
+export default function MarkdownRenderer({ content, ragEvidence = false, onOpenInPreview }: Props) {
   const [pendingLink, setPendingLink] = useState<{ url: string; label: string } | null>(null);
   const markdown = useMemo(function prepareContent() { return ragEvidence ? formatRagTables(content) : content; }, [content, ragEvidence]);
   const components = useMemo<Components>(function markdownComponents() { return {
@@ -120,5 +122,5 @@ export default function MarkdownRenderer({ content, ragEvidence = false }: Props
   }; }, [ragEvidence]);
   /** 标准解析器先过滤危险协议，图片还需命中站内知识路由。 */
   function transformUrl(url: string, key: string) { return key === "src" ? ragEvidence && isKnowledgeImage(url) ? url : "" : defaultUrlTransform(url); }
-  return <><div className="prose prose-sm max-w-none"><ReactMarkdown remarkPlugins={[remarkGfm]} components={components} urlTransform={transformUrl}>{markdown}</ReactMarkdown></div>{pendingLink && <ExternalLinkDialog url={pendingLink.url} label={pendingLink.label} onClose={function closeLinkDialog() { setPendingLink(null); }} />}</>;
+  return <><div className="prose prose-sm max-w-none"><ReactMarkdown remarkPlugins={[remarkGfm]} components={components} urlTransform={transformUrl}>{markdown}</ReactMarkdown></div>{pendingLink && <ExternalLinkDialog url={pendingLink.url} label={pendingLink.label} onClose={function closeLinkDialog() { setPendingLink(null); }} onOpenInPreview={onOpenInPreview} />}</>;
 }

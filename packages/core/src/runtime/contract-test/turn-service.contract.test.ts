@@ -1198,3 +1198,85 @@ describe("TurnService contract test", function turnServiceContractSuite() {
     expect(sampleCount).toBe(3);
   });
 });
+
+/** H1：会话延续基线要保留失败轮的原始请求，而不是回退到更早的 completed 历史。 */
+describe("会话延续基线（H1）", function conversationBaselineSuite() {
+  /** 构造一次 run_command 采样结果；内存宿主沙箱不可用会把它压成 SANDBOX_UNAVAILABLE 拒绝。 */
+  function sandboxCommandSample(callId: string) {
+    return {
+      content: "",
+      toolCalls: [{ id: callId, name: "run_command", input: { program: "node", args: ["-e", "process.stdout.write('h1')"], cwd: "." } }],
+      reasoningSummary: "mock",
+    };
+  }
+
+  it("首次任务因沙箱不可用失败后，继续执行仍能看到原请求与失败事实", async function keepsFirstFailedTask() {
+    const ports = createMemoryPorts();
+    const sessionId = "turn-baseline-first-failed";
+    await seedSession(ports, sessionId);
+    const samples: AgentMessage[][] = [];
+    const runtime = createAgentRuntime({
+      ports,
+      defaultRunConfig: {
+        modelRef: { provider: "firstParty", modelId: "fixture-model" },
+        providerSettings: { primary: { apiProtocol: "anthropic-messages" } },
+        modelSampler: {
+          async sample(messages) {
+            samples.push(messages);
+            return samples.length === 1 ? sandboxCommandSample("h1-call-1") : { content: "继续处理", toolCalls: [], reasoningSummary: "mock" };
+          },
+        },
+      },
+    });
+
+    const firstEvents = await collectEvents(runtime.turns.start({ sessionId, content: "把计算器做成 index.html" }));
+    const failed = firstEvents.at(-1);
+    expect(failed?.type).toBe("turn_failed");
+    // 终态带出结构化沙箱类别，Web 不再把它当模型配置问题。
+    expect(failed?.type === "turn_failed" ? failed.errorCode : undefined).toBe("SANDBOX_UNAVAILABLE");
+    expect(samples).toHaveLength(1);
+
+    const secondEvents = await collectEvents(runtime.turns.start({ sessionId, content: "继续执行" }));
+    expect(secondEvents.some(function completed(event) { return event.type === "turn_completed"; })).toBe(true);
+    const secondInput = JSON.stringify(samples[1]);
+    expect(secondInput).toContain("把计算器做成 index.html");
+    expect(secondInput).toContain("沙箱不可用");
+    expect(secondInput).toContain("继续执行");
+    // 失败轮的未知副作用不能被自动重放。
+    expect(secondEvents.filter(function reranCommand(event) { return event.type === "tool_started" && event.toolName === "run_command"; })).toHaveLength(0);
+  });
+
+  it("已有成功历史时，最新失败轮仍是下一轮基线", async function prefersLatestFailedTurn() {
+    const ports = createMemoryPorts();
+    const sessionId = "turn-baseline-after-completed";
+    await seedSession(ports, sessionId);
+    const samples: AgentMessage[][] = [];
+    const runtime = createAgentRuntime({
+      ports,
+      defaultRunConfig: {
+        modelRef: { provider: "firstParty", modelId: "fixture-model" },
+        providerSettings: { primary: { apiProtocol: "anthropic-messages" } },
+        modelSampler: {
+          async sample(messages) {
+            samples.push(messages);
+            if (samples.length === 1) return { content: "第一轮完成", toolCalls: [], reasoningSummary: "mock" };
+            if (samples.length === 2) return sandboxCommandSample("h1-call-2");
+            return { content: "继续处理", toolCalls: [], reasoningSummary: "mock" };
+          },
+        },
+      },
+    });
+
+    await collectEvents(runtime.turns.start({ sessionId, content: "第一轮任务" }));
+    const failedEvents = await collectEvents(runtime.turns.start({ sessionId, content: "第二轮任务" }));
+    expect(failedEvents.at(-1)?.type).toBe("turn_failed");
+    expect(samples).toHaveLength(2);
+
+    const thirdEvents = await collectEvents(runtime.turns.start({ sessionId, content: "继续执行" }));
+    expect(thirdEvents.some(function completed(event) { return event.type === "turn_completed"; })).toBe(true);
+    const thirdInput = JSON.stringify(samples[2]);
+    expect(thirdInput).toContain("第一轮任务");
+    expect(thirdInput).toContain("第二轮任务");
+    expect(thirdInput).toContain("沙箱不可用");
+  });
+});

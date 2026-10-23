@@ -6,7 +6,7 @@
 import stringWidth from "string-width";
 
 /** Autopilot 品牌版本号。 */
-export const AUTOPILOT_VERSION = "0.1.0";
+export const AUTOPILOT_VERSION = "0.2.0";
 /** 品牌像素字母的完整单词。 */
 export const AUTOPILOT_BRAND_WORD = "AUTOPILOT";
 /** 开场动画总时长（毫秒）。 */

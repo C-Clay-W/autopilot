@@ -5,6 +5,7 @@
 import { NodeChatError, createNodeIdentityError } from "./node-errors";
 import { createUnavailableSandboxPort, type ProductMode, type RuntimePorts } from "@autopilot-agent/core";
 import { createNodeCapabilityLoader } from "./create-node-capability-loader";
+import { createNodeHostExecutionSandboxPort } from "./sandbox/node-host-execution-sandbox-port";
 import { createNodeSandboxPort } from "./sandbox/node-sandbox-port";
 import { createNodeWorkspaceAdapter } from "./workspace-adapter";
 import { createNodeApprovalStore } from "./stores/node-approval-store";
@@ -84,14 +85,18 @@ export function createNodeRuntimePorts(options: NodeRuntimePortsOptions): Runtim
      * Stage 2：Work 模式装配真实 SRT adapter（绑定 canonical workspaceRoot；tempRoot
      * 必须由宿主显式验证后提供）；Chat 保持 unavailable stub——Chat 不开放 Work 工具，
      * 即使伪造 full_access 也不能获得进程沙箱能力。workspaceRoot 缺失时同样 fail-closed。
+     * Talk-Plan1022 S1：Windows 宿主执行模式装配宿主执行 port——不加载 SRT、不要求
+     * provision，进程调用经用户逐次审批后在宿主直接执行；macOS 装配保持不变。
      */
     sandboxPort: options.productMode === "chat" || options.workspaceRoot === undefined
       ? createUnavailableSandboxPort()
-      : createNodeSandboxPort({
-          workspaceRoot: options.workspaceRoot,
-          stateRoot: options.stateRoot,
-          ...(options.sandboxTempRoot !== undefined ? { tempRoot: options.sandboxTempRoot } : {}),
-        }),
+      : process.platform === "win32"
+        ? createNodeHostExecutionSandboxPort()
+        : createNodeSandboxPort({
+            workspaceRoot: options.workspaceRoot,
+            stateRoot: options.stateRoot,
+            ...(options.sandboxTempRoot !== undefined ? { tempRoot: options.sandboxTempRoot } : {}),
+          }),
   };
 }
 

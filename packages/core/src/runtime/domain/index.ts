@@ -16,6 +16,7 @@ export type { ExternalExecutionTarget, ExternalExecutionApproval, ExternalExecut
 export { SANDBOX_ERROR_CODES, SANDBOX_POLICY_VERSION, isSandboxPolicyDenialCode, isSandboxAvailabilityFailureCode, resolveSandboxMode, computeSandboxPolicyDigest } from "./sandbox-policy";
 export type { Turn, TurnStatus } from "./turn";
 export { JOB_RECORD_VERSION } from "./job";
+export { normalizeJobServiceUrl, jobServicePort, sameServiceOrigin } from "./job-service-url";
 export type { Job, JobStatus, JobOwner, JobOwnerLiveness, JobControlState, JobExecutionFacts, JobLastControl, JobView, JobListView, JobReadView, JobOutputSnapshot, JobSafeOutputSnapshot, JobSafeOutputStreamSnapshot, JobSafeOutputStreamView, JobOutputView, JobSandboxSummary, StartJobInput, PollJobInput, JobPollResult } from "./job";
 export type { FileMutation, FileMutationOperation, FileMutationStatus, PrepareFileMutationInput, UndoTransaction } from "./file-mutation";
 export type { Project, CreateProjectInput } from "./project";

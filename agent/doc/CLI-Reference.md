@@ -178,6 +178,8 @@ autopilot resume [--session <id>] [--output interactive|text|jsonl]
 
 恢复最近由 Core 确认可恢复的 Turn。Turn 状态全集为 `running | awaiting_approval | awaiting_user_input | interrupted_recoverable | limit_reached | completed | failed`，其中**只有 `awaiting_approval`、`interrupted_recoverable`、`limit_reached` 三种可执行恢复**；`awaiting_user_input` 仅会出现在同一 durable stateRoot 的 Web Session，CLI 固定显示“请在支持结构化回答的 Web 中处理”，不展示题目、选项或补充正文，也不伪造答案或调用 `continue`。`completed`、`failed` 与不可恢复终态（包括耗尽的 `token_budget`）不显示 Resume 指引。没有可恢复 Turn 时返回 `INVALID_INPUT`。从安全批次 checkpoint 恢复时，Core 私有存储沿用已完成调用与 canonical history，宿主不读取完整 checkpoint；仍未闭合的调用按未知结果安全闭合。
 
+恢复或新 Turn 的对话基线取最近一个“可安全重建”的终态轮（`completed`/`failed`/`interrupted`，checkpoint 身份一致、消息可迁移、工具配对完整）：最新失败或中断任务仍留在上下文中，继续执行不回退到更早历史，也不重放失败轮的工具调用。沙箱可用性等环境阻塞失败以结构化 `errorCode`（如 `SANDBOX_UNAVAILABLE`）区分，提示对应原因与处理说明，不再统一引导模型配置。
+
 来源未验证的旧 Work 历史不再参与恢复：Core `getRecoverableState()` 返回 null，因此 CLI 将其视为无可恢复 Turn；直接 start/continue/compact 也受 `WORK_HISTORY_READ_ONLY` 限制。请新建任务，旧知识、会话与 transcript 保留。Node Context 暂停旧 Memory 召回，有 query 时返回 `LEGACY_MEMORY_REVIEW_REQUIRED`；不自动迁移或删除旧记忆，新的 Work AutoMemory 尚未接入。
 
 ---
@@ -293,6 +295,8 @@ autopilot config get model --scope user
 ### 6.3 手写 settings.json 的参数与写法
 
 文件必须是 JSON 对象，不支持 JSON 注释或尾随逗号。**不要添加 `schemaVersion`**：当前 resolver 对任何显式 schemaVersion 都产生 `SETTINGS_SCHEMA_VERSION_UNSUPPORTED`，忽略整份来源。未知顶层字段不会因此获得执行能力；env 字符串也不会自动导出到进程环境。
+
+`permissions` 段只接受 `allow`/`deny`/`ask`：`allow` 仅 Local 文件（workspace 的 `settings.local.json` 投影）生效，User/Project 的 `allow` 产生 `SETTINGS_PERMISSIONS_SCOPE_FORBIDDEN`；未知字段（如 Claude Code 的 `defaultMode`、`Bash(...)` 类工具规则）产生 `SETTINGS_PERMISSIONS_UNSUPPORTED`——该字段不生效、不迁移、不写回，也不会产生任何授权，同段合法的 `deny`/`ask` 收窄继续保留。`deny`/`ask` 出现无法解释的条目或 `permissions` 不是对象时产生 `SETTINGS_PERMISSIONS_UNSAFE` / `SETTINGS_PERMISSIONS_INVALID`：外部文件操作的自动放行与持久授权一律按拒绝处理（fail-closed），修正该字段前不会恢复。设置中心读取时权限段问题单独展示，不阻断模型字段读写；保存模型配置不会删除、迁移或改写该段。
 
 最小默认协议配置（占位模型必须替换为供应商可用的完整 ID）：
 
@@ -451,7 +455,7 @@ autopilot mcp revoke <server>
 - `approve <server> [--yes]`：为 server 当前配置与有效执行模式保存 workspace grant，不会由此命令启动 server；成功输出 `{ serverName, approved, executionMode, isolation }`。默认 `host` 与显式 `host` 都会在授权前 stderr 明确警告其直接运行在宿主且没有 OS 沙箱隔离；非交互必须 `--yes`，否则 stderr 输出 `MCP_APPROVAL_CONFIRMATION_REQUIRED` 并以退出码 1 结束。
 - `revoke <server>`：撤销该 server 的授权，输出 `{ serverName, revoked }`。
 
-**安全边界**：Workspace Trust 只允许读取 `mcp.json`，不等于允许执行任意 server command；授权前把 `program + args + cwd + configHash` 作为 `mcp_server_start` ActionFacts 交给 PolicyEngine，不能把 CLI 确认当成绕过 hard deny。每个 server 默认使用 `execution: "host"`；只有配置显式选择 `"sandbox"` 才经 `SandboxPort`。host 以宿主用户权限运行且没有 OS 沙箱，必须显示 `unisolated` 并在授权前警告。两种模式都要求 Workspace Trust 与绑定 `serverName + configHash`（包含有效执行模式）的 workspace grant；缺省模式变更及旧 hash 标准化会使旧 grant 失配，需重新授权。sandbox 初始化失败保持 fail-closed，不回退 host。server 启动后的每次 MCP 工具调用仍需要工具审批，审批卡显示其隔离事实；`run_command` 和 Job 仍始终要求 OS 沙箱。server 不存在返回 `MCP_SERVER_NOT_FOUND`。
+**安全边界**：Workspace Trust 只允许读取 `mcp.json`，不等于允许执行任意 server command；授权前把 `program + args + cwd + configHash` 作为 `mcp_server_start` ActionFacts 交给 PolicyEngine，不能把 CLI 确认当成绕过 hard deny。每个 server 默认使用 `execution: "host"`；只有配置显式选择 `"sandbox"` 才经 `SandboxPort`。host 以宿主用户权限运行且没有 OS 沙箱，必须显示 `unisolated` 并在授权前警告。两种模式都要求 Workspace Trust 与绑定 `serverName + configHash`（包含有效执行模式）的 workspace grant；缺省模式变更及旧 hash 标准化会使旧 grant 失配，需重新授权。sandbox 初始化失败保持 fail-closed，不回退 host。server 启动后的每次 MCP 工具调用仍需要工具审批，审批卡显示其隔离事实；macOS 上 `run_command` 与 Job 仍要求 OS 沙箱；Windows 不加载 SRT，进程工具经逐次审批后在宿主直接执行（见 8.5 停用报告与第 9 节宿主 Job 说明）。server 不存在返回 `MCP_SERVER_NOT_FOUND`。
 
 ---
 
@@ -462,8 +466,8 @@ autopilot sandbox status
 autopilot sandbox setup --yes
 ```
 
-- `status`：输出当前平台沙箱能力报告（脱敏 JSON）：`platform`、`backend`、`enforcement`（`full` / `partial` / `unavailable`）、`installed`、`provisioned`、`version` 与脱敏 `diagnostics`。macOS 首次 status 会惰性初始化 Seatbelt 沙箱；Windows 报告 provision 事实，但命令执行路径在实机门禁通过前保持不可用。不需要 Trust。
-- `setup --yes`：显式触发沙箱安装（仅 Windows 有实际效果：专用账户/WFP/ACL 的 UAC 提权安装；macOS 无 provision 步骤，返回当前能力报告）。必须显式 `--yes`，否则 parser 报错 `sandbox 支持 status | setup --yes`；用户取消 UAC 不是错误，报告诊断含 `install_cancelled`。要求工作区已 Trust。
+- `status`：输出当前平台沙箱能力报告（脱敏 JSON）：`platform`、`backend`、`enforcement`（`full` / `partial` / `unavailable`）、`installed`、`provisioned`、`version` 与脱敏 `diagnostics`。macOS 首次 status 会惰性初始化 Seatbelt 沙箱；Windows 返回宿主执行停用报告（`backend: "host-execution"`，diagnostics 说明进程调用经逐次审批后在宿主直接执行），不加载 SRT、不报告 provision。不需要 Trust。
+- `setup --yes`：显式触发沙箱安装（macOS 无 provision 步骤，返回当前能力报告；Windows 返回同一份宿主执行停用报告，不触发 UAC、不做系统变更）。必须显式 `--yes`，否则 parser 报错 `sandbox 支持 status | setup --yes`。要求工作区已 Trust。
 
 **安全边界**：报告不含 SID、用户名、真实路径列表、凭据或命令正文；底层错误统一映射为稳定 `SANDBOX_*` 错误码，不透传 SRT 原始文案；setup 不会在模型工具调用或普通命令中自动触发。
 
@@ -471,7 +475,7 @@ autopilot sandbox setup --yes
 
 ## 9. 后台 Job 管理
 
-TUI Job 请求带视图代次，Esc 返回后迟到详情不会重新打开弹层；详情与停止结果按 revision 同步缓存列表，因此停止后 Esc 返回仍显示 stopped。2026-09-09 Windows 真实 TTY 已验证 busy 中 `/jobs`、日志、停止、Esc，以及 `NO_COLOR`/screen reader 文字可读；Windows 全屏请求按既有规则降级 inline。macOS 实机仍暂缓。
+TUI Job 请求带视图代次，Esc 返回后迟到详情不会重新打开弹层；详情与停止结果按 revision 同步缓存列表，因此停止后 Esc 返回仍显示 stopped。Windows 全屏请求按既有规则降级 inline；`NO_COLOR` 与 screen reader 场景只使用文字事实。
 
 Agent 启动后台 Job 后，活动工具卡持续显示 `/jobs 查看后台任务`。启动成功时可显示 Core 安全 DTO 提供的 executable basename（例如 `POWERSHELL`）：CLI 仅将该标签转为大写，并使用界面统一的橙色强调 token；目录、参数、PID 与输出不得进入该标签或启动卡。Job 离开 `starting/running` 后不再显示操作提示。
 
@@ -573,8 +577,8 @@ autopilot undo --session <id> --yes
 - `/approve <decision>`：只接受固定宿主决定，不携带冻结调用字段；缺决定或非法值返回用法错误。
 - `/model <modelId>`：值必须属于当前 settings 允许的模型目录；`/effort <effort>` 只接受当前 firstParty 的 CC 请求值。端点不支持显式 effort 时返回明确错误，不静默降档。
 
-### 待验证 Continue 与后台执行阶段（2026-10-12）
+### Continue 与后台执行
 
-写后读回验证未完成时显示“等待修改文件读回验证 · 可继续”，既有精确继续词恢复同一 Turn。继续只补 read_file 验证和总结，不重放已完成写入或任意恢复 failed。停止当前 Session/Runtime 的精确 Job 不再弹额外操作审批，外部/不确定 owner 拒绝；全树停止失败仍为 stopping/JOB_STOP_FAILED，不能用 broker close 伪造 stopped。
+写后读回验证未完成时显示“等待修改文件读回验证 · 可继续”，既有精确继续词恢复同一 Turn。继续只补 read_file 验证和总结，不重放已完成写入或任意恢复 failed。停止当前 Session/Runtime 的精确 Job 不再弹额外操作审批，外部/不确定 owner 拒绝；全树停止失败仍为 stopping/JOB_STOP_FAILED，不能用包装进程 close 伪造 stopped。
 
-Job 的 running 指包装进程运行，缺少原生 ready 协议时目标状态未知；安全 read/list 的 execution 可带包装阶段、关闭信号及 reported Win32 错误码。新源码/包通过不等于现役 ap 已全部更新或 Windows 沙箱恢复。
+Job 的 running 指包装进程运行，缺少原生 ready 协议时目标状态未知；安全 read/list 的 execution 可带执行阶段、关闭信号及 reported Win32 错误码。Windows 宿主执行 Job（`sandbox.execution: "host"`）没有包装进程，spawn 的子进程即目标本身，`phase` 为 `host_running` / `host_spawn_failed`，停止以进程树终止加 close 观察为实际证据。

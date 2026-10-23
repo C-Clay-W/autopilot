@@ -60,7 +60,8 @@ export type JobControlState = "owned" | "foreign_owner" | "owner_unknown" | "ter
 
 /** 包装进程的可证执行阶段；缺少原生 ready 协议时目标状态只能是未知。 */
 export interface JobExecutionFacts {
-  phase: "wrapper_spawn_failed" | "wrapper_running" | "wrapper_exit" | "target_spawn_error_reported";
+  /** Talk-Plan1022 S2：host_* 仅用于 Windows 宿主执行 Job（无沙箱包装，进程即目标本身）。 */
+  phase: "wrapper_spawn_failed" | "wrapper_running" | "wrapper_exit" | "target_spawn_error_reported" | "host_spawn_failed" | "host_running";
   targetState: "unknown" | "not_started";
   signal?: string;
   win32Code?: string;
@@ -90,6 +91,8 @@ export interface JobView {
   stderrBytes: number;
   outputTruncated: boolean;
   lastControl?: JobLastControl;
+  /** 启动时声明的本机服务地址；只是目标声明，不能单独证明端口归属。 */
+  serviceUrl?: string;
 }
 
 /** 当前 Session 的有界 Job 列表。 */
@@ -129,6 +132,8 @@ export interface JobSandboxSummary {
   mode: SandboxMode;
   policyDigest: string;
   policyVersion: number;
+  /** Talk-Plan1022 S2：缺省视为沙箱执行；"host" 表示经逐次审批后在宿主直接执行，摘要仍是真实计算的宿主冻结范围。 */
+  execution?: "host";
 }
 
 /** 绑定 workspace 与 Session 的非 PTY 后台进程记录。 */
@@ -159,6 +164,11 @@ export interface Job {
   safeOutput?: JobSafeOutputSnapshot;
   /** 新记录随存的冻结沙箱摘要；旧 v2 记录缺省视为无沙箱事实，不参与恢复判定。 */
   sandbox?: JobSandboxSummary;
+  /**
+   * 启动时声明的本机服务地址（规范化 loopback origin）；只是目标声明，
+   * 预览归属仍须结合启动前端口检查与当前监听归属核验。
+   */
+  serviceUrl?: string;
 }
 
 /** 启动一个已通过执行期 PolicyEngine 授权的后台 Job。 */
@@ -175,13 +185,17 @@ export interface StartJobInput {
   program: string;
   args: string[];
   cwd: string;
-  /** 已由 ToolExecutor 解析确认的冻结沙箱范围；后台与前台共用同一边界，缺失即 fail-closed 拒绝启动。 */
-  sandbox: {
-    /** 沙箱 Port；prepare/release 生命周期由 JobService 编排并与 Job 终态绑定。 */
-    port: SandboxPort;
-    /** 当前 Turn 冻结的沙箱策略。 */
-    policy: SandboxPolicy;
-  };
+  /** 启动时声明的本机服务地址（loopback http/https origin）；仅作预览归属声明，不授予任何权限。 */
+  serviceUrl?: string;
+  /**
+   * 已由 ToolExecutor 解析确认的冻结执行范围；后台与前台共用同一边界，缺失即 fail-closed 拒绝启动。
+   * Talk-Plan1022 S2：与 internal/tools 的 SandboxExecutionScope 判别联合对齐——沙箱形态携带
+   * port（prepare/release 生命周期由 JobService 编排并与 Job 终态绑定）；host 形态（Windows 宿主
+   * 执行）无 port，JobService 直接以受信解析 argv spawn，持久摘要标记 execution:"host"。
+   */
+  sandbox:
+    | { execution?: "sandboxed"; port: SandboxPort; policy: SandboxPolicy }
+    | { execution: "host"; policy: SandboxPolicy };
 }
 
 /** 读取 Job 增量输出的输入。 */

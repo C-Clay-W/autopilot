@@ -84,6 +84,11 @@ export interface ResolvedExternalPermissionSettings {
   allow: readonly string[];
   deny: readonly string[];
   ask: readonly string[];
+  /**
+   * deny/ask 无法完整解释时置位：无法证明收窄范围，所有外部文件放行按拒绝处理（fail-closed）。
+   * 不支持的字段与作用域只产生诊断，不会置位，也不会产生任何授权。
+   */
+  readonly restricted?: boolean;
 }
 
 /** 供 Runtime 后续阶段消费的安全 settings 快照；未知 CC 字段不进入该对象。 */
@@ -410,39 +415,67 @@ function parseSandboxSettings(value: unknown, scope: AutopilotSettingsScope, dia
   };
 }
 
-/** 解析外部权限规则列表：条目必须符合 Write|Edit|Read(<绝对路径>) 语法，非法整列表丢弃。 */
-function parseExternalPermissionList(value: unknown, scope: AutopilotSettingsScope, field: string, diagnostics: SettingsDiagnostic[]): readonly string[] | undefined {
+/**
+ * 解析 allow 列表：只接受本项目 `Read|Write|Edit(<绝对路径>)` 语法。
+ * 不支持的写法（含 Claude Code 的 Bash/工具规则）整列表丢弃并给出诊断——allow 不产生授权，
+ * 丢弃只会更严格，绝不退化为裸工具放行。
+ */
+function parseExternalAllowList(value: unknown, scope: AutopilotSettingsScope, field: string, diagnostics: SettingsDiagnostic[]): readonly string[] | undefined {
   if (value === undefined) return undefined;
   if (!Array.isArray(value)) {
-    diagnostics.push({ scope, code: "SETTINGS_PERMISSIONS_INVALID", field });
+    diagnostics.push({ scope, code: "SETTINGS_PERMISSIONS_UNSUPPORTED", field });
     return undefined;
   }
   const items = value.map(parseNonEmptyString);
   if (items.some((item) => !item || !parseExternalPermissionRule(item!))) {
-    diagnostics.push({ scope, code: "SETTINGS_PERMISSIONS_INVALID", field });
+    diagnostics.push({ scope, code: "SETTINGS_PERMISSIONS_UNSUPPORTED", field });
     return undefined;
   }
   return Object.freeze(items as string[]);
 }
 
-/** 解析 settings 的 permissions 段：allow 仅 local（投影写入口），deny/ask 任意 scope 并集收窄。 */
+/**
+ * 解析 deny/ask 收窄列表：任何无法解释的条目都会让整段快照不可信（state.unsafe）。
+ * 不能只丢掉无法解释的条目后继续放行——那等于悄悄放宽了用户已经写下的限制。
+ */
+function parseExternalNarrowingList(value: unknown, scope: AutopilotSettingsScope, field: string, diagnostics: SettingsDiagnostic[], state: { unsafe: boolean }): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  const items = Array.isArray(value) ? value.map(parseNonEmptyString) : [];
+  if (!Array.isArray(value) || items.some((item) => !item || !parseExternalPermissionRule(item!))) {
+    state.unsafe = true;
+    diagnostics.push({ scope, code: "SETTINGS_PERMISSIONS_UNSAFE", field });
+    return undefined;
+  }
+  return Object.freeze(items as string[]);
+}
+
+/**
+ * 解析 settings 的 permissions 段：allow 仅 local（投影写入口），deny/ask 任意 scope 并集收窄。
+ * 未知字段（如 Claude Code 的 defaultMode）只产生不支持诊断，不再让整段失效，也不产生授权；
+ * 结构不可解释或 deny/ask 无法解析时置 restricted，交由权限判定按拒绝处理。
+ */
 function parseExternalPermissions(value: unknown, scope: AutopilotSettingsScope, diagnostics: SettingsDiagnostic[]): Partial<ResolvedExternalPermissionSettings> {
   if (value === undefined) return {};
-  if (!isRecord(value) || Object.keys(value).some(function unknown(key) { return !["allow", "deny", "ask"].includes(key); })) {
+  if (!isRecord(value)) {
     diagnostics.push({ scope, code: "SETTINGS_PERMISSIONS_INVALID", field: "permissions" });
-    return {};
+    return { restricted: true };
   }
+  for (const key of Object.keys(value)) {
+    if (!["allow", "deny", "ask"].includes(key)) diagnostics.push({ scope, code: "SETTINGS_PERMISSIONS_UNSUPPORTED", field: `permissions.${key}` });
+  }
+  const state = { unsafe: false };
   let allow: readonly string[] | undefined;
   if (value.allow !== undefined) {
     if (scope !== "local") diagnostics.push({ scope, code: "SETTINGS_PERMISSIONS_SCOPE_FORBIDDEN", field: "permissions.allow" });
-    else allow = parseExternalPermissionList(value.allow, scope, "permissions.allow", diagnostics);
+    else allow = parseExternalAllowList(value.allow, scope, "permissions.allow", diagnostics);
   }
-  const deny = parseExternalPermissionList(value.deny, scope, "permissions.deny", diagnostics);
-  const ask = parseExternalPermissionList(value.ask, scope, "permissions.ask", diagnostics);
+  const deny = parseExternalNarrowingList(value.deny, scope, "permissions.deny", diagnostics, state);
+  const ask = parseExternalNarrowingList(value.ask, scope, "permissions.ask", diagnostics, state);
   return {
     ...(allow !== undefined ? { allow } : {}),
     ...(deny !== undefined ? { deny } : {}),
     ...(ask !== undefined ? { ask } : {}),
+    ...(state.unsafe ? { restricted: true } : {}),
   };
 }
 
@@ -711,12 +744,23 @@ function mergeCcSource(current: ResolvedAutopilotSettings, source: AutopilotSett
   // Talk-Plan1013 Stage 2：外部权限规则快照。allow 只由 local 投影贡献（授权判定仍以 grant 为准），
   // deny/ask 按并集累积只收窄；手写 allow 不获得 authority（16.4 导入边界）。
   const requestedPermissions = parseExternalPermissions(source.value.permissions, source.scope, diagnostics);
+  // restricted 只累积不放宽：任一层无法解释 deny/ask 即整体按不可信处理。
+  const restrictedPermissions = current.permissions.restricted === true || requestedPermissions.restricted === true;
   const permissions: ResolvedExternalPermissionSettings = {
     allow: Object.freeze([...current.permissions.allow, ...(requestedPermissions.allow ?? [])]),
     deny: Object.freeze([...current.permissions.deny, ...(requestedPermissions.deny ?? [])]),
     ask: Object.freeze([...current.permissions.ask, ...(requestedPermissions.ask ?? [])]),
+    ...(restrictedPermissions ? { restricted: true } : {}),
   };
   return { ...current, maxTurns, modelRef, visionModelRef, modelSource, reasoningProfile, reasoningSource, availableModels, modelCandidates, modelOverrides, providerRoutes, webSearch, webSearchDisabled, rag, sandbox, permissions, firstParty: { baseUrl: parsedBaseUrl ?? current.firstParty.baseUrl, credentialRef, maxOutputTokens, compactWindow, timeoutMs, subagentModelId, thinkingEnabled }, diagnostics: current.diagnostics };
+}
+
+/**
+ * 权限段诊断只描述外部权限快照，不参与模型/凭据分类可用性判定：
+ * 宿主可以据此隔离展示，不把权限问题说成“模型配置无法读取”。
+ */
+export function isExternalPermissionDiagnostic(diagnostic: SettingsDiagnostic): boolean {
+  return diagnostic.code.startsWith("SETTINGS_PERMISSIONS_");
 }
 
 /** 依照 User < Project < Local 优先级构建一次可原子替换的 settings 快照。 */

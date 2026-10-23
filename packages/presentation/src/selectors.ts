@@ -2,6 +2,51 @@
 import { groupToolCalls, type TimelineItem } from "./grouping.js";
 import type { AgentPresentationItem, AgentPresentationState, ApprovalItem, AssistantAnswerItem, InputNoticeItem, PresentationInputPosition, TodoSnapshotItem, ToolCallItem, UserQuestionItem } from "./model.js";
 
+/** 行动文案只按注册工具名白名单生成，不从命令、参数、路径或日志猜测目的。 */
+function getToolAction(toolName: string): string {
+  const actions: Record<string, string> = {
+    open_preview: "检查预览页面是否可访问", read_file: "读取文件内容", glob_files: "查找相关文件", grep_files: "检索文件内容",
+    rag_search: "检索知识库资料", web_search: "搜索网页资料", web_fetch: "读取网页资料", write_file: "写入文件", edit_file: "调整文件内容",
+    run_command: "执行本地命令", start_background_job: "启动后台任务", list_background_jobs: "查看后台任务", read_background_job: "查看后台任务结果", stop_background_job: "停止后台任务",
+  };
+  return actions[toolName] ?? "执行工具操作";
+}
+
+/** 固定安全结果文案不推断根因、重试计划或浏览器实际显示状态。 */
+function getToolOutcome(tool: ToolCallItem): string | undefined {
+  if (tool.state === "awaiting_approval") return "等待确认后执行";
+  if (tool.state === "denied") return tool.errorCode === "SANDBOX_UNAVAILABLE" ? "沙箱不可用，命令未启动" : "操作未获授权";
+  if (tool.state === "cancelled") return "操作已取消";
+  if (tool.state === "timeout") return "操作等待超时";
+  if (tool.state === "failed") {
+    const previewErrors: Record<string, string> = {
+      PREVIEW_PAGE_NOT_FOUND: "预览页面不存在（HTTP 404）", PREVIEW_HTTP_ERROR: "预览地址返回 HTTP 错误",
+      PREVIEW_CONNECTION_FAILED: "无法连接预览地址", PREVIEW_PROBE_TIMEOUT: "预览地址检查超时", PREVIEW_PROBE_ABORTED: "预览地址检查已取消",
+    };
+    return tool.toolName === "open_preview" ? previewErrors[tool.errorCode ?? ""] ?? "预览地址检查未通过" : "操作未成功";
+  }
+  if (tool.toolName === "open_preview" && tool.state === "completed") return "预览请求已准备";
+  return undefined;
+}
+
+/** 从现有节点派生短进展；同一步之前已有安全模型正文时只保留结果，Live/History 使用同一规则。 */
+export function selectToolProgress(state: AgentPresentationState, item: TimelineItem): { source: "system"; action?: string; outcome?: string } | undefined {
+  if (item.kind !== "tool_call" && item.kind !== "tool_group") return undefined;
+  const calls = item.kind === "tool_call" ? [item] : selectToolCalls(state, item.turnId).filter(function grouped(call) { return item.toolCallIds.includes(call.callId); });
+  if (!calls.length) return undefined;
+  const modelExplains = calls.every(function explained(call) {
+    const position = state.items.findIndex(function same(candidate) { return candidate.id === call.id; });
+    return Boolean(call.stepId) && state.items.slice(0, position).some(function process(candidate) {
+      return candidate.kind === "assistant_answer" && candidate.turnId === call.turnId && candidate.stepId === call.stepId && Boolean(candidate.content.trim());
+    });
+  });
+  const waiting = calls.some(function pending(call) { return call.state === "awaiting_approval"; });
+  const notExecuted = calls.every(function stopped(call) { return call.state === "denied" || call.state === "cancelled"; });
+  const action = waiting ? "等待确认后执行" : modelExplains || notExecuted ? undefined : [...new Set(calls.map(function action(call) { return getToolAction(call.toolName); }))].join("、");
+  const outcome = item.kind === "tool_call" && !waiting ? getToolOutcome(item) : undefined;
+  return { source: "system", action, outcome };
+}
+
 /** 仅识别 Provider 为同批工具调用自动拼出的名称摘要。 */
 function isRedundantToolCallSummary(item: AgentPresentationItem, items: AgentPresentationItem[]): boolean {
   if (item.kind !== "thinking" || !item.summary.startsWith("模型请求调用 ")) return false;

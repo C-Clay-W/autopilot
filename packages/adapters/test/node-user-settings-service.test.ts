@@ -130,6 +130,54 @@ describe("Node user settings service", function userSettingsServiceSuite() {
     expect(saved.rag.textRerank.model).toBe("rerank-model");
   });
 
+  it("H3：权限段诊断不阻断模型状态与保存，permissions 与无关字段原样保留", async function isolatesPermissionDiagnostics() {
+    const { homeDirectory, settingsPath } = fixture();
+    const service = createNodeUserSettingsService({ homeDirectory });
+    await service.saveMain({ baseUrl: "https://api.deepseek.com/anthropic", model: "deepseek-v4-flash", apiKey: "fixture-main" });
+    const raw = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    raw.custom = { keep: true };
+    raw.permissions = { defaultMode: "acceptEdits", allow: ["Bash(ls)"], deny: ["Bash(rm -rf /)"], ask: [] };
+    fs.writeFileSync(settingsPath, JSON.stringify(raw, null, 2));
+
+    const status = service.getStatus();
+    expect(status.main.model).toBe("deepseek-v4-flash");
+    expect(status.diagnostics).toEqual(expect.arrayContaining([
+      { code: "SETTINGS_PERMISSIONS_UNSUPPORTED", field: "permissions.defaultMode", scope: "user" },
+      { code: "SETTINGS_PERMISSIONS_SCOPE_FORBIDDEN", field: "permissions.allow", scope: "user" },
+      { code: "SETTINGS_PERMISSIONS_UNSAFE", field: "permissions.deny", scope: "user" },
+    ]));
+    expect(JSON.stringify(status)).not.toContain("fixture-main");
+
+    await service.saveMain({ baseUrl: "https://api.deepseek.com/anthropic", model: "deepseek-v4-pro[1m]" }, status.revision);
+    const saved = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    expect(saved.permissions).toEqual(raw.permissions);
+    expect(saved.custom).toEqual({ keep: true });
+    expect(saved.env.ANTHROPIC_AUTH_TOKEN).toBe("fixture-main");
+  });
+
+  it("H3：模型字段非法仍阻断读取，其他分类非法仍阻断保存并指出字段", async function blocksUnrelatedCategories() {
+    const statusFixture = fixture();
+    const statusService = createNodeUserSettingsService({ homeDirectory: statusFixture.homeDirectory });
+    await statusService.saveMain({ baseUrl: "https://api.deepseek.com/anthropic", model: "deepseek-v4-flash", apiKey: "fixture-main" });
+    const invalidModel = JSON.parse(fs.readFileSync(statusFixture.settingsPath, "utf8"));
+    invalidModel.availableModels = [];
+    fs.writeFileSync(statusFixture.settingsPath, JSON.stringify(invalidModel, null, 2));
+    let thrown: unknown;
+    try { statusService.getStatus(); } catch (error) { thrown = error; }
+    expect(thrown).toMatchObject({ code: "SETTINGS_INVALID", diagnostic: { code: "SETTINGS_MODEL_INVALID", field: "availableModels", scope: "user" } });
+
+    const saveFixture = fixture();
+    const saveService = createNodeUserSettingsService({ homeDirectory: saveFixture.homeDirectory });
+    await saveService.saveMain({ baseUrl: "https://api.deepseek.com/anthropic", model: "deepseek-v4-flash", apiKey: "fixture-main" });
+    const unsafeSandbox = JSON.parse(fs.readFileSync(saveFixture.settingsPath, "utf8"));
+    unsafeSandbox.sandbox = { mode: "danger-full-access" };
+    fs.writeFileSync(saveFixture.settingsPath, JSON.stringify(unsafeSandbox, null, 2));
+    await expect(saveService.saveMain({ baseUrl: "https://api.deepseek.com/anthropic", model: "deepseek-v4-pro[1m]" })).rejects.toMatchObject({
+      code: "SETTINGS_INPUT_INVALID",
+      diagnostic: { code: "SETTINGS_SANDBOX_MODE_FORBIDDEN", field: "sandbox.mode", scope: "user" },
+    });
+  });
+
   it("仅在用户主动刷新时读取 DeepSeek 官方模型目录并在失败时回退维护目录", async function refreshesDeepSeekCatalogWithFallback() {
     const { homeDirectory } = fixture();
     const fetchImpl = async function fetchModels() { return new Response(JSON.stringify({ data: [{ id: "deepseek-live" }, { id: "deepseek-live" }] }), { status: 200, headers: { "content-type": "application/json" } }); } as typeof fetch;

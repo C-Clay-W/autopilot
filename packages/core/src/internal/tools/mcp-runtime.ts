@@ -12,7 +12,7 @@ import { z } from "zod";
 import type { SandboxPolicy, SandboxPreparedCommand } from "../../runtime/domain/sandbox-policy";
 import type { CredentialStore, SandboxPort } from "../../runtime/ports";
 import { getMcpServerGrantConstraint, type McpCapability, type McpServerConfig } from "../../runtime/protocol";
-import { getPlatformExecutable } from "./process-utils";
+import { getPlatformExecutable, resolveWindowsPackageManagerCommand } from "./process-utils";
 import { resolveSandboxPolicy } from "./sandbox-policy-resolver";
 import { decideCommandPermission, normalizeProgramName } from "./permissions/command-policy";
 import { resolveFileTarget } from "./permissions/path-access-policy";
@@ -201,7 +201,9 @@ export class McpStdioRuntime {
       return;
     }
     // server grant 不能为未隔离进程授予全盘修改能力；host 必须在 spawn 前明确阻塞。
-    if (getMcpExecutionMode(server.config) === "host") {
+    // Talk-Plan1022 S1：Windows 宿主执行模式例外——host 配置本就声明无隔离，经上方审批
+    // 判定放行后允许宿主直接启动；其余平台维持阻塞，行为不变。
+    if (getMcpExecutionMode(server.config) === "host" && !(await this.isHostExecutionPlatform())) {
       server.state = "failed";
       this.diagnostics.push({ serverName: server.config.name, code: "MCP_SERVER_SANDBOX_FAILED" });
       return;
@@ -217,28 +219,40 @@ export class McpStdioRuntime {
         // sandbox 为默认路径；准备失败时只拒绝，不切换为 host。
         const scope = await this.resolveSandboxScope();
         if (!scope) {
-          this.diagnostics.push({ serverName: server.config.name, code: "MCP_SERVER_SANDBOX_FAILED" });
-          server.state = "failed";
-          return;
+          // Talk-Plan1022 S1：Windows 宿主执行模式下 host 配置的 server 免沙箱包装，
+          // 直接以受信解析的可执行名启动（与展示的 unisolated 事实一致）；其余情况 fail-closed。
+          if (getMcpExecutionMode(server.config) === "host" && (await this.isHostExecutionPlatform())) {
+            // Talk-Plan1022 CR R3：Windows 的 npm/npx/pnpm 不能把 .cmd shim 交给 spawn(shell:false)
+            // （EINVAL，server 未启动）；复用前台与 Job 的同一受信解析得到 node.exe + CLI 脚本 + 原 argv。
+            const resolved = resolveHostServerCommand(server.config.command, server.config.args ?? []);
+            executable = resolved.executable;
+            args = resolved.args;
+          } else {
+            this.diagnostics.push({ serverName: server.config.name, code: "MCP_SERVER_SANDBOX_FAILED" });
+            server.state = "failed";
+            return;
+          }
+        } else {
+          const program = getPlatformExecutable(server.config.command);
+          try {
+            const done = await scope.port.prepare({
+              commandId: randomUUID(),
+              program,
+              args: server.config.args ?? [],
+              cwd: cwd.canonicalTarget,
+              policy: scope.policy,
+            });
+            prepared = done;
+            server.executionId = done.executionId;
+            executable = done.executable;
+            args = [...done.args];
+          } catch {
+            // 沙箱拒绝/runner 失败只影响本 server；诊断使用稳定码，不透出底层平台文案。
+            this.diagnostics.push({ serverName: server.config.name, code: "MCP_SERVER_SANDBOX_FAILED" });
+            server.state = "failed";
+            return;
+          }
         }
-        const program = getPlatformExecutable(server.config.command);
-        try {
-          prepared = await scope.port.prepare({
-            commandId: randomUUID(),
-            program,
-            args: server.config.args ?? [],
-            cwd: cwd.canonicalTarget,
-            policy: scope.policy,
-          });
-        } catch {
-          // 沙箱拒绝/runner 失败只影响本 server；诊断使用稳定码，不透出底层平台文案。
-          this.diagnostics.push({ serverName: server.config.name, code: "MCP_SERVER_SANDBOX_FAILED" });
-          server.state = "failed";
-          return;
-        }
-        server.executionId = prepared.executionId;
-        executable = prepared.executable;
-        args = [...prepared.args];
       }
       const childEnvironment = await this.resolveEnvironment(server.config);
       for (const [key, value] of Object.entries(prepared?.env ?? {})) {
@@ -404,7 +418,7 @@ export class McpStdioRuntime {
   }
 
   /** 解析 MCP server 启动的沙箱范围；绑定缺失或能力不可执行时返回 undefined（fail-closed，不裸跑）。 */
-  private async resolveSandboxScope(): Promise<SandboxExecutionScope | undefined> {
+  private async resolveSandboxScope(): Promise<Extract<SandboxExecutionScope, { execution?: "sandboxed" }> | undefined> {
     const binding = this.options.sandbox;
     if (!binding) return undefined;
     const capability = await binding.port.status();
@@ -420,6 +434,17 @@ export class McpStdioRuntime {
     return { port: binding.port, policy: resolution.policy };
   }
 
+  /** 判定当前沙箱绑定是否为 Windows 宿主执行模式（宿主 port 报告 backend "host-execution"）。 */
+  private async isHostExecutionPlatform(): Promise<boolean> {
+    const binding = this.options.sandbox;
+    if (!binding) return false;
+    try {
+      return (await binding.port.status()).backend === "host-execution";
+    } catch {
+      return false;
+    }
+  }
+
   /** 释放已 prepare 的沙箱执行资源；幂等，server 真实终态（崩溃/关闭）时调用。 */
   private releaseSandbox(server: Pick<ManagedServer, "executionId">): void {
     const executionId = server.executionId;
@@ -433,6 +458,18 @@ export class McpStdioRuntime {
 /** 返回 MCP 执行方式；只有显式 sandbox 才进入沙箱，缺省和 host 均按 host 处理。 */
 function getMcpExecutionMode(server: McpServerConfig): "sandbox" | "host" {
   return server.execution === "sandbox" ? "sandbox" : "host";
+}
+
+/**
+ * 宿主执行模式下解析 MCP server 的启动 argv（Talk-Plan1022 CR R3）：Windows 包管理器复用
+ * 前台与 Job 的受信解析（node.exe + 固定 CLI 脚本 + 原 argv），不把 .cmd 交给 shell:false；
+ * 其余程序只做平台可执行名解析。受信 CLI 不可用时抛 SANDBOX_UNAVAILABLE，由调用方按启动
+ * 失败拒绝，不回退 shell 拼接。
+ */
+export function resolveHostServerCommand(command: string, args: readonly string[]): { executable: string; args: string[] } {
+  const program = getPlatformExecutable(command);
+  const managed = resolveWindowsPackageManagerCommand(program, args);
+  return managed ? { executable: managed.executable, args: [...managed.args] } : { executable: program, args: [...args] };
 }
 
 /** 返回本地 MCP server 实际采用的隔离事实，供脱敏状态和工具审批展示。 */

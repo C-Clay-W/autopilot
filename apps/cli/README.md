@@ -44,6 +44,10 @@ build 使用 TypeScript，输出 dist/*.js 与声明，不在 npm 包中发布�
 
 CLI 使用用户级 settings.json，默认工作区为当前目录，可显式指定 --workspace-root。CLI 不读取开发仓库 Web env，也不因配置中含 RAG 字段而自动启用私有知识库工具。重要项目保留版本控制，OS 沙箱、MCP 和平台限制见主包手册。
 
+## 源码 0.2.0 与 npm 版本
+
+本次源码版本为 0.2.0，不表示 npm 已发布该版本；上面的 npm 0.1.0 安装示例继续对应旧归档。Windows 源码已移除进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
+
 ## 许可证
 
 MIT，见本包 LICENSE。第三方依赖保留各自许可证。

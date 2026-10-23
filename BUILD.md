@@ -88,4 +88,4 @@ npm run typecheck -w packages/core
 
 ## 沙箱与平台
 
-安装包不代表 OS 沙箱可用。先运行 sandbox status / doctor；初始化系统能力属于单独显式操作。Adapters native 目录是 Windows 原生候选材料，不等于默认 npm runner 的实机保证。macOS/Linux 的验证范围及已知问题见主包手册。
+源码 0.2.0 在 Windows 不提供 OS 进程沙箱：命令、后台 Job 和 host MCP 逐次审批后以当前用户权限运行。sandbox status / setup 返回停用报告，不安装 Windows 沙箱；审批不构成隔离。macOS 继续使用 Seatbelt，系统初始化属于显式操作。进程树回收与跨平台实机验证须单独确认。此前 npm 0.1.0 的行为与限制见主包手册。

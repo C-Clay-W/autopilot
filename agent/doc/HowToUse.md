@@ -3,6 +3,8 @@
 
 源码包含 CLI、Web 应用及五个 npm 包。普通终端用户可直接安装 `autopilot-agent@0.1.0`；需要修改代码或使用 Web 时，按本文启动。
 
+当前源码版本为 0.2.0；本次仅更新 Git 源码，npm 仍为此前发布的 0.1.0。Windows 源码不再提供 OS 进程沙箱，命令、后台 Job 和 host MCP 逐次审批后以当前用户权限运行；macOS 继续使用 Seatbelt。Web Work 提供内置预览与 `open_preview`，只准备导航，不读取或验证网页，完整浏览器与 Provider 验收仍待确认。
+
 ## 1. 环境准备
 
 - 建议 Node.js 20.20.2 与 npm 10。CLI 声明范围为 `>=20.11.0 <22`，整仓依赖可能要求较新的 Node 20 小版本；Node 22 不在 CLI 声明范围内。

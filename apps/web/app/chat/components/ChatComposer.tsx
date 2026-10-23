@@ -66,6 +66,11 @@ interface ChatComposerProps {
   handleKeyDown: (e: React.KeyboardEvent) => void;
   activeTurnId: string;
   handleSend: (overrideContent?: string) => Promise<void>;
+  /** 空输入时的 Continue 入口：复用既有恢复动作，不另建恢复链（H2）。 */
+  handleContinueTurn: (messageId: string) => Promise<void>;
+  resumableMessageId?: string;
+  /** 停止请求在途：右侧按钮显示忙状态，不作为发送或继续入口。 */
+  stopping: boolean;
   cancelCurrentTurn: () => Promise<void>;
   databaseSyncMessage: string;
   databaseSyncing: boolean;
@@ -74,9 +79,11 @@ interface ChatComposerProps {
 }
 
 /** 渲染输入区完整 UI；条件分支、事件回调与原页面保持一致。 */
-export default function ChatComposer({ pendingInputs, cancelPendingInput, setInputDelivery, textareaRef, inputRef, inputActionsRef, inputDeliveryNotice, readOnlyReason, isChat, loading, submissionActivity, currentRetrieval, requestAbortRef, chatAttachments, sessionId, selectedFiles, setSelectedFiles, onOpenWorkspacePicker, workspace, setSkillPickerOpen, selectedSkills, getSkillDisplayName, toggleSelectedSkill, togglePinnedSkill, showSources, setShowSources, showProcess, setShowProcess, databaseEnabled, setDatabaseEnabled, onRetrievalChange, hasWorkspace, fileInputRef, handleFileSelect, handleDragEnter, handleDragOver, handleDragLeave, handleDrop, pendingUserQuestion, canWrite, handleKeyDown, activeTurnId, handleSend, cancelCurrentTurn, databaseSyncMessage, databaseSyncing, databaseSyncElapsedSeconds, inputDelivery }: ChatComposerProps) {
+export default function ChatComposer({ pendingInputs, cancelPendingInput, setInputDelivery, textareaRef, inputRef, inputActionsRef, inputDeliveryNotice, readOnlyReason, isChat, loading, submissionActivity, currentRetrieval, requestAbortRef, chatAttachments, sessionId, selectedFiles, setSelectedFiles, onOpenWorkspacePicker, workspace, setSkillPickerOpen, selectedSkills, getSkillDisplayName, toggleSelectedSkill, togglePinnedSkill, showSources, setShowSources, showProcess, setShowProcess, databaseEnabled, setDatabaseEnabled, onRetrievalChange, hasWorkspace, fileInputRef, handleFileSelect, handleDragEnter, handleDragOver, handleDragLeave, handleDrop, pendingUserQuestion, canWrite, handleKeyDown, activeTurnId, handleSend, handleContinueTurn, resumableMessageId, stopping, cancelCurrentTurn, databaseSyncMessage, databaseSyncing, databaseSyncElapsedSeconds, inputDelivery }: ChatComposerProps) {
   const [input, setInputState] = useState("");
   const previousInputRef = useRef(input);
+  /** 空输入、非运行中且存在结构化可恢复 Turn 时，右侧按钮改为继续入口。 */
+  const continueReady = !isChat && !loading && !stopping && canWrite && Boolean(resumableMessageId) && !input.trim() && selectedFiles.length === 0;
 
   /** 只在 Composer 子树内更新文本，并同步提交时读取的 ref。 */
   const updateInput = useCallback(function updateInput(value: string): void {
@@ -190,6 +197,12 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
           {isChat && <ChatRetrievalControls mode={currentRetrieval} persisted={Boolean(sessionId || loading || chatAttachments.length)} onChange={onRetrievalChange} />}
         </div>
 
+        {!isChat && stopping && (
+          <p role="status" aria-live="polite" className="mb-2 border-l-4 border-accent bg-accent/10 px-3 py-2 text-xs">
+            正在停止任务，等待服务端确认停止后才能继续。
+          </p>
+        )}
+
         {!isChat && loading && activeTurnId && input.trim() && (
           <div className="mb-2 flex items-center gap-2 text-xs">
             <span>发送方式：</span>
@@ -238,7 +251,7 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
           <button
             type="button"
             onClick={() => {
-              if (pendingUserQuestion) return;
+              if (pendingUserQuestion || stopping) return;
               if (!isChat && loading && activeTurnId && input.trim()) {
                 void handleSend();
                 return;
@@ -247,22 +260,29 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
                 void cancelCurrentTurn();
                 return;
               }
+              // 空输入且存在结构化可恢复 Turn 时，复用既有 Continue 动作（H2）。
+              if (continueReady && resumableMessageId) {
+                void handleContinueTurn(resumableMessageId);
+                return;
+              }
               void handleSend();
             }}
-            disabled={!canWrite || Boolean(pendingUserQuestion) || (loading ? !activeTurnId : (!input.trim() && selectedFiles.length === 0))}
+            disabled={!canWrite || Boolean(pendingUserQuestion) || stopping || (loading ? !activeTurnId : (!input.trim() && selectedFiles.length === 0 && !continueReady))}
             className={`absolute right-2 top-1/2 h-9 w-9 -translate-y-1/2 flex items-center justify-center transition ${
-              !isChat && loading && activeTurnId && input.trim()
+              stopping
+                ? "bg-muted text-ink-on-dark cursor-not-allowed"
+                : !isChat && loading && activeTurnId && input.trim()
                 ? "bg-accent text-ink-on-dark hover:bg-ink"
                 : loading && activeTurnId
                 ? "bg-accent text-ink-on-dark hover:bg-ink"
-                : (input.trim() || selectedFiles.length > 0) && !loading
+                : ((input.trim() || selectedFiles.length > 0) && !loading) || continueReady
                 ? "bg-accent text-ink-on-dark hover:bg-ink"
                 : "bg-muted text-ink-on-dark cursor-not-allowed"
             }`}
-            aria-label={!isChat && loading && activeTurnId && input.trim() ? (inputDelivery === "steer" ? "发送引导任务" : "发送排队任务") : loading && activeTurnId ? "停止当前任务" : loading ? (submissionActivity === "upload" ? "正在上传附件" : "任务正在启动") : "发送消息"}
-            title={!isChat && loading && activeTurnId && input.trim() ? (inputDelivery === "steer" ? "发送引导任务" : "发送排队任务") : loading ? (activeTurnId ? "停止当前任务" : submissionActivity === "upload" ? "正在上传附件" : "任务正在启动") : "发送消息"}
+            aria-label={stopping ? "正在停止任务" : continueReady ? "继续执行未完成的任务" : !isChat && loading && activeTurnId && input.trim() ? (inputDelivery === "steer" ? "发送引导任务" : "发送排队任务") : loading && activeTurnId ? "停止当前任务" : loading ? (submissionActivity === "upload" ? "正在上传附件" : "任务正在启动") : "发送消息"}
+            title={stopping ? "正在停止任务，等待服务端确认后才能继续" : continueReady ? "继续执行未完成的任务" : !isChat && loading && activeTurnId && input.trim() ? (inputDelivery === "steer" ? "发送引导任务" : "发送排队任务") : loading ? (activeTurnId ? "停止当前任务" : submissionActivity === "upload" ? "正在上传附件" : "任务正在启动") : "发送消息"}
           >
-            {!isChat && loading && activeTurnId && input.trim() ? <QueueDeliveryIcon delivery={inputDelivery} /> : loading ? <StopTaskIcon /> : "➤"}
+            {stopping ? <StopTaskIcon /> : continueReady ? "↻" : !isChat && loading && activeTurnId && input.trim() ? <QueueDeliveryIcon delivery={inputDelivery} /> : loading ? <StopTaskIcon /> : "➤"}
           </button>
         </div>
         {!isChat && (databaseEnabled || databaseSyncMessage) && (

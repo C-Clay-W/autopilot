@@ -9,6 +9,7 @@ import { ToolExecutor } from "../tool-executor";
 import { ToolRegistry } from "../tool-registry";
 import { SANDBOX_ERROR_CODES, type SandboxExecutionRequest, type SandboxPolicy, type SandboxPreparedCommand } from "../../../runtime/domain/sandbox-policy";
 import { SandboxPortError, type SandboxPort } from "../../../runtime/ports";
+import type { SandboxCapabilityReport } from "../../../runtime/domain/sandbox-policy";
 import type { JobService } from "../../../runtime/application/job-service";
 
 /** 透传式 fake 沙箱 Port：记录 prepare 调用供断言（JobService double 场景不会真正 prepare）。 */
@@ -28,6 +29,18 @@ function createFakeSandboxPort(options: { enforcement?: "full" | "partial" | "un
   return { port, prepared };
 }
 
+/** 宿主执行 fake port：backend host-execution，prepare 恒拒（宿主路径不应触达）。 */
+function createHostExecutionPort() {
+  const port: SandboxPort = {
+    async status(): Promise<SandboxCapabilityReport> { return { platform: "windows", backend: "host-execution", enforcement: "unavailable", installed: false, provisioned: false }; },
+    async setup(): Promise<SandboxCapabilityReport> { return { platform: "windows", backend: "host-execution", enforcement: "unavailable", installed: false, provisioned: false }; },
+    async prepare() { throw new SandboxPortError(SANDBOX_ERROR_CODES.UNAVAILABLE, "宿主执行模式不提供沙箱包装"); },
+    async release() {},
+    async shutdown() {},
+  };
+  return { port };
+}
+
 /** 构造与工具 workspaceRoot 对应的冻结沙箱策略。 */
 function fakePolicy(workspaceRoot: string): SandboxPolicy {
   return { mode: "workspace-write", workspaceRoot, allowedDomains: [], deniedRead: [], deniedWrite: [] };
@@ -42,7 +55,7 @@ function createJobs(): { jobs: JobService; startInputs: Array<Record<string, unk
       return { id: "job-1", workspaceId: input.workspaceId, sessionId: input.sessionId, turnId: input.turnId, program: input.program, args: input.args, cwd: input.cwd, status: "running", startedAt: 1, updatedAt: 1, output: { stdout: "", stderr: "", stdoutCursor: 0, stderrCursor: 0, stdoutStartCursor: 0, stderrStartCursor: 0, totalStdoutBytes: 0, totalStderrBytes: 0, stdoutTruncated: false, stderrTruncated: false } };
     },
     async poll() { throw new Error("unused"); }, async readOutput() { throw new Error("unused"); }, async write() { throw new Error("unused"); }, async kill() { throw new Error("unused"); }, async list() { return []; }, async get() { return null; }, async hasActiveJobs() { return false; },
-    forSession() { return { async list() { return { jobs: [] }; }, async read() { throw new Error("unused"); }, async stop() { throw new Error("unused"); } }; },
+    forSession() { return { async list() { return { jobs: [] }; }, async read() { throw new Error("unused"); }, async stop() { throw new Error("unused"); }, async verifyServiceOwnership() { return "unverifiable" as const; } }; },
     async shutdown() {},
   };
   return { jobs, startInputs };
@@ -95,6 +108,30 @@ describe("start_background_job", function suite() {
     expect(result).toMatchObject({ status: "denied", error: { code: SANDBOX_ERROR_CODES.UNAVAILABLE } });
     expect(fake.startInputs).toHaveLength(0);
     expect(unavailablePort.prepared).toHaveLength(0);
+  });
+
+  it("宿主执行范围原样贯穿 JobService，输出标记 execution host，prepare 零调用", async function passesHostScopeThrough() {
+    const fake = createJobs();
+    const workspaceRoot = "/tmp/ws";
+    const hostPort = createHostExecutionPort();
+    const registry = new ToolRegistry();
+    registry.register(createStartBackgroundJobTool({ jobs: fake.jobs, workspaceId: workspaceRoot, workspaceRoot, sessionId: "s1", turnId: "t1" }));
+    const executor = new ToolExecutor(registry, {
+      workspaceRoot,
+      permissionMode: "full_access",
+      workspaceTrusted: true,
+      sandbox: { port: hostPort.port, mode: "workspace-write" },
+    });
+    const request = { callId: "host", toolName: "start_background_job", input: { program: "node", args: ["--version"], cwd: "." } };
+    const first = await executor.execute(request);
+    expect(first.status).toBe("approval_required");
+    if (first.status !== "approval_required") throw new Error("期望宿主逐次确认");
+    const allowed = await executor.execute({ ...request, approval: { approvalId: first.approval.approvalId, decision: "allow_once" as const } });
+    expect(allowed).toMatchObject({ status: "success" });
+    if (allowed.status !== "success") throw new Error("expected success");
+    expect(allowed.output).toEqual({ jobId: "job-1", status: "running", startedAt: 1, sandbox: { mode: "workspace-write", execution: "host" } });
+    expect(fake.startInputs).toHaveLength(1);
+    expect(fake.startInputs[0].sandbox).toEqual({ execution: "host", policy: fakePolicy(workspaceRoot) });
   });
 
   it("绕过 ToolExecutor 的直接调用缺少沙箱范围时 fail-closed", async function rejectsDirectCallWithoutScope() {

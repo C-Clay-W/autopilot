@@ -56,11 +56,11 @@ function getToolState(status: string): ToolCallState {
 
 /** 取得或创建同一 callId 的工具节点，保证同名工具绝不互相覆盖。 */
 function getToolItem(state: AgentPresentationState, envelope: AgentEventEnvelope, stepId: string, callId: string, toolName: string): ToolCallItem {
-  const current = findItem(state.items, `tool:${callId}`, "tool_call");
+  const current = state.items.find(function sameCall(item): item is ToolCallItem { return item.kind === "tool_call" && item.turnId === envelope.turnId && item.callId === callId; });
   if (current) return current;
   const profile = getToolPresentationProfile(toolName);
   return {
-    id: `tool:${callId}`,
+    id: `tool:${envelope.turnId}:${callId}`,
     kind: "tool_call",
     turnId: envelope.turnId,
     stepId,
@@ -74,9 +74,9 @@ function getToolItem(state: AgentPresentationState, envelope: AgentEventEnvelope
 }
 
 /** 将与工具调用关联的审批标记为已解决，不额外制造另一张工具卡。 */
-function resolveApprovals(items: AgentPresentationItem[], callId: string): AgentPresentationItem[] {
+function resolveApprovals(items: AgentPresentationItem[], callId: string, turnId: string): AgentPresentationItem[] {
   return items.map(function resolveApproval(item) {
-    return item.kind === "approval" && item.callId === callId ? { ...item, state: "resolved" as const } : item;
+    return item.kind === "approval" && item.turnId === turnId && item.callId === callId ? { ...item, state: "resolved" as const } : item;
   });
 }
 
@@ -159,7 +159,7 @@ export function restorePresentationApproval(state: AgentPresentationState, appro
   });
   if (!approval) return state;
   const tool = state.items.find(function findApprovalTool(item): item is ToolCallItem {
-    return item.kind === "tool_call" && item.callId === approval.callId;
+    return item.kind === "tool_call" && item.turnId === approval.turnId && item.callId === approval.callId;
   });
   if (tool && tool.state !== "awaiting_approval") return state;
   if (state.turnSummary?.turnId === approval.turnId) return state;
@@ -236,7 +236,7 @@ function reduceRuntimeEvent(state: AgentPresentationState, envelope: AgentEventE
     const display = event.result.approval.display;
     const approval: ApprovalItem = { id: `approval:${event.result.approval.approvalId}`, kind: "approval", turnId: envelope.turnId, approvalId: event.result.approval.approvalId, callId: event.callId, toolName: event.toolName, state: "required", constraint: event.result.approval.constraint, display };
     // 同一次 Fetch 跨域后产生新审批，旧域名审批已被消费，重放时也只保留当前目标可操作。
-    return { ...base, items: upsertItem(upsertItem(resolveApprovals(base.items, event.callId), tool), approval), activeOperation: { kind: "approval", id: approval.id } };
+    return { ...base, items: upsertItem(upsertItem(resolveApprovals(base.items, event.callId, envelope.turnId), tool), approval), activeOperation: { kind: "approval", id: approval.id } };
   }
   if (event.type === "question_required") {
     const base = completeActiveThinking(state);
@@ -268,7 +268,7 @@ function reduceRuntimeEvent(state: AgentPresentationState, envelope: AgentEventE
       durationMs: "meta" in result ? result.meta?.durationMs : undefined,
       errorCode: "error" in result ? result.error.code : undefined,
     }, result.display);
-    return { ...base, items: resolveApprovals(upsertItem(base.items, item), event.callId), activeOperation: base.activeOperation?.id === item.id ? undefined : base.activeOperation };
+    return { ...base, items: resolveApprovals(upsertItem(base.items, item), event.callId, envelope.turnId), activeOperation: base.activeOperation?.id === item.id ? undefined : base.activeOperation };
   }
   if (event.type === "todo_updated") {
     // Session 任务链单卡 latest-write-wins：timestamp 守卫保证跨 Turn 乱序回放时只有最近快照生效。

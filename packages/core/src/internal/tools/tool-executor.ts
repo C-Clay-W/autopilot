@@ -380,6 +380,8 @@ function describeToolDisplayDetail(detail: ToolDisplayDetail): { target?: string
       return { summary: detail.sourceCount === 0 ? "搜索服务未返回结构化引用" : `找到 ${detail.sourceCount} 个公开来源${detail.truncated ? "，结果已截断" : ""}` };
     case "web_fetch":
       return { target: detail.host, summary: `已读取 ${detail.contentType}${detail.truncated ? "，内容已截断" : ""}` };
+    case "open_preview":
+      return { target: detail.hostLabel, summary: "预览请求已准备，实际显示由用户端处理" };
     default: {
       const exhaustive: never = detail;
       return exhaustive;
@@ -428,10 +430,11 @@ function describeJobDisplayFacts(job: ToolJobDisplayFacts): { target?: string; s
 }
 
 /** 从工具本地生成的 ActionFacts 构造展示层可消费的安全事实。 */
-function createToolDisplayFacts(facts: ToolActionFacts, metrics?: ToolDisplayFacts["metrics"], output?: unknown): ToolDisplayFacts {
+function createToolDisplayFacts(facts: ToolActionFacts, metrics?: ToolDisplayFacts["metrics"], output?: unknown, toolDetail?: ToolDisplayDetail): ToolDisplayFacts {
   const diff = getEditDiffFacts(facts, output);
   // 只有成功执行才会传入 output；审批、拒绝与运行中阶段继续只提供通用类别事实。
-  const detail = output === undefined ? undefined : createToolDisplayDetail(facts.toolName, output);
+  // 工具自带 projectDisplayDetail 时优先使用：原始结果含模型 serialized 输出不携带的受控字段。
+  const detail = toolDetail ?? (output === undefined ? undefined : createToolDisplayDetail(facts.toolName, output));
   const described = detail ? describeToolDisplayDetail(detail) : undefined;
   const job = output === undefined ? undefined : createJobDisplayFacts(facts, output);
   const describedJob = job ? describeJobDisplayFacts(job) : undefined;
@@ -454,6 +457,8 @@ function createApprovalRequest(
   constraint: string,
   policy: ToolPolicyResult,
   facts: ToolActionFacts,
+  display?: ToolDisplayFacts,
+  hostExecution = false,
 ): ToolApprovalRequest {
   const allowedDecisions = policy.allowedApprovalDecisions ?? ["allow_once", "deny"];
   return {
@@ -477,7 +482,13 @@ function createApprovalRequest(
       actionPreview: createSafeActionPreview(facts),
       ...(facts.commandCwd ? { cwd: facts.commandCwd } : {}),
       // 命令声明外部效果但没有精确目标声明：修改范围无法精确限定，展示层不得宣称"仅覆盖精确目标"。
-      ...(facts.operation === "command" && facts.effect === "external" && !facts.externalExecutionTarget ? { unknownScope: true } : {}),
+      // Talk-Plan1022 CR R4：宿主执行命令即便声明了外部目标，进程也不受该文件范围约束，
+      // 因此同样按未知范围处理，声明目标只是预期范围。
+      ...(facts.operation === "command" && facts.effect === "external" && (hostExecution || !facts.externalExecutionTarget) ? { unknownScope: true } : {}),
+      // Talk-Plan1022 S3：把已解析的执行方式带进审批卡，宿主执行批准前即可看到无隔离说明。
+      ...(display?.executionMode ? { executionMode: display.executionMode } : {}),
+      // Talk-Plan1022 CR C4：宿主执行确认的受信来源；展示层据此区分平台，不用 unisolated 反推。
+      ...(hostExecution ? { hostExecution: true as const } : {}),
       allowedDecisions,
     },
   };
@@ -647,20 +658,23 @@ export class ToolExecutor {
           sandboxFacts = { available: true };
         }
       }
-      if (sandboxEligible && !sandboxFacts && !directSandboxBypass) sandboxFacts = { available: sandboxScope !== undefined };
+      // 宿主执行范围不是沙箱可用事实：不注入 sandbox.available（避免 G4 自动放行与 fail-closed 误判），
+      // 由 hostExecution 事实走逐次确认分支。
+      if (sandboxEligible && !sandboxFacts && !directSandboxBypass && sandboxScope?.execution !== "host") sandboxFacts = { available: sandboxScope !== undefined };
       // R5：进程类调用把实际执行方式与脱敏诊断冻结为结构化展示事实（sandboxed/unisolated/unavailable）。
       // deny 不再把诊断拼接进 error.message；Web/TUI/Plain/JSONL/历史共用同一份事实，
       // 展示层不得把 unisolated/unavailable 宣称隔离。
       if (sandboxEligible && display) {
         display = {
           ...display,
-          executionMode: sandboxScope ? "sandboxed" : directSandboxBypass ? "unisolated" : "unavailable",
+          executionMode: sandboxScope ? (sandboxScope.execution === "host" ? "unisolated" : "sandboxed") : directSandboxBypass ? "unisolated" : "unavailable",
           ...(!sandboxScope && !directSandboxBypass && sandboxDiagnostics.length ? { diagnostics: sandboxDiagnostics } : {}),
         };
       }
       const grantMatched = facts.externalExecutionTarget ? executionAuthorization !== null : this.policyEngine.canUsePersistentGrant(policyContext, facts)
         && await policyContext.resolvePersistentGrant?.({ toolName: request.toolName, inputHash, input: parsed.data, constraint: facts.stableConstraint, risk: facts.risk }) === true;
-      const policy = this.policyEngine.evaluate({ context: policyContext, metadata: definition.metadata, facts, grantMatched, ...(sandboxFacts ? { sandbox: sandboxFacts } : {}) });
+      const hostExecution = sandboxScope?.execution === "host";
+      const policy = this.policyEngine.evaluate({ context: policyContext, metadata: definition.metadata, facts, grantMatched, ...(sandboxFacts ? { sandbox: sandboxFacts } : {}), ...(hostExecution ? { hostExecution: true } : {}) });
       if (policy.decision === "deny") {
         // R5：诊断已提升为 display.diagnostics 结构化事实；消息保持策略原因本身，不重复拼接。
         const error = { code: policy.errorCode ?? TOOL_ERROR_CODES.COMMAND_FORBIDDEN, message: policy.reason };
@@ -680,11 +694,16 @@ export class ToolExecutor {
       let consumed = true;
       if (policy.decision === "approval_required") {
         if (facts.externalExecutionTarget) {
-          consumed = executionAuthorization !== null;
+          // Talk-Plan1022 CR R1：Windows 宿主执行只认本调用新签发的 allow_once。旧 allow_session/
+          // allow_workspace 授权会让 ApprovalService 在无 approval 时直接返回真实封印授权，若把它当作
+          // 本次批准就会跳过逐次无隔离确认；沙箱平台继续沿用原有持久授权语义。
+          consumed = hostExecution
+            ? executionAuthorization !== null && request.approval?.decision === "allow_once"
+            : executionAuthorization !== null;
         } else consumed = await this.consumeApproval(request, inputHash, policy.allowedApprovalDecisions, policy.constraint);
       }
       if (policy.decision === "approval_required" && !consumed) {
-        const approval = createApprovalRequest(request, inputHash, policy.constraint ?? inputHash, policy, facts);
+        const approval = createApprovalRequest(request, inputHash, policy.constraint ?? inputHash, policy, facts, display, hostExecution);
         if (facts.externalExecutionTarget) await callExecutionAuthority(async function freezeExecution() { await externalAuthority!.freeze({ approval, input: parsed.data }); });
         this.pendingApprovals.set(approval.approvalId, { request: approval });
         emitToolEvent(this.context, { type: "tool_approval_required", callId: request.callId, toolName: request.toolName, inputHash, status: "approval_required" });
@@ -708,7 +727,7 @@ export class ToolExecutor {
         toolCallId: request.callId,
         webFetchRedirectsRemaining: getWebFetchRedirectBudget(request.input),
         ...(sandboxScope ? { sandboxPolicy: sandboxScope } : {}),
-        ...(directSandboxBypass ? { sandboxExecutionOverride: "direct" as const } : {}),
+        ...(directSandboxBypass || sandboxScope?.execution === "host" ? { sandboxExecutionOverride: "direct" as const } : {}),
         // Talk-Plan1013 Stage5 R3：外部文件修改授权绑定——到达此处必已过外部 gate（deny 已拒绝、
         // 未消费审批已返回 approval_required），绑定由 facts 的 canonical 身份生成，模型不可构造；
         // write_file/edit_file 在目标锁内比较当前 canonical 目标与操作，失配即停止。
@@ -737,7 +756,8 @@ export class ToolExecutor {
         return interactionResult;
       }
       emitToolEvent(this.context, { type: "tool_result", callId: request.callId, toolName: request.toolName, inputHash, status: "success", durationMs: meta.durationMs, outputBytes, truncated });
-      const resultDisplay = createToolDisplayFacts(facts, { durationMs: meta.durationMs, outputBytes, truncated }, serialized);
+      const toolDetail = definition.projectDisplayDetail?.(output);
+      const resultDisplay = createToolDisplayFacts(facts, { durationMs: meta.durationMs, outputBytes, truncated }, serialized, toolDetail);
       return {
         status: "success",
         callId: request.callId,
@@ -810,6 +830,11 @@ export class ToolExecutor {
       permissionMode: this.context.permissionMode,
       workspaceTrusted: this.context.workspaceTrusted === true,
     });
+    // Talk-Plan1022 S1：Windows 宿主执行 port——不探测 SRT、不要求 provision，直接返回
+    // 宿主执行范围（无 port、enforcement=unavailable）；审批与直执由调用方按宿主事实处理。
+    if (capability.backend === "host-execution") {
+      return { scope: { execution: "host" as const, policy: resolution.policy }, diagnostics: [] };
+    }
     if (!resolution.executable) {
       return { scope: undefined, diagnostics: [`能力报告：backend=${capability.backend}，enforcement=${capability.enforcement}`, ...(capability.diagnostics ?? [])] };
     }

@@ -22,7 +22,8 @@ export function createWebCheckpointInputs(): WebCheckpointInputs {
       forget(checkpoint.turnId);
       for (const [key, entry] of entries) if (entry.expiresAt <= Date.now()) forget(key);
       const calls = checkpoint.messages.flatMap(getAgentToolCalls).filter(function selectWebCall(call) {
-        return (call.name === "web_search" || call.name === "web_fetch") && checkpoint.pendingCalls?.some(function isPending(pending) { return pending.id === call.id; });
+        // open_preview 与 Web 工具同机制：原始输入只在当前 Runtime 短期保存，落盘占位不可当请求输入。
+        return (call.name === "web_search" || call.name === "web_fetch" || call.name === "open_preview") && checkpoint.pendingCalls?.some(function isPending(pending) { return pending.id === call.id; });
       });
       if (checkpoint.status !== "awaiting_approval" || !calls?.length) return;
       if (entries.size >= 32) forget(entries.keys().next().value!);

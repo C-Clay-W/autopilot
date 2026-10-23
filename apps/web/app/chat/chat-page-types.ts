@@ -47,6 +47,8 @@ export interface Message {
   createdAt?: number;
   /** 任务达到最大执行步骤时为 true，UI 会渲染“继续执行”按钮 */
   canContinue?: boolean;
+  /** 继续请求本身失败的结构化原因；只在当前消息内展示，不隐藏可恢复入口。 */
+  recoveryError?: string;
   /** 本地实时请求尚未被 History 持久化投影确认。 */
   optimistic?: boolean;
 }

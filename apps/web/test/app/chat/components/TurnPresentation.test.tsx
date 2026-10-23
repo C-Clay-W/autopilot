@@ -286,3 +286,59 @@ describe("TurnPresentation", function turnPresentationSuite() {
     expect(renderToStaticMarkup(<CurrentWorkTodo presentation={cleared} isChat={false} />)).toBe("");
   });
 });
+
+/** 构造带成功 open_preview 交付的 Turn 状态；不传终态摘要表示仍在运行。 */
+function createPreviewDeliveryState(summaryState?: "completed" | "failed" | "interrupted" | "limit_reached"): AgentPresentationState {
+  return {
+    sessionId: "session-1",
+    turnId: "turn-1",
+    appliedEventIds: [],
+    lastSeqByTurn: {},
+    turnStartedAt: {},
+    items: [
+      { id: "tool:preview-1", kind: "tool_call", turnId: "turn-1", stepId: "one", callId: "preview-1", toolName: "open_preview", profileKey: "open_preview", category: "external", state: "completed", titleKey: "tool.external.completed", detail: { kind: "open_preview", previewId: "pvw-1", hostLabel: "127.0.0.1:5173", copyUrl: "http://127.0.0.1:5173/demo", openWhen: "after_turn", state: "prepared" } },
+      { id: "answer:turn-1", kind: "assistant_answer", channel: "final", turnId: "turn-1", stepId: "two", content: "页面已准备好" },
+      ...(summaryState ? [{ id: "turn:turn-1:summary", kind: "turn_summary" as const, turnId: "turn-1", state: summaryState, toolCount: 1 }] : []),
+    ],
+  };
+}
+
+/** 结果尾部接线桩：静态渲染只验证终态门与顺序，不触达网络。 */
+const previewView = {
+  panelPreviewId: null,
+  resolvingPreviewId: null,
+  onTogglePreview: function noopTogglePreview() {},
+  onOpenInPreview: async function noopOpenInPreview() { return undefined; },
+};
+
+describe("结果尾部终态门（AC-8）", function resultAreaGate() {
+  it("正常终态在最终正文之后、Turn Summary 之前渲染结果操作与完整链接", function rendersAfterNormalTerminal() {
+    const markup = renderToStaticMarkup(<TurnPresentation state={createPreviewDeliveryState("completed")} turnId="turn-1" showThinking workPreview={previewView} onApprovalDecision={function ignoreDecision() {}} {...userQuestionCallbacks} />);
+
+    expect(markup).toContain("打开预览");
+    expect(markup).toContain("http://127.0.0.1:5173/demo");
+    expect(markup.indexOf("页面已准备好")).toBeLessThan(markup.indexOf("打开预览"));
+    expect(markup.indexOf("打开预览")).toBeLessThan(markup.indexOf("Turn Summary"));
+  });
+
+  it("运行中、失败、取消与 limit 终态都不渲染正常结果入口", function hidesWithoutNormalTerminal() {
+    const states = [createPreviewDeliveryState(), createPreviewDeliveryState("failed"), createPreviewDeliveryState("interrupted"), createPreviewDeliveryState("limit_reached")];
+    for (const state of states) {
+      const markup = renderToStaticMarkup(<TurnPresentation state={state} turnId="turn-1" showThinking workPreview={previewView} onApprovalDecision={function ignoreDecision() {}} {...userQuestionCallbacks} />);
+      expect(markup).not.toContain("打开预览");
+      expect(markup).not.toContain("复制链接");
+    }
+  });
+
+  it("终止提示与恢复中不渲染结果操作", function hidesOnTerminationAndResume() {
+    const terminated = renderToStaticMarkup(<TurnPresentation state={createPreviewDeliveryState("completed")} turnId="turn-1" showThinking workPreview={previewView} termination={{ reason: "runtime_budget", recoverable: true }} onApprovalDecision={function ignoreDecision() {}} {...userQuestionCallbacks} />);
+    expect(terminated).not.toContain("打开预览");
+    const resuming = renderToStaticMarkup(<TurnPresentation state={createPreviewDeliveryState("completed")} turnId="turn-1" showThinking isResuming workPreview={previewView} onApprovalDecision={function ignoreDecision() {}} {...userQuestionCallbacks} />);
+    expect(resuming).not.toContain("打开预览");
+  });
+
+  it("只读历史保留链接文本但不提供结果操作按钮", function readOnlyWithoutActions() {
+    const markup = renderToStaticMarkup(<TurnPresentation state={createPreviewDeliveryState("completed")} turnId="turn-1" showThinking readOnly workPreview={previewView} onApprovalDecision={function ignoreDecision() {}} {...userQuestionCallbacks} />);
+    expect(markup).not.toContain("打开预览");
+  });
+});

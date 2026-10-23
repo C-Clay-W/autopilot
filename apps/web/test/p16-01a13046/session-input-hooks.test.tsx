@@ -8,9 +8,11 @@ import { useConversationSubmission } from "@/app/chat/hooks/useConversationSubmi
 import { useTurnRecoveryActions } from "@/app/chat/hooks/useTurnRecoveryActions";
 import type { Message, PendingAgentInput } from "@/app/chat/chat-page-types";
 
-const context = vi.hoisted(function contextMocks() { return { manager: { updateRuntimeState: vi.fn(), beginSession: vi.fn() }, refreshSessions: vi.fn() }; });
+const context = vi.hoisted(function contextMocks() { return { manager: { updateRuntimeState: vi.fn(), beginSession: vi.fn(), getSessionSnapshot: vi.fn(), applyTerminalEvent: vi.fn() }, refreshSessions: vi.fn() }; });
+/** 通知与上下文一样提升为共享替身，便于断言用户可见的停止/继续提示。 */
+const notice = vi.hoisted(function noticeMocks() { return { error: vi.fn(), warning: vi.fn(), success: vi.fn() }; });
 vi.mock("@/app/chat/session-task-context", function contextMock() { return { useSessionTaskContext: function readContext() { return context; } }; });
-vi.mock("@/app/chat/components/Notice", function noticeMock() { return { useNotice: function notice() { return { error: vi.fn(), warning: vi.fn(), success: vi.fn() }; } }; });
+vi.mock("@/app/chat/components/Notice", function noticeMock() { return { useNotice: function useNoticeMock() { return notice; } }; });
 vi.mock("@/lib/knowledge-ingest-client", function knowledgeMock() { return { uploadChatKnowledge: vi.fn() }; });
 
 /** 用现有 Ink 测试 renderer 执行真实 React Hook 生命周期，不模拟 React 或复制 Hook 逻辑。 */
@@ -40,7 +42,7 @@ function inputHarness() {
     textareaRef: { current: null }, setMessages: messages.set, setLoading: vi.fn(), setActivity: vi.fn(), setPresentation: state.set,
     setStreamingMessageId: vi.fn(), setActiveTurnId: vi.fn(), setPendingInputs: pending.set, setInputDeliveryNotice: vi.fn(), setResumePendingSessionId: vi.fn(),
     loadHistory: vi.fn(async function load() { return true; }), consumeAgentStream: vi.fn(async function stream() { return "terminal" as const; }), getSessionController: vi.fn(), setTransportState: vi.fn(), clearActiveTurn: vi.fn(), markAwaitingUserInput: vi.fn(),
-    activeTurnRef: { current: null as { sessionId: string; turnId: string } | null }, cancelRequestedRef: { current: false }, cancelledTurnIdsRef: { current: new Set<string>() }, cancelInFlightRef: { current: null }, requestAbortRef: { current: null }, transportDisconnectedRef: { current: false }, awaitingApprovalRef: { current: false }, awaitingUserInputRef: { current: false },
+    activeTurnRef: { current: null as { sessionId: string; turnId: string } | null }, cancelRequestedRef: { current: false }, cancelledTurnIdsRef: { current: new Set<string>() }, cancelInFlightRef: { current: null }, requestAbortRef: { current: null }, transportDisconnectedRef: { current: false }, awaitingApprovalRef: { current: false }, awaitingUserInputRef: { current: false }, executionEpochRef: { current: 0 },
     pendingInputsRef: { current: [] as PendingAgentInput[] }, currentSessionIdRef: { current: "session" }, currentWorkspaceIdRef: { current: "workspace" }, queueExecutionRequestedRef: { current: false }, joinedInputIdsRef: { current: new Set<string>() }, historyInputIdsRef: { current: new Set<string>() },
   };
   const submission = { ...common, presentation: state.value, hasWorkspace: true, currentRetrieval: "none", databaseEnabled: false, selectedSkills: [], setSelectedSkills: vi.fn(), setPinnedSkills: vi.fn(), inputRef: { current: "用户原文\n@docs/a.md" }, inputActionsRef: { current: null }, onOpenWorkspacePicker: vi.fn(), onSessionStarting: vi.fn(), onSessionCreated: vi.fn(), handleContinueTurn: vi.fn(), requestNextQueuedTurn: vi.fn(), setSessionMeta: vi.fn(), setHistoryReady: vi.fn(), setReadOnlyReason: vi.fn(), setChatAttachments: vi.fn(), locallyCreatedSessionRef: { current: null } } as unknown as Parameters<typeof useConversationSubmission>[0];
@@ -243,5 +245,203 @@ describe("P16 session input Hooks", function suite() {
       expect(h.common.clearActiveTurn).not.toHaveBeenCalled();
       expect(h.common.setLoading).not.toHaveBeenCalled();
     } finally { recovery.unmount(); }
+  });
+});
+
+describe("H2 Turn 停止与继续", function h2RecoverySuite() {
+  beforeEach(function globals() { vi.clearAllMocks(); vi.stubGlobal("window", { setTimeout, clearTimeout, addEventListener: vi.fn(), removeEventListener: vi.fn() }); });
+  afterEach(function restore() { vi.unstubAllGlobals(); });
+
+  /** 停止在途时准备一条真实可继续的 Turn 消息与可用的 Session controller。 */
+  function recoveryWithContinuableTurn() {
+    const h = inputHarness();
+    const messages: Message[] = [{ id: "assistant", role: "assistant", content: "", turnId: "A", canContinue: true }];
+    h.messages.set(messages);
+    h.recovery.messages = messages;
+    h.submission.messages = messages;
+    h.submission.loading = false;
+    h.common.getSessionController.mockReturnValue({ createAbortController: function create() { return new AbortController(); } });
+    return h;
+  }
+
+  it("停止在途时的继续动作给出明确提示且不抢跑", async function blocksContinueWhileStopping() {
+    const h = recoveryWithContinuableTurn();
+    h.common.cancelInFlightRef.current = Promise.resolve();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const hook = mountHook(useTurnRecoveryActions, h.recovery);
+    try {
+      await hook.current.handleContinueTurn("assistant");
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(notice.warning).toHaveBeenCalledWith("任务正在停止，请等待服务端确认后再继续");
+      expect(h.common.setLoading).not.toHaveBeenCalled();
+    } finally { hook.unmount(); }
+  });
+
+  it("停止在途时的明确继续命令同样给出提示且不发送", async function blocksContinueCommandWhileStopping() {
+    const h = recoveryWithContinuableTurn();
+    h.submission.inputRef.current = "继续执行";
+    h.common.cancelInFlightRef.current = Promise.resolve();
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const hook = mountHook(useConversationSubmission, h.submission);
+    try {
+      await hook.current.handleSend();
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(notice.warning).toHaveBeenCalledWith("任务正在停止，请等待服务端确认后再发送");
+    } finally { hook.unmount(); }
+  });
+
+  it("继续失败不乐观恢复可继续入口，仅保留结构化原因（P17 问题2）", async function keepsStructuredReasonWithoutOptimisticEntry() {
+    const h = recoveryWithContinuableTurn();
+    vi.stubGlobal("fetch", vi.fn(async function continueRoute() { return Response.json({ error: "TURN_NOT_RESUMABLE" }, { status: 409 }); }));
+    const hook = mountHook(useTurnRecoveryActions, h.recovery);
+    try {
+      await hook.current.handleContinueTurn("assistant");
+      await frame();
+      const message = h.messages.value[0];
+      expect(message.canContinue).toBe(false);
+      expect(message.recoveryError).toContain("恢复失败");
+      expect(message.recoveryError).toContain("TURN_NOT_RESUMABLE");
+      expect(message.activity).toBeUndefined();
+    } finally { hook.unmount(); }
+  });
+
+  it("点击继续立即隐藏旧继续入口与旧停止提示（P17 问题2）", async function hidesStaleRecoveryProjectionOnClaim() {
+    const h = recoveryWithContinuableTurn();
+    const seeded: Message[] = [{ id: "assistant", role: "assistant", content: "", turnId: "A", canContinue: true, termination: { reason: "turn_limit_reached", recoverable: true } }];
+    h.messages.set(seeded);
+    h.recovery.messages = seeded;
+    const response = deferred<Response>();
+    vi.stubGlobal("fetch", vi.fn(function wait() { return response.promise; }));
+    const hook = mountHook(useTurnRecoveryActions, h.recovery);
+    try {
+      const started = hook.current.handleContinueTurn("assistant");
+      await frame();
+      const message = h.messages.value[0];
+      expect(message.canContinue).toBe(false);
+      expect(message.termination).toBeUndefined();
+      expect(message.activity).toBe("answer");
+      response.resolve(new Response("data: end\n\n"));
+      await started;
+    } finally { hook.unmount(); }
+  });
+
+  it("继续在途时重复触发不再发送第二个请求（P17 问题2）", async function blocksDuplicateContinueWhileInFlight() {
+    const h = recoveryWithContinuableTurn();
+    const response = deferred<Response>();
+    const fetchMock = vi.fn(function wait() { return response.promise; });
+    vi.stubGlobal("fetch", fetchMock);
+    const hook = mountHook(useTurnRecoveryActions, h.recovery);
+    try {
+      const started = hook.current.handleContinueTurn("assistant");
+      await frame();
+      await hook.current.handleContinueTurn("assistant");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      response.resolve(new Response("data: end\n\n"));
+      await started;
+    } finally { hook.unmount(); }
+  });
+
+  it("完成终态清除上一段恢复留下的旧停止提示（P17 问题2）", async function completionClearsStaleTermination() {
+    const presentation = createPresentationState();
+    const agent = { turnId: "A", status: "interrupted_recoverable", recoverable: true, termination: { reason: "turn_limit_reached", recoverable: true } };
+    vi.stubGlobal("fetch", vi.fn(async function history() {
+      return Response.json({ meta: { id: "session", productMode: "work", runtimeStatus: "interrupted" }, messages: [{ id: "assistant", role: "assistant", content: "部分结果", turnId: "A" }], presentation, agent });
+    }));
+    const options = { workspaceId: "workspace", sessionId: "session", isChat: false, notifyNewProgress: vi.fn(), setSelectedSkills: vi.fn(), setPinnedSkills: vi.fn() };
+    const hook = mountHook(useSessionConversation, options);
+    try {
+      await frame();
+      const restored = hook.current.messages[0];
+      expect(restored.canContinue).toBe(true);
+      expect(restored.termination).toEqual({ reason: "turn_limit_reached", recoverable: true });
+      const outcome = await hook.current.consumeAgentStream(new Response('data: {"type":"turn_completed","turnId":"A"}\n\n'), "assistant", "session");
+      expect(outcome).toBe("terminal_seen");
+      await frame();
+      const cleared = hook.current.messages[0];
+      expect(cleared.termination).toBeUndefined();
+      expect(cleared.canContinue).toBe(false);
+      expect(cleared.activity).toBeUndefined();
+    } finally { hook.unmount(); }
+  });
+
+  it("旧继续请求的收尾不清理后来续接的执行段", async function ignoresStaleFinally() {
+    const h = recoveryWithContinuableTurn();
+    const response = deferred<Response>();
+    vi.stubGlobal("fetch", vi.fn(function wait() { return response.promise; }));
+    const hook = mountHook(useTurnRecoveryActions, h.recovery);
+    try {
+      const started = hook.current.handleContinueTurn("assistant");
+      await frame();
+      h.common.setLoading.mockClear();
+      h.common.clearActiveTurn.mockClear();
+      h.common.executionEpochRef.current += 1;
+      response.resolve(new Response("data: end\n\n"));
+      await started;
+      expect(h.common.setLoading).not.toHaveBeenCalled();
+      expect(h.common.clearActiveTurn).not.toHaveBeenCalled();
+    } finally { hook.unmount(); }
+  });
+
+  it("停止请求失败时重新同步权威状态并结束忙状态", async function resyncsAfterCancelFailure() {
+    const h = recoveryWithContinuableTurn();
+    h.common.activeTurnRef.current = { sessionId: "session", turnId: "A" };
+    let rejectCancel!: (error: unknown) => void;
+    vi.stubGlobal("fetch", vi.fn(function cancelRoute() { return new Promise<Response>(function pending(_resolve, reject) { rejectCancel = reject; }); }));
+    const hook = mountHook(useTurnRecoveryActions, h.recovery);
+    try {
+      const stopping = hook.current.cancelCurrentTurn();
+      await frame();
+      expect(hook.current.stopping).toBe(true);
+      rejectCancel(new TypeError("network"));
+      await stopping;
+      await frame();
+      expect(notice.error).toHaveBeenCalledWith("停止请求未收到确认，已重新同步任务状态");
+      expect(h.common.loadHistory).toHaveBeenCalledWith("session");
+      expect(hook.current.stopping).toBe(false);
+    } finally { hook.unmount(); }
+  });
+
+  it("取消返回 409 且权威状态同步失败时撤销可继续资格", async function revokesWhenCancelUnconfirmed() {
+    const h = recoveryWithContinuableTurn();
+    h.common.activeTurnRef.current = { sessionId: "session", turnId: "A" };
+    vi.stubGlobal("fetch", vi.fn(async function cancelRoute() { return Response.json({ error: "TURN_ALREADY_RUNNING" }, { status: 409 }); }));
+    h.common.loadHistory.mockResolvedValueOnce(false);
+    const hook = mountHook(useTurnRecoveryActions, h.recovery);
+    try {
+      await hook.current.cancelCurrentTurn();
+      await frame();
+      const message = h.messages.value.find((item) => item.turnId === "A");
+      expect(message?.canContinue).toBe(false);
+      expect(message?.recoveryError).toContain("停止请求未收到确认");
+    } finally { hook.unmount(); }
+  });
+
+  it("继续失败且权威状态同步失败时不保留可继续承诺", async function revokesWhenContinueUnconfirmable() {
+    const h = recoveryWithContinuableTurn();
+    vi.stubGlobal("fetch", vi.fn(async function continueRoute() { return Response.json({ error: "TURN_NOT_RESUMABLE" }, { status: 409 }); }));
+    h.common.loadHistory.mockResolvedValueOnce(false);
+    const hook = mountHook(useTurnRecoveryActions, h.recovery);
+    try {
+      await hook.current.handleContinueTurn("assistant");
+      await frame();
+      const message = h.messages.value[0];
+      expect(message.canContinue).toBe(false);
+      expect(message.recoveryError).toContain("无法确认任务当前状态");
+    } finally { hook.unmount(); }
+  });
+
+  it("服务端终态优先于旧活动快照，不把历史 Turn 恢复成运行中", async function terminalBeatsStaleProjection() {
+    const presentation = { ...createPresentationState(), turnId: "A", activeOperation: { kind: "thinking" as const, id: "thinking" }, turnStartedAt: { A: new Date(1000).toISOString() } };
+    vi.stubGlobal("fetch", vi.fn(async function history() { return Response.json({ meta: { id: "session", productMode: "work", runtimeStatus: "interrupted" }, messages: [], presentation }); }));
+    const options = { workspaceId: "workspace", sessionId: "session", isChat: false, notifyNewProgress: vi.fn(), setSelectedSkills: vi.fn(), setPinnedSkills: vi.fn() };
+    const hook = mountHook(useSessionConversation, options);
+    try {
+      await frame();
+      expect(hook.current.loading).toBe(false);
+      expect(hook.current.activity).toBeUndefined();
+      expect(hook.current.activeTurnId).toBe("");
+    } finally { hook.unmount(); }
   });
 });

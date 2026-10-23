@@ -1,6 +1,6 @@
 {
   "name": "autopilot-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Autopilot Agent CLI：本地工作区中的 AI 编程助手。",
   "type": "module",
   "bin": {
@@ -34,9 +34,9 @@
     "prepack": "node ../../scripts/check-npm-pack.mjs packages/autopilot-agent"
   },
   "dependencies": {
-    "@autopilot-agent/adapters": "0.1.0",
-    "@autopilot-agent/cli": "0.1.0",
-    "@autopilot-agent/core": "0.1.0"
+    "@autopilot-agent/adapters": "0.2.0",
+    "@autopilot-agent/cli": "0.2.0",
+    "@autopilot-agent/core": "0.2.0"
   },
   "license": "MIT",
   "repository": {

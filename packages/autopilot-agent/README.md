@@ -222,6 +222,10 @@ CLI 也直接依赖 Core 和 Adapters，Adapters/Presentation 依赖 Core。主�
 
 源码仓库：https://github.com/C-Clay-W/autopilot 。源码还包含 Web；它不随 npm 主包安装。开发者可阅读各包 README、Core API 和 BUILD.md，从源码修改并验证。当前源码可以先于 registry 中的 0.1.0，不能仅凭版本字段判断二者完全相同。
 
+## 源码 0.2.0 与 npm 版本
+
+本次源码版本为 0.2.0，不表示 npm 已发布该版本；上面的 npm 0.1.0 安装示例继续对应旧归档。Windows 源码已移除进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
+
 ## 许可证
 
 本公开源码采用 MIT，见 LICENSE；第三方依赖和字体保留各自许可证。已发布的 npm 0.1.0 不会因本次源码整理而被替换或重新发布。

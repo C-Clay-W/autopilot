@@ -15,6 +15,7 @@ import type { ModelSampler } from "../../internal/kernel/model-sampler";
 import type { ModelSamplerFactory } from "../provider/model-sampler-factory";
 import type { McpCapability } from "./mcp-capability";
 import type { WebCapability } from "./web-capability";
+import type { WorkPreviewCapability } from "./work-preview-capability";
 import type { SessionRunConfig } from "../domain/session-run-config";
 import type { FrozenRunConfig } from "../domain/frozen-run-config";
 import type { ModelRef } from "../domain/model-ref";
@@ -85,6 +86,10 @@ export interface RunConfig {
   web?: WebCapability;
   /** 受信宿主在 start/continue 前重新解析 Web 配置；undefined 必须清除旧能力。 */
   webLoader?: () => Promise<WebCapability | undefined>;
+  /** Trust 后由宿主 bootstrap 注入的 Work 预览能力；仅进程内存在，override 不可注入或替换。 */
+  workPreview?: WorkPreviewCapability;
+  /** 受信宿主在每个 Work Turn 开始前重新解析预览能力；undefined 必须清除旧能力。 */
+  workPreviewLoader?: () => Promise<WorkPreviewCapability | undefined>;
   databaseSearch?: DatabaseSearchCapability;
   /** 仅控制 Work 当前 Turn 是否注册独立 database_search。 */
   databaseSearchPolicy?: DatabaseSearchPolicy;
@@ -178,6 +183,8 @@ export function resolveRunConfig(input: ResolveRunConfigInput): FrozenRunConfig 
     safetyBudgetVersion: 2,
     workspaceRoot,
     workspaceTrusted,
+    // Work 预览能力开关只从受信宿主 runtimeDefault 计算；override 不可开启（Talk-Plan0908 §7.2）。
+    workPreviewEnabled: runtimeDefault?.workPreview !== undefined,
     compactPolicy,
     databaseSearchPolicy,
     ragSourcePolicy: ragSourcePolicy ? { ...ragSourcePolicy } : undefined,

@@ -50,6 +50,40 @@ describe("R5 CLI 无沙箱批准与执行方式出口", () => {
     expect(jsonl.display.cwd).toBe("C:/workspace/demo");
   });
 
+  it("Talk-Plan1022 S3：宿主执行审批卡按待审措辞显示无隔离说明，JSONL 透传 executionMode", () => {
+    const projector = createCliEventProjector({ sessionId: "s3-host-approval" });
+    projector.project(asEvent({
+      type: "approval_required",
+      turnId: "turn-s3",
+      stepId: "step-1",
+      callId: "call-s3",
+      toolName: "run_command",
+      result: {
+        status: "approval_required",
+        callId: "call-s3",
+        toolName: "run_command",
+        approval: {
+          approvalId: "approval-s3",
+          callId: "call-s3",
+          toolName: "run_command",
+          normalizedInputHash: "hash-s3",
+          reason: "Windows 宿主执行：命令将在当前用户权限下直接运行，未启用沙箱隔离，需要逐次确认",
+          risk: "unknown",
+          preview: { program: "node" },
+          expiresAt: "2099-01-01T00:00:00.000Z",
+          display: { operation: "command", effect: "workspace", destructive: false, allowedDecisions: ["allow_once", "deny"], executionMode: "unisolated" },
+        },
+      },
+    }));
+    const event = projector.getProjection().events.at(-1)!;
+    const text = createPlainRenderer("text").render(event);
+    // 待审批措辞用"将"，不得显示成已执行。
+    expect(text).toContain("将在当前用户权限下运行（未启用沙箱隔离）");
+    expect(text).not.toContain("未隔离：宿主直接执行");
+    const jsonl = JSON.parse(createPlainRenderer("jsonl").render(event));
+    expect(jsonl.display.executionMode).toBe("unisolated");
+  });
+
   it("普通命令批准不显示无沙箱标注", () => {
     const projector = createCliEventProjector({ sessionId: "r5-normal" });
     projector.project(asEvent({

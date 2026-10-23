@@ -11,9 +11,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { SANDBOX_ERROR_CODES, SandboxPortError, type SandboxExecutionRequest, type SandboxPolicy } from "@autopilot-agent/core";
 import { buildSrtRuntimeConfig, createNodeSandboxPort, serializePosixCommand } from "../src/node/sandbox/node-sandbox-port";
-import { readWindowsSandboxCapability, runWindowsSandboxSetup } from "../src/node/sandbox/windows-sandbox-setup";
 import type { SrtRuntimeSurface } from "../src/node/sandbox/srt-module";
-import { finalizeWindowsSandboxArgv, resolveWindowsSandboxCommand } from "../src/node/sandbox/windows-sandbox-command";
 
 /** 构造冻结 policy 的最小合法请求。 */
 function createRequest(overrides: Partial<SandboxExecutionRequest> = {}): SandboxExecutionRequest {
@@ -177,54 +175,7 @@ describe("createNodeSandboxPort (darwin)", () => {
   });
 });
 
-describe("Windows 与其他平台 fail-closed", () => {
-  it("win32 用原生 argv 包装，无 shell 插值，透传公共 runner 与冻结 temp", async () => {
-    const restore = stubPlatform("win32");
-    try {
-      const srt = createFakeSrt();
-      const port = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", windowsSrtWinExe: "C:\\public\\srt-win.exe", loadModule: async () => srt });
-      const args = ["", "中文", 'a"b', "$literal; & echo unsafe", "a b"];
-      const prepared = await port.prepare(createRequest({ program: process.execPath, args }));
-      expect(prepared.args.slice(-args.length - 1)).toEqual([process.execPath, ...args]);
-      expect(prepared.args).toContain("TEMP=/ws/.autopilot/tmp");
-      expect(srt.SandboxManager.initialize).toHaveBeenCalledWith(expect.objectContaining({ windows: { srtWin: { path: "C:\\public\\srt-win.exe" } } }));
-      await port.release("call-1");
-      await port.shutdown();
-    } finally {
-      restore();
-    }
-  });
-
-  it("win32 status 在初始化和 WFP 行为验证成功后报告 full，不泄露 SID", async () => {
-    const restore = stubPlatform("win32");
-    try {
-      const srt = createFakeSrt();
-      const port = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async () => srt });
-      const report = await port.status();
-      expect(report.platform).toBe("windows");
-      expect(report.provisioned).toBe(true);
-      expect(report.enforcement).toBe("full");
-      expect(srt.SandboxManager.waitForNetworkInitialization).toHaveBeenCalled();
-      expect(JSON.stringify(report)).not.toContain("S-1-5-TEST");
-    } finally {
-      restore();
-    }
-  });
-
-  it("win32 setup 显式触发安装；UAC 取消不视为错误并在诊断中说明", async () => {
-    const restore = stubPlatform("win32");
-    try {
-      const srt = createFakeSrt();
-      (srt.installWindowsSandboxAsync as ReturnType<typeof vi.fn>).mockResolvedValue({ wfp: { state: "absent", filters: 0 }, user: { provisioned: false, credPresent: false }, cancelled: true });
-      const port = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async () => srt });
-      const report = await port.setup();
-      expect(srt.installWindowsSandboxAsync).toHaveBeenCalledTimes(1);
-      expect(JSON.stringify(report.diagnostics ?? [])).toContain("install_cancelled");
-    } finally {
-      restore();
-    }
-  });
-
+describe("非 darwin 平台 fail-closed（Talk-Plan1022 S3：Windows 走宿主执行 port，SRT 不再覆盖）", () => {
   it("linux prepare/status 均 unavailable，不宣称跨平台能力", async () => {
     const restore = stubPlatform("linux");
     try {
@@ -234,123 +185,6 @@ describe("Windows 与其他平台 fail-closed", () => {
       expect((await port.status()).enforcement).toBe("unavailable");
     } finally {
       restore();
-    }
-  });
-});
-
-describe("Windows 会话安全边界", function windowsSessionTests() {
-  let restore: () => void;
-  beforeEach(function useWindowsPlatform() { restore = stubPlatform("win32"); });
-  afterEach(function restorePlatform() { restore(); });
-
-  it("网络验证失败时 status unavailable 且 prepare 不包装目标", async function rejectsInactiveFence() {
-    const srt = createFakeSrt();
-    vi.mocked(srt.SandboxManager.waitForNetworkInitialization).mockResolvedValue(false);
-    const port = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async function load() { return srt; } });
-    expect((await port.status()).enforcement).toBe("unavailable");
-    await expect(port.prepare(createRequest())).rejects.toMatchObject({ code: SANDBOX_ERROR_CODES.RUNNER_FAILED });
-    expect(srt.SandboxManager.wrapWithSandboxArgv).not.toHaveBeenCalled();
-  });
-
-  it("活动命令阻止策略切换，释放后 reset/initialize 真正替换会话 ACL", async function resetsAclBeforePolicyChange() {
-    const srt = createFakeSrt();
-    const port = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async function load() { return srt; } });
-    const request = createRequest({ program: process.execPath });
-    await port.prepare(request);
-    const readonlyRequest = { ...request, policy: { ...request.policy, mode: "read-only" as const } };
-    await expect(port.prepare(readonlyRequest)).rejects.toMatchObject({ code: SANDBOX_ERROR_CODES.SCOPE_CONFLICT });
-    await port.release(request.commandId);
-    await port.prepare(readonlyRequest);
-    expect(srt.SandboxManager.reset).toHaveBeenCalledTimes(1);
-    expect(srt.SandboxManager.initialize).toHaveBeenCalledTimes(2);
-    expect(srt.SandboxManager.updateConfig).not.toHaveBeenCalled();
-    await port.release(request.commandId);
-    await port.shutdown();
-  });
-
-  it("另一 Port 不能并行占用全局 Windows manager", async function rejectsSecondPort() {
-    const srt = createFakeSrt();
-    const first = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async function load() { return srt; } });
-    const second = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/other", loadModule: async function load() { return srt; } });
-    await first.status();
-    await expect(second.prepare(createRequest({ policy: { ...createRequest().policy, workspaceRoot: "/other" } }))).rejects.toMatchObject({ code: SANDBOX_ERROR_CODES.SCOPE_CONFLICT });
-    await first.shutdown();
-    expect((await second.status()).enforcement).toBe("full");
-    await second.shutdown();
-  });
-
-  it("拒绝异常包装结构，不以裸 argv 降级", function rejectsMalformedWrapper() {
-    expect(function invalid() { finalizeWindowsSandboxArgv(["node.exe"], { exe: "node.exe", args: [] }); }).toThrow(SandboxPortError);
-  });
-
-  it("npm/npx/pnpm 只解析可信 JS 入口并保留结构化参数", function resolvesTrustedPackageManagers() {
-    const realpath = vi.spyOn(fs.realpathSync, "native").mockImplementation(function samePath(value) { return String(value); });
-    const stat = vi.spyOn(fs, "statSync").mockReturnValue({ isFile: function file() { return true; } } as fs.Stats);
-    try {
-      for (const [program, suffix] of [["npm.cmd", "npm-cli.js"], ["npx.cmd", "npx-cli.js"], ["pnpm.cmd", "pnpm.mjs"]] as const) {
-        const resolved = resolveWindowsSandboxCommand(program, ["--no-install", "tsc"]);
-        expect(resolved.exe).toBe(process.execPath);
-        expect(resolved.args[0]).toMatch(new RegExp(`${suffix.replace(".", "\\.")}$`));
-        expect(resolved.args.slice(1)).toEqual(["--no-install", "tsc"]);
-      }
-    } finally {
-      realpath.mockRestore();
-      stat.mockRestore();
-    }
-  });
-
-  it("可信工具链入口被重定向到工作区时 fail-closed", function rejectsPackageManagerSymlink() {
-    const realpath = vi.spyOn(fs.realpathSync, "native").mockImplementation(function redirected(value) {
-      const candidate = String(value);
-      return candidate.endsWith("pnpm.mjs") ? "C:\\workspace\\pnpm.mjs" : candidate;
-    });
-    try {
-      expect(function resolve() { resolveWindowsSandboxCommand("pnpm.cmd", []); }).toThrow(SandboxPortError);
-    } finally {
-      realpath.mockRestore();
-    }
-  });
-
-  it("status 只报告阶段与白名单底层码，不泄露底层文案", async function reportsSanitizedFailurePhase() {
-    const srt = createFakeSrt();
-    vi.mocked(srt.checkWindowsSandboxStatusAsync).mockRejectedValue(Object.assign(new Error("secret path and token"), { code: "EACCES", win32Code: 5 }));
-    const port = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async function load() { return srt; } });
-    const report = await port.status();
-    expect(report.enforcement).toBe("unavailable");
-    expect(report.diagnostics).toEqual(["phase=capability-probe;cause=EACCES;win32=0x00000005"]);
-    expect(JSON.stringify(report)).not.toContain("secret");
-    await port.shutdown();
-  });
-
-  it("模块加载、初始化与包装分别保留脱敏阶段", async function separatesPortFailures() {
-    const moduleFailure = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async function failLoad() { throw Object.assign(new Error("secret module"), { code: "EPERM" }); } });
-    expect((await moduleFailure.status()).diagnostics).toEqual(["phase=module-load;cause=EPERM"]);
-
-    const initializingSrt = createFakeSrt();
-    vi.mocked(initializingSrt.SandboxManager.initialize).mockRejectedValue(Object.assign(new Error("secret init"), { code: "EACCES" }));
-    const initializingPort = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async function load() { return initializingSrt; } });
-    expect((await initializingPort.status()).diagnostics).toEqual(["phase=initialize;cause=EACCES"]);
-    await initializingPort.shutdown();
-
-    const wrappingSrt = createFakeSrt();
-    vi.mocked(wrappingSrt.SandboxManager.wrapWithSandboxArgv).mockRejectedValue(Object.assign(new Error("secret wrap"), { code: "EPERM" }));
-    const wrappingPort = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async function load() { return wrappingSrt; } });
-    const error = await wrappingPort.prepare(createRequest({ program: process.execPath })).catch(function capture(caught: SandboxPortError) { return caught; });
-    expect(error).toMatchObject({ code: SANDBOX_ERROR_CODES.RUNNER_FAILED, message: "phase=wrap;cause=EPERM" });
-    await wrappingPort.shutdown();
-  });
-
-  it("包管理器入口文件访问异常属于 command-resolve UNAVAILABLE，目标不包装", async function classifiesCommandResolutionFailure() {
-    const realpath = vi.spyOn(fs.realpathSync, "native").mockImplementation(function deny() { throw Object.assign(new Error("secret file path"), { code: "EACCES" }); });
-    const srt = createFakeSrt();
-    const port = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async function load() { return srt; } });
-    try {
-      const error = await port.prepare(createRequest({ program: "npx.cmd", args: ["--no-install", "tsc"] })).catch(function capture(caught: SandboxPortError) { return caught; });
-      expect(error).toMatchObject({ code: SANDBOX_ERROR_CODES.UNAVAILABLE, message: "phase=command-resolve;cause=EACCES" });
-      expect(srt.SandboxManager.wrapWithSandboxArgv).not.toHaveBeenCalled();
-    } finally {
-      realpath.mockRestore();
-      await port.shutdown();
     }
   });
 });
@@ -370,6 +204,22 @@ describe("Stage3 执行边界（纯 mock，不证明 OS）", () => {
     expect(srt.SandboxManager.wrapWithSandboxArgv).not.toHaveBeenCalled();
   });
 
+  it("模块加载、初始化与包装分别保留脱敏阶段（darwin 路径）", async function separatesPortFailures() {
+    const moduleFailure = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async function failLoad() { throw Object.assign(new Error("secret module"), { code: "EPERM" }); } });
+    expect((await moduleFailure.status()).diagnostics).toEqual(["phase=module-load;cause=EPERM"]);
+    const initializingSrt = createFakeSrt();
+    vi.mocked(initializingSrt.SandboxManager.initialize).mockRejectedValue(Object.assign(new Error("secret init"), { code: "EACCES" }));
+    const initializingPort = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async function load() { return initializingSrt; } });
+    expect((await initializingPort.status()).diagnostics).toEqual(["phase=initialize;cause=EACCES"]);
+    await initializingPort.shutdown();
+
+    const wrappingSrt = createFakeSrt();
+    vi.mocked(wrappingSrt.SandboxManager.wrapWithSandboxArgv).mockRejectedValue(Object.assign(new Error("secret wrap"), { code: "EPERM" }));
+    const wrappingPort = createNodeSandboxPort({ stateRoot: "/authority", workspaceRoot: "/ws", loadModule: async function load() { return wrappingSrt; } });
+    const error = await wrappingPort.prepare(createRequest({ program: process.execPath })).catch(function capture(caught: SandboxPortError) { return caught; });
+    expect(error).toMatchObject({ code: SANDBOX_ERROR_CODES.RUNNER_FAILED, message: "phase=wrap;cause=EPERM" });
+    await wrappingPort.shutdown();
+  });
   it("活动执行阻止策略变更、重复 ID 和 shutdown；release 后才可切换", async function guardsLifetime() {
     const srt = createFakeSrt();
     const port = createNodeSandboxPort({ workspaceRoot: "/ws", stateRoot: "/authority", loadModule: async function load() { return srt; } });
@@ -444,30 +294,5 @@ describe("Stage3 执行边界（纯 mock，不证明 OS）", () => {
     const missing = createNodeSandboxPort({ workspaceRoot: "/ws", loadModule: async function load() { return srt; } });
     await expect(missing.prepare(createRequest())).rejects.toMatchObject({ code: SANDBOX_ERROR_CODES.UNAVAILABLE });
     expect(srt.SandboxManager.initialize).not.toHaveBeenCalled();
-    const restoreWindows = stubPlatform("win32");
-    try {
-      const port = createNodeSandboxPort({ workspaceRoot: "/ws", stateRoot: "/authority", loadModule: async function load() { return srt; } });
-      await expect(port.prepare(createRequest({ policy: { ...createRequest().policy, mode: "read-only", deniedRead: ["/ws/.env"] } }))).rejects.toMatchObject({ code: SANDBOX_ERROR_CODES.POLICY_DENIED });
-      expect(srt.SandboxManager.initialize).not.toHaveBeenCalled();
-      expect(srt.SandboxManager.wrapWithSandboxArgv).not.toHaveBeenCalled();
-    } finally { restoreWindows(); }
-  });
-});
-
-describe("readWindowsSandboxCapability / runWindowsSandboxSetup", () => {
-  it("未 provision 时 status 报告 unavailable，setup 抛 NOT_PROVISIONED 之外的探测失败映射 UNAVAILABLE", async () => {
-    const srt = createFakeSrt();
-    (srt.checkWindowsSandboxStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue({ user: { provisioned: false, credPresent: false, realUserSid: "S-1-5" }, wfp: { state: "absent", filters: 0 } });
-    const report = await readWindowsSandboxCapability({ loadModule: async () => srt });
-    expect(report.provisioned).toBe(false);
-    expect(report.enforcement).toBe("unavailable");
-  });
-
-  it("探测异常映射为稳定 UNAVAILABLE 且不透传底层文案", async () => {
-    const srt = createFakeSrt();
-    (srt.checkWindowsSandboxStatusAsync as ReturnType<typeof vi.fn>).mockRejectedValue(new Error("secret probe detail"));
-    await expect(readWindowsSandboxCapability({ loadModule: async () => srt })).rejects.toMatchObject({ code: SANDBOX_ERROR_CODES.UNAVAILABLE });
-    const error = await readWindowsSandboxCapability({ loadModule: async () => srt }).catch((caught: SandboxPortError) => caught);
-    expect(error.message).not.toContain("secret probe detail");
   });
 });

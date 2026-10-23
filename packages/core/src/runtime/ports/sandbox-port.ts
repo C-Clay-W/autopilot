@@ -30,6 +30,12 @@ export class SandboxPortError extends Error {
 
 /** 平台沙箱 Port；运行时在 Composition Root 装配，Core 不感知具体平台实现。 */
 export interface SandboxPort {
+  /**
+   * Talk-Plan1022 CR R2：本 Port 静态声明的进程执行方式。只有停用进程沙箱的宿主执行 Port
+   * 声明 "host"，其余缺省表示沙箱。它是 Turn 冻结执行方式的唯一来源，不依赖 status()
+   * 探测（探测会初始化真实后端，且恢复路径不得借当前探测结果重解释过去的授权）。
+   */
+  readonly execution?: "host";
   /** 报告当前平台能力；不得包含敏感明细（凭据、真实路径列表、命令正文等）。 */
   status(): Promise<SandboxCapabilityReport>;
   /** 显式系统变更入口（如 Windows provision）；只能由用户显式命令触发，禁止在工具执行期调用。 */

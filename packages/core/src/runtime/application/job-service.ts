@@ -18,6 +18,8 @@ import { assertExternalJobDispatch } from "../../internal/tools/permissions/exte
 import { BoundedOutputBuffer, ProcessTreeTerminationError, resolveManagedCommand, terminateManagedProcessTree } from "../../internal/tools/process-utils";
 import { JobOutputProjector, readStoredJobOutput } from "./job-output-projection";
 import { projectJobCloseFacts } from "./job-execution-facts";
+import { jobServicePort, normalizeJobServiceUrl } from "../domain/job-service-url";
+import { createDefaultJobServiceOwnershipProbe, type JobServiceOwnershipProbe } from "./job-service-ownership";
 
 const JOB_OUTPUT_LIMIT = 30_000;
 const JOB_STDIN_SINGLE_LIMIT = 8_000;
@@ -46,6 +48,11 @@ export interface SessionJobService {
   list(input?: { limit?: number; pageCursor?: string }): Promise<JobListView>;
   read(input: { jobId: string; stdoutCursor?: string; stderrCursor?: string; waitMs?: number; signal?: AbortSignal }): Promise<JobReadView>;
   stop(input: { jobId: string; source: "agent" | "host" }): Promise<JobView>;
+  /**
+   * 复核声明的服务地址是否仍由该 Job 自身的进程树监听（Talk-Plan0908 R1）：
+   * owned=声明地址、活动身份与监听归属全部成立；unowned=不成立；unverifiable=当前平台/工具无法证明。
+   */
+  verifyServiceOwnership(input: { jobId: string; serviceUrl: string }): Promise<"owned" | "unowned" | "unverifiable">;
 }
 
 /** SessionService 使用的内部协调接口，不通过 AgentRuntime.jobs 暴露。 */
@@ -62,6 +69,8 @@ export interface CreateJobServiceOptions {
   runtimeInstanceId?: string;
   hostProcessId?: number;
   now?: () => number;
+  /** 监听归属探测面；缺省使用平台只读命令实现，测试注入替身。 */
+  serviceProbe?: JobServiceOwnershipProbe;
 }
 
 interface ActiveJob {
@@ -155,6 +164,7 @@ export function createJobService(options: CreateJobServiceOptions): InternalJobS
   assertStoreCapabilities(options.store);
   const { store, ownerProbe, sessionStore } = options;
   const processes = new ProcessManager();
+  const serviceProbe = options.serviceProbe ?? createDefaultJobServiceOwnershipProbe();
   const now = options.now ?? Date.now;
   const owner: JobOwner = { runtimeInstanceId: options.runtimeInstanceId ?? randomUUID(), hostProcessId: options.hostProcessId ?? process.pid };
   const pageCursorKey = randomBytes(32);
@@ -324,15 +334,15 @@ export function createJobService(options: CreateJobServiceOptions): InternalJobS
     return current;
   }
 
-  /** 创建并持久化 spawn 失败终态，不把 starting 留作伪活动记录。 */
-  async function failStartingJob(active: ActiveJob): Promise<Job> {
+  /** 创建并持久化 spawn 失败终态，不把 starting 留作伪活动记录；phase 按真实执行方式区分。 */
+  async function failStartingJob(active: ActiveJob, hostExecution = false): Promise<Job> {
     // 目标进程从未成功启动，已 prepare 的沙箱包装资源立即释放，不等待后续 close。
     releaseSandbox(active);
     if (!active.projectorFlushed) { active.projector.flush(); active.projectorFlushed = true; }
     const failed = await transition(active, function markSpawnFailure(next) {
       next.status = "failed";
       next.failureCode = "JOB_SPAWN_FAILED";
-      next.execution = { phase: "wrapper_spawn_failed", targetState: "not_started" };
+      next.execution = { phase: hostExecution ? "host_spawn_failed" : "wrapper_spawn_failed", targetState: "not_started" };
       next.finishedAt = now();
     });
     processes.delete(active.job.id);
@@ -346,11 +356,24 @@ export function createJobService(options: CreateJobServiceOptions): InternalJobS
     // 防止绕过 ToolExecutor 的直接调用退化为裸 spawn（fail-closed，不降级）。
     const sandboxBinding = input.sandbox;
     if (!sandboxBinding) throw new SandboxPortError(SANDBOX_ERROR_CODES.UNAVAILABLE, "沙箱未就绪，无法提供已隔离执行，后台 Job 未启动");
+    // Talk-Plan1022 S2：host 形态（Windows 宿主执行）没有沙箱 port，spawn 直接使用受信解析 argv，
+    // 不依赖 srt-win 私有控制协议；持久摘要以 execution:"host" 记录真实执行方式。
+    const sandboxPort = sandboxBinding.execution === "host" ? undefined : sandboxBinding.port;
+    const hostExecution = sandboxPort === undefined;
+    // 声明的服务地址只作为预览归属目标；非法或非 loopback 一律拒绝，避免把任意地址写进 Job。
+    const declaredServiceUrl = input.serviceUrl === undefined ? undefined : normalizeJobServiceUrl(input.serviceUrl);
+    if (input.serviceUrl !== undefined && !declaredServiceUrl) throw new RuntimeError("INVALID_INPUT", "后台 Job 声明的服务地址必须是本机 http(s) origin");
     await assertExternalJobDispatch({ program: input.program, args: input.args, cwd: input.cwd, ...(input.externalWriteTarget !== undefined ? { externalWriteTarget: input.externalWriteTarget } : {}) }, { workspaceRoot: input.workspaceRoot, permissionMode: "ask", executionSessionId: input.sessionId, toolCallId: input.toolCallId, sandboxPolicy: sandboxBinding });
     return store.withSessionLock(input.sessionId, async function registerJob() {
       input.signal?.throwIfAborted();
       const session = await sessionStore.get(input.sessionId);
       if (!session) throw new RuntimeError("SESSION_NOT_FOUND", "后台 Job 所属 Session 不存在");
+      // 启动前端口检查：声明端口已被占用时无法区分服务归属，拒绝声明（fail-closed，禁止端口漂移）。
+      if (declaredServiceUrl) {
+        const port = jobServicePort(declaredServiceUrl);
+        const listeners = port === undefined ? undefined : await serviceProbe.listenerPids(port);
+        if (listeners && listeners.length > 0) throw new RuntimeError("INVALID_INPUT", "声明的服务端口已被占用，无法建立可核验的预览绑定");
+      }
       const cwd = await resolveFileTarget(input.workspaceRoot, input.cwd);
       if (!cwd.exists) throw new RuntimeError("INVALID_INPUT", "后台 Job 工作目录不存在");
       input.signal?.throwIfAborted();
@@ -364,11 +387,14 @@ export function createJobService(options: CreateJobServiceOptions): InternalJobS
         output: { stdout: "", stderr: "", stdoutCursor: 0, stderrCursor: 0, stdoutStartCursor: 0, stderrStartCursor: 0, totalStdoutBytes: 0, totalStderrBytes: 0, stdoutTruncated: false, stderrTruncated: false },
         safeOutput: projector.snapshot(),
         // durable 记录只保存安全 policy 摘要：模式 + 冻结摘要 + 版本，不含代理 env、deny 路径明细或执行句柄。
+        // host Job 的摘要来自宿主冻结范围的真实计算，并以 execution:"host" 明确标注非隔离执行。
         sandbox: {
           mode: sandboxBinding.policy.mode,
           policyDigest: computeSandboxPolicyDigest(sandboxBinding.policy),
           policyVersion: SANDBOX_POLICY_VERSION,
+          ...(hostExecution ? { execution: "host" as const } : {}),
         },
+        ...(declaredServiceUrl ? { serviceUrl: declaredServiceUrl } : {}),
       };
       let created: boolean;
       try { created = await store.create(job); }
@@ -384,16 +410,21 @@ export function createJobService(options: CreateJobServiceOptions): InternalJobS
         // 包装顺序固定：受信解析（含 Windows npm/npx 固定 CLI 与 realpath containment）
         // → SandboxPort.prepare 生成沙箱包装 argv → spawn；平台解析结果不回退拼接 shell。
         const command = resolveManagedCommand(input.program, input.args);
-        prepared = await sandboxBinding.port.prepare({
-          commandId: sandboxBinding.policy.externalWriteCapability?.executionId ?? randomUUID(),
-          program: command.executable,
-          args: command.args,
-          cwd: cwd.canonicalTarget,
-          policy: sandboxBinding.policy,
-          managed: true,
-        });
-        if (prepared.control && prepared.control.protocolVersion !== 1) throw new SandboxPortError(SANDBOX_ERROR_CODES.RUNNER_FAILED, "未知执行控制协议");
-        child = spawn(prepared.executable, [...prepared.args], { cwd: cwd.canonicalTarget, detached: process.platform !== "win32", shell: false, windowsHide: true, stdio: prepared.control ? ["pipe", "pipe", "pipe", "pipe"] : "pipe", env: { ...process.env, ...prepared.env } });
+        if (sandboxPort) {
+          prepared = await sandboxPort.prepare({
+            commandId: sandboxBinding.policy.externalWriteCapability?.executionId ?? randomUUID(),
+            program: command.executable,
+            args: command.args,
+            cwd: cwd.canonicalTarget,
+            policy: sandboxBinding.policy,
+            managed: true,
+          });
+          if (prepared.control && prepared.control.protocolVersion !== 1) throw new SandboxPortError(SANDBOX_ERROR_CODES.RUNNER_FAILED, "未知执行控制协议");
+          child = spawn(prepared.executable, [...prepared.args], { cwd: cwd.canonicalTarget, detached: process.platform !== "win32", shell: false, windowsHide: true, stdio: prepared.control ? ["pipe", "pipe", "pipe", "pipe"] : "pipe", env: { ...process.env, ...prepared.env } });
+        } else {
+          // 宿主执行：无沙箱包装与私有控制协议；受信解析后直接 spawn，进程即目标本身。
+          child = spawn(command.executable, [...command.args], { cwd: cwd.canonicalTarget, detached: process.platform !== "win32", shell: false, windowsHide: true, stdio: "pipe", env: { ...process.env } });
+        }
         // 先观察真实启动/error，再绑定私有通道；bind 抛错也不能遗漏异步 ENOENT 或活跃 wrapper。
         spawnPromise = new Promise<void>(function observeSpawn(resolve, reject) {
           child.once("spawn", function spawned() { spawnObserved = true; resolve(); });
@@ -402,15 +433,15 @@ export function createJobService(options: CreateJobServiceOptions): InternalJobS
         void spawnPromise.catch(function retainSpawnFailureUntilHandled() {});
       }
       catch (error) {
-        const placeholder = { child: { pid: undefined } as ChildProcess, job, stdout: new BoundedOutputBuffer(JOB_OUTPUT_LIMIT), stderr: new BoundedOutputBuffer(JOB_OUTPUT_LIMIT), projector, stdinBytes: 0, stdinClosed: true, outputDirty: false, transitionTail: Promise.resolve(), closeResult: { exitCode: null }, initialized: true, projectorFlushed: false, ...(prepared ? { sandboxExecution: { port: sandboxBinding.port, executionId: prepared.executionId } } : {}) } satisfies ActiveJob;
-        await failStartingJob(placeholder);
+        const placeholder = { child: { pid: undefined } as ChildProcess, job, stdout: new BoundedOutputBuffer(JOB_OUTPUT_LIMIT), stderr: new BoundedOutputBuffer(JOB_OUTPUT_LIMIT), projector, stdinBytes: 0, stdinClosed: true, outputDirty: false, transitionTail: Promise.resolve(), closeResult: { exitCode: null }, initialized: true, projectorFlushed: false, ...(prepared && sandboxPort ? { sandboxExecution: { port: sandboxPort, executionId: prepared.executionId } } : {}) } satisfies ActiveJob;
+        await failStartingJob(placeholder, hostExecution);
         input.signal?.throwIfAborted();
         // 沙箱拒绝/runner 失败是稳定的沙箱错误词汇，原样透出由工具层投影稳定错误码。
         if (error instanceof SandboxPortError) throw error;
         throw new RuntimeError("JOB_SPAWN_FAILED", "后台 Job 启动失败", error);
       }
 
-      const active: ActiveJob = { child, job, stdout: new BoundedOutputBuffer(JOB_OUTPUT_LIMIT), stderr: new BoundedOutputBuffer(JOB_OUTPUT_LIMIT), projector, stdinBytes: 0, stdinClosed: false, outputDirty: false, transitionTail: Promise.resolve(), initialized: false, projectorFlushed: false, sandboxExecution: { port: sandboxBinding.port, executionId: prepared.executionId, control: prepared.control } };
+      const active: ActiveJob = { child, job, stdout: new BoundedOutputBuffer(JOB_OUTPUT_LIMIT), stderr: new BoundedOutputBuffer(JOB_OUTPUT_LIMIT), projector, stdinBytes: 0, stdinClosed: false, outputDirty: false, transitionTail: Promise.resolve(), initialized: false, projectorFlushed: false, ...(sandboxPort && prepared ? { sandboxExecution: { port: sandboxPort, executionId: prepared.executionId, control: prepared.control } } : {}) };
       processes.set(job.id, active);
       child.stdout?.on("data", function captureStdout(chunk: Buffer) { active.stdout.append(chunk); active.projector.append("stdout", chunk); active.outputDirty = true; scheduleOutputPersist(active); notifyJobChanged(job.id); });
       child.stderr?.on("data", function captureStderr(chunk: Buffer) { active.stderr.append(chunk); active.projector.append("stderr", chunk); active.outputDirty = true; scheduleOutputPersist(active); notifyJobChanged(job.id); });
@@ -420,10 +451,12 @@ export function createJobService(options: CreateJobServiceOptions): InternalJobS
       });
 
       try {
-        if (prepared.control) {
+        // 宿主执行没有 prepared/control：直接以受限 stdio 管道观察目标进程。
+        const control = prepared?.control;
+        if (control) {
           const stream = child.stdio[3] as Duplex | null;
           if (!stream) throw new SandboxPortError(SANDBOX_ERROR_CODES.RUNNER_FAILED, "私有执行控制通道缺失");
-          prepared.control.bind({ incoming: stream, send: function send(bytes) { stream.write(bytes); }, close: function close() { stream.destroy(); } });
+          control.bind({ incoming: stream, send: function send(bytes) { stream.write(bytes); }, close: function close() { stream.destroy(); } });
         }
         await spawnPromise;
       } catch (error) {
@@ -435,12 +468,12 @@ export function createJobService(options: CreateJobServiceOptions): InternalJobS
           catch { neverSpawned = !spawnObserved && child.pid === undefined; }
         }
         if (neverSpawned) {
-          await failStartingJob(active);
+          await failStartingJob(active, hostExecution);
         } else {
           await transition(active, function retainFailedBinding(next) {
             next.status = "stopping";
             next.failureCode = "JOB_SPAWN_FAILED";
-            next.execution = { phase: "wrapper_running", targetState: "unknown" };
+            next.execution = { phase: hostExecution ? "host_running" : "wrapper_running", targetState: "unknown" };
           });
           active.initialized = true;
           // 与正常停止共用容器空/close门禁；确认失败保留注册和资源，后续 close 不抢先释放。
@@ -450,7 +483,7 @@ export function createJobService(options: CreateJobServiceOptions): InternalJobS
         throw new RuntimeError("JOB_SPAWN_FAILED", "后台 Job 启动失败", error);
       }
 
-      try { await transition(active, function markRunning(next) { next.status = "running"; next.execution = { phase: "wrapper_running", targetState: "unknown" }; }); }
+      try { await transition(active, function markRunning(next) { next.status = "running"; next.execution = { phase: hostExecution ? "host_running" : "wrapper_running", targetState: "unknown" }; }); }
       catch (error) {
         active.stdinClosed = true;
         try { await terminateManagedProcessTree(child); } catch { /* 句柄继续由 ProcessManager 保留，供 shutdown 重试。 */ }
@@ -617,6 +650,7 @@ export function createJobService(options: CreateJobServiceOptions): InternalJobS
       stderrBytes: job.output.totalStderrBytes,
       outputTruncated: job.output.stdoutTruncated || job.output.stderrTruncated || Boolean(job.safeOutput?.stdout.truncated || job.safeOutput?.stderr.truncated),
       lastControl: job.lastControl ? { ...job.lastControl } : undefined,
+      serviceUrl: job.serviceUrl,
     };
   }
 
@@ -712,7 +746,34 @@ export function createJobService(options: CreateJobServiceOptions): InternalJobS
       return createJobView(await killWithSource(input.jobId, input.source));
     }
 
-    return { list: listScoped, read: readScoped, stop: stopScoped };
+    /**
+     * 监听归属核验：声明地址必须与 Job 记录一致、Job 仍活动且由本 Runtime 拥有，
+     * 并且该端口当前监听者必须是 Job 子进程本身或其子孙进程；任何一环无法证明即 fail-closed。
+     */
+    async function verifyServiceOwnership(input: { jobId: string; serviceUrl: string }): Promise<"owned" | "unowned" | "unverifiable"> {
+      await validateSessionBinding(scopedBinding);
+      const current = await getScopedJob(scopedBinding, input.jobId);
+      const declared = normalizeJobServiceUrl(input.serviceUrl);
+      if (!declared || current.serviceUrl !== declared || !isActiveStatus(current.status)) return "unowned";
+      if (!processes.has(current.id)) return "unowned";
+      const active = processes.get(current.id);
+      const pid = active?.child.pid;
+      if (!pid) return "unverifiable";
+      const port = jobServicePort(declared);
+      if (port === undefined) return "unowned";
+      const listeners = await serviceProbe.listenerPids(port);
+      if (!listeners) return "unverifiable";
+      if (listeners.length === 0) return "unowned";
+      for (const listener of listeners) {
+        if (listener === pid) return "owned";
+        const chain = await serviceProbe.ancestry(listener);
+        if (!chain) return "unverifiable";
+        if (chain.includes(pid)) return "owned";
+      }
+      return "unowned";
+    }
+
+    return { list: listScoped, read: readScoped, stop: stopScoped, verifyServiceOwnership };
   }
 
   /** Runtime 退出时有界停止全部自有 Job；全部成功后才记录 dispose。 */

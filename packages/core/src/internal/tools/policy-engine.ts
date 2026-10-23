@@ -19,6 +19,13 @@ export interface PolicyEvaluationInput {
    * 未注入表示该调用不经过沙箱判定，行为与本字段引入前完全一致。
    */
   sandbox?: { available: boolean };
+  /**
+   * Talk-Plan1022 S1：Windows 宿主执行事实——受信宿主已停用进程沙箱，进程调用经用户
+   * 逐次审批后在宿主直接执行（无 OS 隔离）。由 ToolExecutor 探测到宿主执行 port 后注入；
+   * 任何 grant、full_access、auto_approve 或 Trust 自动放行都不代替此次确认，
+   * 仅 hard deny、Skill 白名单与显式外部 deny 仍然先于本分支拒绝。
+   */
+  hostExecution?: boolean;
 }
 
 /** 唯一策略决策器；顺序固定为 hard deny、Skill、操作审批、grant、Trust/模式自动放行、请求审批。 */
@@ -68,6 +75,24 @@ export class PolicyEngine {
     if (input.sandbox && input.sandbox.available !== true) {
       return { decision: "deny", reason: "沙箱不可用，无法提供已隔离执行，操作被拒绝", errorCode: SANDBOX_ERROR_CODES.UNAVAILABLE, ...base };
     }
+    // Talk-Plan1022 S1：显式外部 deny 从 externalMutation gate 提前为统一前置判定——宿主执行
+    // 确认与只读自动放行都不得越过它；非宿主模式行为不变（该分支原判定结果一致）。
+    if (facts.externalMutation === true && facts.externalRestriction === "deny") {
+      return { decision: "deny", reason: "该工作区外文件修改已被显式规则拒绝", errorCode: TOOL_ERROR_CODES.COMMAND_FORBIDDEN, ...base };
+    }
+    // Talk-Plan1022 S1：Windows 宿主执行逐次确认，先于只读自动放行、grant、full_access、
+    // auto_approve 与 Trust；allowedDecisions 收窄为单次允许/拒绝。审批卡按工具说明
+    // 无隔离事实（run_command 批准后真实执行；start_background_job 通道未接通，批准不启动）。
+    if (input.hostExecution === true) {
+      return {
+        decision: "approval_required",
+        reason: facts.toolName === "start_background_job"
+          ? "Windows 宿主执行：后台命令将在当前用户权限下直接运行，未启用沙箱隔离，需要逐次确认"
+          : "Windows 宿主执行：命令将在当前用户权限下直接运行，未启用沙箱隔离，需要逐次确认",
+        ...base,
+        allowedApprovalDecisions: ["allow_once", "deny"],
+      };
+    }
     if (!facts.requiresApproval) return { decision: "allow", reason: facts.approval?.reason ?? "本地策略确认该操作为只读", ...base };
     // Talk-Plan1013 Stage5 R5：外部读取 ask 逐次询问——先于 grant 与任何权限模式分支，
     // allowedDecisions 收窄为单次允许/拒绝，不写任何持久规则，full_access 也不能跳过。
@@ -85,9 +110,6 @@ export class PolicyEngine {
     // Stage5 R5：deny 为硬拒绝（先于 grant 与模式放行）；ask 已在上方收窄为逐次询问（即便有 grant）；
     // grant boolean 不再兼任 deny，三态判定来自共享权限事实入口。
     if (facts.externalMutation === true) {
-      if (facts.externalRestriction === "deny") {
-        return { decision: "deny", reason: "该工作区外文件修改已被显式规则拒绝", errorCode: TOOL_ERROR_CODES.COMMAND_FORBIDDEN, ...base };
-      }
       if (!grantMatched) {
         return {
           decision: "approval_required",

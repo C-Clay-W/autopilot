@@ -1,7 +1,7 @@
 /** useTurnRecoveryActions.ts — cancel/queue/continue/approval/question 与 transport refresh 的连续逻辑；自原 page.tsx 原样迁入，不含新的业务判断。 */
 "use client";
 
-import { useRef, useEffect, useCallback } from "react";
+import { useRef, useState, useEffect, useCallback } from "react";
 import { reducePresentationInput, resolvePresentationApproval, restorePresentationApproval, type ApprovalItem, type UserQuestionItem } from "@autopilot-agent/presentation";
 import { sessionApiUrl } from "../conversation-target";
 import { useSessionTaskContext } from "../session-task-context";
@@ -45,6 +45,7 @@ interface UseTurnRecoveryActionsOptions {
   transportDisconnectedRef: React.MutableRefObject<boolean>;
   awaitingApprovalRef: React.MutableRefObject<boolean>;
   awaitingUserInputRef: React.MutableRefObject<boolean>;
+  executionEpochRef: React.MutableRefObject<number>;
   pendingInputsRef: React.MutableRefObject<PendingAgentInput[]>;
   joinedInputIdsRef: React.MutableRefObject<Set<string>>;
   currentSessionIdRef: React.MutableRefObject<string>;
@@ -54,6 +55,9 @@ interface UseTurnRecoveryActionsOptions {
 
 /** 共用传输地址解析；Chat 作用域永远不发送到 Work API。 */
 const getWorkspaceSessionUrl = sessionApiUrl;
+
+/** 取消请求的前端等待上限；超时按“未确认停止”处理并重新同步权威状态（H2）。 */
+const CANCEL_REQUEST_TIMEOUT_MS = 10_000;
 
 /** 承接原 ChatPageContent 的 Turn 恢复与排队启动逻辑；语句顺序、请求体与依赖数组保持不变。 */
 export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
@@ -91,6 +95,7 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     transportDisconnectedRef,
     awaitingApprovalRef,
     awaitingUserInputRef,
+    executionEpochRef,
     pendingInputsRef,
     joinedInputIdsRef,
     currentSessionIdRef,
@@ -98,6 +103,10 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
   } = options;
   const { manager, refreshSessions } = useSessionTaskContext();
   const notice = useNotice();
+  /** 停止请求在途：UI 显示忙状态并禁用继续，避免服务端尚未确认停止时抢跑（H2）。 */
+  const [stopping, setStopping] = useState(false);
+  /** 继续请求单次锁：继续在途时忽略重复触发，避免双击或并发 /continue（P17 问题2）。 */
+  const continueInFlightRef = useRef(false);
   const queueStartInFlightRef = useRef<Promise<void> | null>(null);
   const startNextQueuedTurnRef = useRef<(() => Promise<void>) | null>(null);
 
@@ -106,6 +115,8 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     if (cancelInFlightRef.current) return;
     const activeTurn = activeTurnRef.current;
     if (!activeTurn && !requestAbortRef.current) return;
+    // 停止开启新的执行代次：被中止请求的 finally 不得再清理停止后建立的状态（H2）。
+    executionEpochRef.current += 1;
     cancelRequestedRef.current = true;
     const requestAbortController = requestAbortRef.current;
     if (!activeTurn) {
@@ -126,24 +137,47 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     clearActiveTurn();
     // loading 只代表当前页面是否可继续交互；服务端收口由独立的 cancel Promise 负责。
     setLoading(false);
+    setStopping(true);
+    // 取消请求独立计时：前端不再无限等待，超时后按“未确认停止”重新同步权威状态。
+    const cancelAbortController = new AbortController();
+    const cancelTimeoutId = window.setTimeout(function abortCancelRequest() { cancelAbortController.abort(); }, CANCEL_REQUEST_TIMEOUT_MS);
     const cancelPromise = (async function requestServerCancellation(): Promise<void> {
+      /** 权威状态不可得时撤销乐观的可继续资格，只保留可解释的错误说明。 */
+      function revokeUnconfirmedContinue(turnId: string): void {
+        setMessages((previous) => previous.map((message) => (
+          message.turnId === turnId || message.id === streamingMessageId
+            ? { ...message, canContinue: false, recoveryError: "停止请求未收到确认，任务可能仍在运行；请刷新状态后再操作。" }
+            : message
+        )));
+      }
       try {
         const response = await fetch(getWorkspaceSessionUrl(workspaceId, activeTurn.sessionId, "/cancel")!, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: cancelAbortController.signal,
           body: JSON.stringify({ turnId: activeTurn.turnId }),
         });
         console.log(response);
-        if (response.ok) await loadHistory(activeTurn.sessionId);
-        else notice.warning("任务尚未确认停止，已重新同步实际状态");
+        if (!response.ok) {
+          const payload = await response.json().catch(function emptyBody() { return {}; }) as { error?: string };
+          notice.warning(payload.error || "任务尚未确认停止，已重新同步实际状态");
+        }
+        // 成功与失败都以 durable 状态重建；未确认停止且同步也失败时不得保留可继续承诺。
+        const synced = await loadHistory(activeTurn.sessionId);
+        if (!response.ok && !synced) revokeUnconfirmedContinue(activeTurn.turnId);
       } catch {
-        // 本地已停止展示；服务端失败时保留取消 Turn 标记，避免迟到 SSE 再写回界面。
+        // 超时或网络失败：本地已停止展示，必须重新获取权威状态，不能继续假装可恢复。
+        notice.error("停止请求未收到确认，已重新同步任务状态");
+        const synced = await loadHistory(activeTurn.sessionId);
+        if (!synced) revokeUnconfirmedContinue(activeTurn.turnId);
       } finally {
+        window.clearTimeout(cancelTimeoutId);
         void refreshSessions(workspaceId);
         requestAbortController?.abort();
         if (requestAbortRef.current === requestAbortController) requestAbortRef.current = null;
         cancelRequestedRef.current = false;
         cancelInFlightRef.current = null;
+        setStopping(false);
       }
     })();
     cancelInFlightRef.current = cancelPromise;
@@ -262,8 +296,16 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     if (isChat || !canWrite) return;
     const message = messages.find((item) => item.id === messageId);
     if (!sessionId || !message?.turnId) return;
-    if (cancelInFlightRef.current) return;
+    if (cancelInFlightRef.current) {
+      // 取消在途时不得抢跑，也不能静默丢弃用户动作（H2）。
+      notice.warning("任务正在停止，请等待服务端确认后再继续");
+      return;
+    }
+    if (continueInFlightRef.current) return;
     const turnId = message.turnId;
+    const executionEpoch = executionEpochRef.current + 1;
+    executionEpochRef.current = executionEpoch;
+    continueInFlightRef.current = true;
     cancelledTurnIdsRef.current.delete(turnId);
     const abortController = getSessionController(sessionId).createAbortController();
     requestAbortRef.current = abortController;
@@ -271,7 +313,8 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     activeTurnRef.current = { sessionId, turnId };
     setActiveTurnId(turnId);
     setLoading(true);
-    setMessages((current) => current.map((item) => item.id === messageId ? { ...item, activity: "answer", canContinue: false } : item));
+    // 点击即进入恢复中投影：隐藏旧继续入口与旧停止提示；重新显示只能来自权威 History 或新可恢复终态（P17 问题2）。
+    setMessages((current) => current.map((item) => item.id === messageId ? { ...item, activity: "answer", canContinue: false, termination: undefined, recoveryError: undefined } : item));
     try {
       const response = await fetch(getWorkspaceSessionUrl(workspaceId, sessionId, "/continue")!, {
         method: "POST",
@@ -290,16 +333,25 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
       const disconnected = isTransportFailure(error);
       if (disconnected && !cancelled) setTransportState("disconnected");
       setMessages((current) => current.map((item) => item.id === messageId ? cancelled
-        ? { ...item, content: "用户已取消", activity: undefined, canContinue: true }
+        ? { ...item, content: "用户已取消", activity: undefined, canContinue: true, recoveryError: undefined }
         : disconnected
           ? { ...item, activity: undefined }
-          : { ...item, content: `恢复失败：${error instanceof Error ? error.message : "未知错误"}`, activity: undefined }
+          : { ...item, activity: undefined, recoveryError: `恢复失败：${error instanceof Error ? error.message : "未知错误"}` }
         : item));
+      // 恢复失败不乐观恢复可继续资格：由权威 History 确认仍可恢复才重新显示；读不到时只保留解释（P17 问题2）。
+      if (!cancelled) {
+        const synced = await loadHistory(sessionId);
+        if (!synced) setMessages((current) => current.map((item) => item.id === messageId ? { ...item, canContinue: false, recoveryError: "无法确认任务当前状态，请刷新后重试" } : item));
+      }
     } finally {
       if (requestAbortRef.current === abortController) requestAbortRef.current = null;
-      cancelRequestedRef.current = false;
-      setLoading(false);
-      if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
+      continueInFlightRef.current = false;
+      // 旧继续请求的收尾只能清理自己认领的执行段，不覆盖后来续接的 loading/active（H2）。
+      if (executionEpochRef.current === executionEpoch) {
+        cancelRequestedRef.current = false;
+        setLoading(false);
+        if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
+      }
     }
   }
 
@@ -307,6 +359,8 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
   async function handleApproval(messageId: string, approval: ApprovalItem, decision: "allow_once" | "allow_session" | "allow_workspace" | "deny") {
     if (isChat || !canWrite) return;
     if (!sessionId) return;
+    const executionEpoch = executionEpochRef.current + 1;
+    executionEpochRef.current = executionEpoch;
     setPresentation((current) => resolvePresentationApproval(current, approval.approvalId));
     setLoading(true);
     activeTurnRef.current = { sessionId, turnId: approval.turnId };
@@ -342,8 +396,10 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
       }
       setMessages((prev) => prev.map((message) => message.id === messageId ? disconnected ? { ...message, activity: undefined } : { ...message, content: `审批恢复失败：${error instanceof Error ? error.message : "未知错误"}` } : message));
     } finally {
-      setLoading(false);
-      if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
+      if (executionEpochRef.current === executionEpoch) {
+        setLoading(false);
+        if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
+      }
       textareaRef.current?.focus();
     }
   }
@@ -352,6 +408,8 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
   async function handleUserQuestion(messageId: string, question: UserQuestionItem, answers: UserQuestionAnswerDraft[]): Promise<void> {
     if (isChat || !canWrite) return;
     if (!sessionId || cancelInFlightRef.current) throw new Error("当前任务不可提交答案");
+    const executionEpoch = executionEpochRef.current + 1;
+    executionEpochRef.current = executionEpoch;
     const abortController = getSessionController(sessionId).createAbortController();
     requestAbortRef.current = abortController;
     cancelRequestedRef.current = false;
@@ -388,9 +446,11 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
       throw new Error(error instanceof Error ? error.message : "提交回答失败，请重试");
     } finally {
       if (requestAbortRef.current === abortController) requestAbortRef.current = null;
-      cancelRequestedRef.current = false;
-      setLoading(false);
-      if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
+      if (executionEpochRef.current === executionEpoch) {
+        cancelRequestedRef.current = false;
+        setLoading(false);
+        if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
+      }
     }
   }
 
@@ -420,6 +480,7 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
   }
 
   return {
+    stopping,
     cancelCurrentTurn,
     handleContinueTurn,
     handleApproval,
