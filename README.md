@@ -52,7 +52,7 @@ flowchart TB
 需要 Node.js `>=20.11.0 <22`，建议 Node 20.20.2 与 npm 10。
 
 ```bash
-npm install -g autopilot-agent@0.1.0
+npm install -g autopilot-agent@0.2.0
 ap --help
 ```
 
@@ -84,7 +84,7 @@ node apps/cli/dist/main.js --help
 | [@autopilot-agent/presentation](packages/presentation/README.md) | 共享安全事件投影、时间线、分组和展示文案 |
 | [apps/web](apps/web/README.md) | Next.js 本地 Chat / Work 界面，源码运行，不作为 npm 应用分发 |
 
-当前源码版本为 **0.2.0**，五个 npm 包此前已发布版本仍为 **0.1.0**；本次 GitHub 源码更新不发布 npm。Windows 宿主执行等变化以源码版本为准，不能从 npm 0.1.0 安装命令推断已获得这些变化。详见 [更新日志](CHANGELOG.md)。
+源码与五个 npm 包当前版本均为 **0.2.0**；Web 仍仅通过源码运行。详见 [更新日志](CHANGELOG.md)。
 
 Web Work 新增内置预览面板及 `open_preview`：模型只准备导航，不读取或验证网页；Chat/CLI 不提供此工具。预览与后台 Job 绑定由宿主核验，仍需完整浏览器与 Provider 实机验收。
 

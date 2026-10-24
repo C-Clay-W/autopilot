@@ -1,20 +1,20 @@
 # @autopilot-agent/cli
 
-Autopilot 的终端宿主包。普通用户安装主包 `autopilot-agent@0.1.0`，无需分别安装各个 scoped 包：
+Autopilot 的终端宿主包。普通用户安装主包 `autopilot-agent@0.2.0`，无需分别安装各个 scoped 包：
 
 ```bash
-npm install -g autopilot-agent@0.1.0
+npm install -g autopilot-agent@0.2.0
 ap --help
 ```
 
-完整安装、Anthropic / Chat Completions 配置、使用和限制见 [主包手册](https://github.com/C-Clay-W/autopilot/blob/main/packages/autopilot-agent/README.md)，完整 argv / slash 语法见 [CLI 参考](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/CLI-Reference.md)。开发参考随源码更新，可能先于 npm 0.1.0 的行为。
+完整安装、Anthropic / Chat Completions 配置、使用和限制见 [主包手册](https://github.com/C-Clay-W/autopilot/blob/main/packages/autopilot-agent/README.md)，完整 argv / slash 语法见 [CLI 参考](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/CLI-Reference.md)。开发参考随源码更新，可能先于 npm 0.2.0 的行为。
 
 ## 结构与职责
 
 - parser.ts 解析 argv 与交互命令，main.ts 编排入口、输出及退出。
 - composition-root.ts 注入共享 Core Runtime 与 Node Adapters，controller.ts 管理任务、审批与恢复。
 - tui/ 使用 React / Ink；renderer.ts 与 event-projector.ts 支持纯文本和 JSONL。
-- 内部依赖为 Core、Adapters、Presentation，0.1.0 使用匹配的精确版本。
+- 内部依赖为 Core、Adapters、Presentation，0.2.0 使用匹配的精确版本。
 
 本包的 bin 提供 ap/autopilot，主入口包再转发至本包的 dist/main.js，不复制 Runtime。TTY 使用交互界面；显式 --output text/jsonl 用于脚本，JSONL 不输出 ANSI 或交互提示。
 
@@ -46,7 +46,7 @@ CLI 使用用户级 settings.json，默认工作区为当前目录，可显式�
 
 ## 源码 0.2.0 与 npm 版本
 
-本次源码版本为 0.2.0，不表示 npm 已发布该版本；上面的 npm 0.1.0 安装示例继续对应旧归档。Windows 源码已移除进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
+源码与五个 npm 包当前版本均为 0.2.0。Windows 不提供 OS 进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
 
 ## 许可证
 

@@ -1,6 +1,6 @@
 # @autopilot-agent/presentation
 
-CLI 与 Web 共用的纯 TypeScript 展示层：把 Runtime 安全事件和宿主事件转换为可重放的时间线状态。普通用户安装 `autopilot-agent@0.1.0`，CLI 会带入本包。
+CLI 与 Web 共用的纯 TypeScript 展示层：把 Runtime 安全事件和宿主事件转换为可重放的时间线状态。普通用户安装 `autopilot-agent@0.2.0`，CLI 会带入本包。
 
 ## 核心接口
 
@@ -40,7 +40,7 @@ npm run build -w packages/presentation
 npm run test -w packages/presentation -- test/todo.test.ts
 ```
 
-从 monorepo 根运行。产物为 CJS、ESM 和 TypeScript 声明，Core 保持 external；npm 0.1.0 精确依赖 Core 0.1.0。公开源码还保留 reducer、分组及展示行为测试和合成 fixture。
+从 monorepo 根运行。产物为 CJS、ESM 和 TypeScript 声明，Core 保持 external；npm 0.2.0 精确依赖 Core 0.2.0。公开源码还保留 reducer、分组及展示行为测试和合成 fixture。
 
 ## 许可证
 

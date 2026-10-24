@@ -5,14 +5,14 @@
 
 本 npm 包分发 CLI，不包含 Web 或 Desktop 应用，也不提供私有知识库 RAG、AutoMemory 或内置浏览器预览。
 
-本手册以已发布 npm 0.1.0 的安装和配置为基础；GitHub 源码可能包含后续修复。推荐 Node 20.20.2 与 npm 10。
+本手册以已发布 npm 0.2.0 的安装和配置为基础；GitHub 源码可能包含后续修复。推荐 Node 20.20.2 与 npm 10。
 
 ## 安装
 
 需要 **Node.js >=20.11.0 且 <22** 和 npm。首次安装需要网络连接；部分依赖包含平台二进制或安装脚本。
 
 ```bash
-npm install -g autopilot-agent@0.1.0
+npm install -g autopilot-agent@0.2.0
 ap --help
 ```
 
@@ -127,10 +127,10 @@ npm uninstall -g autopilot-agent
 
 卸载 npm 包不表示删除用户配置、凭据或会话数据。
 
-## npm 0.1.0 的已知限制
+## npm 0.2.0 的已知限制
 
-- Windows 和 macOS 的沙箱需要相应平台条件；安装成功不表示已完成沙箱初始化或隔离验收。通过 `ap doctor` 和 `ap sandbox status` 检查实际状态。
-- Windows 后台 Job 全进程树停止、显式 sandbox MCP 的 stdin 转发目前存在已知问题；默认 host MCP 未提供 OS 隔离。不要依赖这些路径处理不可信任务或需要可靠回收的长任务。
+- Windows 不启用 OS 进程沙箱；命令、后台 Job 和 host MCP 经逐次审批后以当前用户权限直接执行，审批不提供隔离。`ap sandbox status` / `ap sandbox setup` 返回停用报告，不安装 Windows 沙箱。
+- 后台 Job 的完整进程树回收仍有真实环境验收边界；不要仅凭根进程退出判断整棵进程树已停止。macOS 继续使用 Seatbelt，沙箱不可用时受隔离保护的命令拒绝执行。
 - macOS 全链路验收尚未完成，Linux 未纳入本次支持验收。Provider 可用性、限额和调用费用由所配置的服务决定。
 - 当前为早期版本，重要工作区请保留版本控制或备份；不承诺任意平台、协议端点和外部工具的兼容性。
 
@@ -159,7 +159,7 @@ npm uninstall -g autopilot-agent
 | /undo | 先查看最近一轮可撤销文件改动，再确认撤销 |
 | /cancel、/exit | 取消任务或退出 |
 
-完整命令语法见 [CLI 参考](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/CLI-Reference.md)。该参考随源码更新，可能包含 npm 0.1.0 之后的能力；安装版先用 ap --help 确认可用命令。
+完整命令语法见 [CLI 参考](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/CLI-Reference.md)。该参考随源码更新，可能包含 npm 0.2.0 之后的能力；安装版先用 ap --help 确认可用命令。
 
 ## 脚本调用与会话管理
 
@@ -182,7 +182,7 @@ ap job list
 
 Trust 表示你允许该项目作为工作区参与运行，不等于自动批准全部操作。ask、auto_approve、full_access 是工具授权策略；auto_approve 的安全写入和工作区命令仍依赖 Trust，full_access 仍保留路径、Schema 和破坏性命令检查。
 
-OS 沙箱是独立能力，依赖本机平台和系统配置。使用 ap sandbox status / ap doctor 检查，不把 npm 安装成功或拒绝执行当成隔离验收。MCP server 的 command 需要显式授权；项目 Trust 不代替 MCP 审批，默认 host MCP 也不提供 OS 隔离。
+Windows 的进程执行不提供 OS 沙箱；macOS 的 Seatbelt 隔离依赖相应系统条件。使用 ap sandbox status / ap doctor 检查实际状态，不把 npm 安装成功或拒绝执行当成隔离验收。MCP server 的 command 需要显式授权；项目 Trust 不代替 MCP 审批，默认 host MCP 不提供 OS 隔离。
 
 提交重要任务前保留 Git 提交或备份。Undo 只覆盖可撤销的文件修改，不是数据库、网络副作用、外部进程或任意命令的通用回滚。
 
@@ -211,21 +211,21 @@ OS 沙箱是独立能力，依赖本机平台和系统配置。使用 ap sandbox
 ## 五包组成与源码
 
 ```text
-autopilot-agent@0.1.0
-├── @autopilot-agent/cli@0.1.0
-│   └── @autopilot-agent/presentation@0.1.0
-├── @autopilot-agent/core@0.1.0
-└── @autopilot-agent/adapters@0.1.0
+autopilot-agent@0.2.0
+├── @autopilot-agent/cli@0.2.0
+│   └── @autopilot-agent/presentation@0.2.0
+├── @autopilot-agent/core@0.2.0
+└── @autopilot-agent/adapters@0.2.0
 ```
 
 CLI 也直接依赖 Core 和 Adapters，Adapters/Presentation 依赖 Core。主包的 bin 解析已安装的 CLI 并转发参数、标准流及退出结果；不重复实现 Agent Runtime。schema/cc-compatible-settings.schema.json 提供配置结构参考，实际允许字段仍受 Runtime 校验。
 
-源码仓库：https://github.com/C-Clay-W/autopilot 。源码还包含 Web；它不随 npm 主包安装。开发者可阅读各包 README、Core API 和 BUILD.md，从源码修改并验证。当前源码可以先于 registry 中的 0.1.0，不能仅凭版本字段判断二者完全相同。
+源码仓库：https://github.com/C-Clay-W/autopilot 。源码还包含 Web；它不随 npm 主包安装。开发者可阅读各包 README、Core API 和 BUILD.md，从源码修改并验证。源码与 npm 分别交付；Web 不随 CLI 包安装，实际能力仍取决于宿主与平台。
 
 ## 源码 0.2.0 与 npm 版本
 
-本次源码版本为 0.2.0，不表示 npm 已发布该版本；上面的 npm 0.1.0 安装示例继续对应旧归档。Windows 源码已移除进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
+源码与五个 npm 包当前版本均为 0.2.0。Windows 不提供 OS 进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
 
 ## 许可证
 
-本公开源码采用 MIT，见 LICENSE；第三方依赖和字体保留各自许可证。已发布的 npm 0.1.0 不会因本次源码整理而被替换或重新发布。
+本公开源码采用 MIT，见 LICENSE；第三方依赖和字体保留各自许可证。已发布的 npm 0.2.0 不会因本次源码整理而被替换或重新发布。

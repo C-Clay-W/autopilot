@@ -88,4 +88,4 @@ npm run typecheck -w packages/core
 
 ## 沙箱与平台
 
-源码 0.2.0 在 Windows 不提供 OS 进程沙箱：命令、后台 Job 和 host MCP 逐次审批后以当前用户权限运行。sandbox status / setup 返回停用报告，不安装 Windows 沙箱；审批不构成隔离。macOS 继续使用 Seatbelt，系统初始化属于显式操作。进程树回收与跨平台实机验证须单独确认。此前 npm 0.1.0 的行为与限制见主包手册。
+源码 0.2.0 在 Windows 不提供 OS 进程沙箱：命令、后台 Job 和 host MCP 逐次审批后以当前用户权限运行。sandbox status / setup 返回停用报告，不安装 Windows 沙箱；审批不构成隔离。macOS 继续使用 Seatbelt，系统初始化属于显式操作。进程树回收与跨平台实机验证须单独确认。npm 0.2.0 的使用与限制见主包手册。
