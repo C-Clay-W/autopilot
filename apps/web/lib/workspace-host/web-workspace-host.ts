@@ -18,6 +18,9 @@ import {
 } from "@autopilot-agent/adapters";
 import type { AgentRuntimeFacade, WorkspaceTrustPolicy, WorkspaceTrustStatus } from "@autopilot-agent/core";
 import type { WebCompositionRoot } from "../composition-root";
+import { createWebThreadHost, type WebThreadHost } from "./web-thread-host";
+import { createWebTurnHost, type WebTurnHost } from "./web-turn-host";
+import { createWebQueuedTurnPreparer } from "./web-queued-turn";
 
 /** 浏览器可见的工作区摘要；不包含 Host 路径或状态目录。 */
 export interface WebWorkspaceSummary {
@@ -51,6 +54,10 @@ export interface WebWorkspaceContext {
   projectId: string;
   /** 与该 Runtime 同生命周期的 Composition Root，避免 Route 重新装配到默认工作区。 */
   compositionRoot: WebCompositionRoot;
+  /** 普通 Work 的唯一执行入口；页面只提交意图并观察，不直接驱动 Turn。 */
+  turnHost?: WebTurnHost;
+  /** 与普通 Work 共用 TurnService 的协作投递执行宿主。 */
+  threadHost?: WebThreadHost;
 }
 
 /** Host 可稳定映射给 Route 的安全错误码。 */
@@ -81,7 +88,7 @@ export interface WebWorkspaceHost {
   beginDirectorySelection(requestSignal?: AbortSignal): Promise<WebDirectorySelection | undefined>;
   inspectSelection(selectionToken: string): Promise<WebWorkspaceTrustChallenge | WebWorkspaceSummary>;
   submitTrust(input: { challengeId: string; decision: "allow" | "deny" }): Promise<WebWorkspaceSummary>;
-  getContext(workspaceId: string): Promise<WebWorkspaceContext>;
+  getContext(workspaceId: string, options?: { observeOnly?: boolean }): Promise<WebWorkspaceContext>;
   removeWorkspace(workspaceId: string): Promise<boolean>;
 }
 
@@ -191,17 +198,59 @@ export function createWebWorkspaceHost(options: CreateWebWorkspaceHostOptions = 
     const root = createWebCompositionRoot({
       config: { host: "web", debug: false, logLevel: "info", context: {}, workspaceRoot: input.workspaceRoot },
       stateRoot: input.stateRoot,
+      // Registry 签发的 ID 是协作范围的稳定工作区身份；不使用可变的默认工作区或 cwd。
+      workspaceId: input.workspaceId,
     });
     const runtime = await root.bootstrap();
     const existing = (await runtime.projects.list()).find(function isWorkspaceProject(project) {
       return project.workspaceRoot === input.workspaceRoot;
     });
     const project = existing ?? await runtime.projects.create({ name: input.displayName, workspaceRoot: input.workspaceRoot });
-    return { workspaceId: input.workspaceId, workspaceRoot: input.workspaceRoot, runtime, projectId: project.id, compositionRoot: root };
+    // Project 确认后才绑定协作范围，避免 Turn 在 Project 未定时注册不可用的协作工具。
+    root.bindThreadsProject(project.id);
+    const ports = root.getRuntimePorts();
+    const capability = root.getThreadsCapability();
+    // 普通 Work 的唯一执行入口同时负责 Inbox.queue 的后续调度，页面只提交意图并观察。
+    const turnHost = ports
+      ? createWebTurnHost({ runtime, ports, prepareQueuedTurn: createWebQueuedTurnPreparer({ runtime, compositionRoot: root }) })
+      : undefined;
+    const threadHost = ports && capability
+      ? createWebThreadHost({
+        workspaceId: input.workspaceId,
+        stateRootId: capability.stateRootId,
+        projectId: project.id,
+        runtime,
+        ports,
+        capability,
+        workspaceRoot: input.workspaceRoot,
+        ...(turnHost ? { turnHost } : {}),
+      })
+      : undefined;
+    if (threadHost) {
+      // 首个协作子会话已持久化后立即接管 Runner，避免新建组等待下一次路由访问。
+      root.bindThreadRunnerWake(function wakeThreadRunner() {
+        threadHost.ensureStarted();
+        threadHost.kick();
+      });
+    }
+    // 已有协作组才启动轮询：未使用协作的工作区不产生常驻扫描，重启后由已持久化组恢复。
+    if (threadHost && ports) {
+      const groups = await ports.threadStore.listGroups();
+      if (groups.length) threadHost.ensureStarted();
+    }
+    return {
+      workspaceId: input.workspaceId,
+      workspaceRoot: input.workspaceRoot,
+      runtime,
+      projectId: project.id,
+      compositionRoot: root,
+      ...(turnHost ? { turnHost } : {}),
+      ...(threadHost ? { threadHost } : {}),
+    };
   }
 
   /** 根据 Registry 条目复查身份、Trust 并按 workspaceId 去重 Runtime bootstrap。 */
-  async function getContext(workspaceId: string): Promise<WebWorkspaceContext> {
+  async function getContext(workspaceId: string, requestOptions: { observeOnly?: boolean } = {}): Promise<WebWorkspaceContext> {
     const entry = getRegistryEntry(workspaceId);
     if (!entry) throw new WebWorkspaceHostError("WORKSPACE_NOT_FOUND", "工作区不存在");
     const candidate = requireCanonicalDirectory(entry.workspaceRoot);
@@ -213,6 +262,7 @@ export function createWebWorkspaceHost(options: CreateWebWorkspaceHostOptions = 
     }
     const existing = contexts.get(workspaceId);
     if (existing) return existing;
+    if (requestOptions.observeOnly) throw Object.assign(new Error("THREADS_UNAVAILABLE"), { code: "THREADS_UNAVAILABLE" });
     const stateRoot = resolveNodeStateRoot({ workspaceRoot: candidate.workspaceRoot, globalStateRoot: options.globalStateRoot });
     const pending = (options.createContext ?? createDefaultContext)({ ...candidate, stateRoot });
     contexts.set(workspaceId, pending);
@@ -324,6 +374,13 @@ export function createWebWorkspaceHost(options: CreateWebWorkspaceHostOptions = 
 
     /** 只注销 Registry；不删除目录、Trust、state 或运行中的 Runtime。 */
     async removeWorkspace(workspaceId: string): Promise<boolean> {
+      // 本宿主拥有的普通 Work 执行与协作驱动随注销停止；其他 owner 的会话只保留为可观察状态。
+      const pending = contexts.get(workspaceId);
+      contexts.delete(workspaceId);
+      if (pending) void pending.then(async function stopOwnedHosts(context) {
+        await context.turnHost?.stop();
+        await context.threadHost?.stop();
+      }).catch(function ignoreStop() { /* 停机失败不回滚注销 */ });
       return registry.remove(workspaceId);
     },
   };

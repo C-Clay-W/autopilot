@@ -30,6 +30,7 @@ export function getChatToolNames(binding: ChatCapabilityBinding, capability: Cha
   } else if (capability?.authorizeRef && capability.readAttachment && valid.some(function document(grant) { return grant.kind === "document"; })) names.push("chat_attachment_read");
   /** 仅为受控图片来源保留视觉上限，派生页图在读取后才可用。 */
   if (capability?.authorizeRef && capability.readImage && capability.visionAnalyzer && (binding.retrievalMode === "rag" || valid.some(function image(grant) { return grant.kind === "image" || (grant.kind === "document" && capability.readAttachment); }))) names.push("chat_vision_analyze");
+  if ((binding.retrievalMode === "none" || binding.retrievalMode === "web") && capability?.interactiveUi === true) names.push("render_ui");
   return names;
 }
 

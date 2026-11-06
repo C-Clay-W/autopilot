@@ -1,6 +1,8 @@
 /**
  * read_file 工具：在工作区硬边界内流式分页读取文本，并仅向模型返回请求行区间。
  */
+import { estimateMessageTokens } from "../../kernel/compact";
+import { createAgentToolResultMessage } from "../../types/agent-message";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
@@ -10,6 +12,7 @@ import { getReadStateKey, resolveFileTarget, resolveExternalTargetRestriction } 
 import { createToolError, TOOL_ERROR_CODES } from "../tool-error";
 import type { TextFileEncoding } from "../text-file";
 import type { AgentToolDefinition } from "../types";
+import { selectReadLinesWithinTokenBudget } from "./read-output-budget";
 import { MAX_READ_RESULT_BYTES, MAX_TEXT_LINE_CHARACTERS, MAX_TEXT_SCAN_BYTES } from "./text-read-limits";
 
 const readFileSchema = z.object({
@@ -59,7 +62,7 @@ function decodeChunk(decoder: TextDecoder, bytes: Buffer, stream: boolean): stri
 export function createReadFileTool(): AgentToolDefinition<z.infer<typeof readFileSchema>, Record<string, unknown>> {
   return {
     name: "read_file",
-    description: "读取工作区内文本文件。默认从第 1 行读取最多 2000 行；通读时省略 offset/limit，已知目标位置时用 offset/limit 定位读取，单次最多 2000 行。编辑已有文件前必须先定位并读取目标范围；服务端记录完整文件哈希，模型无需接收整个大文件也能安全编辑。单次最多扫描 8 MiB，返回正文最多 256 KiB；超出正文上限时缩小 limit 或选择更小范围。每次编辑成功后 read state 自动更新。",
+    description: "读取工作区内文本文件。默认从第 1 行读取最多 2000 行；通读时省略 offset/limit，已知目标位置时用 offset/limit 定位读取，单次最多 2000 行。编辑已有文件前必须先定位并读取目标范围；服务端记录完整文件哈希，模型无需接收整个大文件也能安全编辑。单次最多扫描 8 MiB，返回正文最多 256 KiB；正文另受约 25000 token 的保守估算预算限制，超预算返回完整行前缀和 nextOffset 供继续读取；相同版本和范围的旧正文仍可见时返回短提示。超出字节上限时缩小 limit 或选择更小范围。每次编辑成功后 read state 自动更新。",
     inputSchema: readFileSchema,
     metadata: { effect: "none", destructive: false, concurrency: { max: 3, resourceKey: "workspace:file-read" }, retry: { safe: true } },
     async createActionFacts(input, context) {
@@ -93,6 +96,7 @@ export function createReadFileTool(): AgentToolDefinition<z.infer<typeof readFil
       const hash = createHash("sha256");
       const selectedLines: string[] = [];
       let selectedBytes = 0;
+      let byteTruncated = false;
       let totalLines = 0;
       let currentLine = "";
       let ignoreLfAfterCr = false;
@@ -105,11 +109,12 @@ export function createReadFileTool(): AgentToolDefinition<z.infer<typeof readFil
       /** 记录一行的总数与请求区间；不保留区间外的正文。 */
       function captureLine(line: string): void {
         totalLines += 1;
-        if (totalLines < input.offset || totalLines >= input.offset + input.limit) return;
+        if (totalLines < input.offset || totalLines >= input.offset + input.limit || byteTruncated) return;
         const lineBytes = Buffer.byteLength(line, "utf8");
         const separatorBytes = selectedLines.length > 0 ? 1 : 0;
         if (selectedBytes + separatorBytes + lineBytes > MAX_READ_RESULT_BYTES) {
-          throw createToolError(TOOL_ERROR_CODES.FILE_TOO_LARGE, "请求行区间超过 256 KiB 返回上限，请缩小 limit 或选择更小范围");
+          byteTruncated = true;
+          return;
         }
         selectedBytes += separatorBytes + lineBytes;
         selectedLines.push(line);
@@ -205,14 +210,46 @@ export function createReadFileTool(): AgentToolDefinition<z.infer<typeof readFil
       if (finalStats.size !== initialStats.size || finalStats.mtimeMs !== initialStats.mtimeMs) {
         throw createToolError(TOOL_ERROR_CODES.FILE_STALE, "文件读取期间已变化，请重新读取");
       }
-      const startLine = Math.min(input.offset, totalLines + 1);
-      const endLine = startLine + selectedLines.length - 1;
-      const truncated = endLine < totalLines;
-      const isCompleteRead = startLine === 1 && !truncated;
       const fullSha256 = hash.digest("hex");
+      const resultPath = target.isExternal ? target.canonicalTarget : target.relativePath!;
+      const startLine = Math.min(input.offset, totalLines + 1);
+      const budget = selectReadLinesWithinTokenBudget(selectedLines, 24_000);
+      const initialLineCount = selectedLines.length;
+      selectedLines.splice(budget.lines.length);
+      /** 完整结果包络按现有上下文估算器核算，包含JSON转义和canonical工具消息开销。 */
+      function buildOutput(lineCount: number): Record<string, unknown> {
+        const endLine = startLine + lineCount - 1;
+        const truncated = endLine < totalLines;
+        const isCompleteRead = startLine === 1 && !truncated;
+        return {
+          path: resultPath, content: selectedLines.slice(0, lineCount).join("\n"),
+          versionSha256: fullSha256, requestedOffset: input.offset, requestedLimit: input.limit,
+          startLine, endLine, totalLines, truncated, isCompleteRead,
+          sha256: isCompleteRead ? fullSha256 : null, encoding,
+          estimatedTokens: 25_000, tokenEstimate: "保守估算，非Provider精确计数；含工具结果包络",
+          ...((byteTruncated || lineCount < initialLineCount) ? { budgetTruncated: true, nextOffset: endLine + 1, continuation: `输出预算已截断；使用 offset=${endLine + 1} 继续读取。` } : {}),
+        };
+      }
+      /** 用同源估算计算实际模型可见的完整工具结果，避免只限制正文而漏掉转义与元数据。 */
+      function outputTokens(lineCount: number): number {
+        return estimateMessageTokens([createAgentToolResultMessage({ toolCallId: context.toolCallId ?? "read_file", text: JSON.stringify({ status: "success", output: buildOutput(lineCount) }), isError: false })]);
+      }
+      let low = 0;
+      let high = selectedLines.length;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        if (outputTokens(middle) <= 25_000) low = middle;
+        else high = middle - 1;
+      }
+      selectedLines.splice(low);
+      if (selectedLines.length === 0 && initialLineCount > 0) throw createToolError(TOOL_ERROR_CODES.FILE_TOO_LARGE, "目标首行超过单次估算 token 预算；请使用定位搜索或缩短该超长行后读取");
+      if (outputTokens(selectedLines.length) > 25_000) throw createToolError(TOOL_ERROR_CODES.FILE_TOO_LARGE, "读取结果元数据超过估算 token 预算，请缩短工具调用标识或目标路径");
+      const output = buildOutput(selectedLines.length);
+      output.estimatedTokens = outputTokens(selectedLines.length);
+      const endLine = startLine + selectedLines.length - 1;
       const readStateKey = getReadStateKey(target);
       const existing = context.fileReadStates?.get(readStateKey);
-      const observedRanges = existing?.observedRanges ?? [];
+      const observedRanges = existing?.sha256 === fullSha256 ? existing.observedRanges : [];
       const newRange = selectedLines.length > 0 ? { startLine, endLine } : undefined;
       const merged = newRange ? [...observedRanges, newRange].sort(function byStart(left, right) { return left.startLine - right.startLine; }) : observedRanges;
       const compact: typeof observedRanges = [];
@@ -222,18 +259,25 @@ export function createReadFileTool(): AgentToolDefinition<z.infer<typeof readFil
         else compact.push({ ...range });
       }
       context.fileReadStates?.set(readStateKey, { sha256: fullSha256, mtimeMs: finalStats.mtimeMs, observedRanges: compact });
-      return {
-        // 外部目标返回 canonical 绝对路径供后续 edit/read 复用；内部目标维持工作区相对路径契约。
-        path: target.isExternal ? target.canonicalTarget : target.relativePath!,
-        content: selectedLines.join("\n"),
-        startLine,
-        endLine,
-        totalLines,
-        truncated,
-        isCompleteRead,
-        sha256: isCompleteRead ? fullSha256 : null,
-        encoding,
-      };
+      // 去重必须有当前可见的成功正文作为证据；恢复、压缩或裁剪后不靠持久 read state 猜测。
+      const duplicate = context.getVisibleMessages?.().some(function hasVisibleRead(message) {
+        return message.content.some(function matchesRead(block) {
+          if (block.type !== "tool-result" || block.isError) return false;
+          try {
+            const serialized = JSON.parse(block.content.map(function text(item) { return item.text; }).join(""));
+            const previous = serialized.status === "success" ? serialized.output : undefined;
+            if (!previous) return false;
+            return previous.path === resultPath && previous.versionSha256 === fullSha256 && previous.requestedOffset === input.offset && previous.requestedLimit === input.limit && previous.content === selectedLines.join("\n") && previous.startLine === startLine && previous.endLine === endLine;
+          } catch { return false; }
+        });
+      }) === true;
+      if (duplicate) {
+        delete output.content;
+        output.unchanged = true;
+        output.message = "同一文件版本与范围的完整读取结果仍在当前可见上下文，请复用之前 read_file 正文。";
+        output.estimatedTokens = estimateMessageTokens([createAgentToolResultMessage({ toolCallId: context.toolCallId ?? "read_file", text: JSON.stringify({ status: "success", output }), isError: false })]);
+      }
+      return output;
     },
     serializeOutput(output) { return output; },
   };

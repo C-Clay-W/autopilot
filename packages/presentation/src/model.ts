@@ -30,6 +30,7 @@ export interface ToolCallItem {
   titleKey: string;
   target?: string;
   resultSummary?: string;
+  observation?: ToolDisplayFacts["observation"];
   metrics?: ToolMetrics;
   startedAt?: string;
   completedAt?: string;
@@ -50,7 +51,7 @@ export interface ToolGroupItem {
   id: string;
   kind: "tool_group";
   turnId: string;
-  groupKey: "exploration";
+  groupKey: "exploration" | "observation";
   toolCallIds: string[];
   state: "running" | "completed";
 }
@@ -103,6 +104,18 @@ export interface AssistantAnswerItem {
   content: string;
 }
 
+/** 不可变交互文档；未知版本或非法文档只保留有界文字回退，不保存原始 spec。 */
+export interface UiDocumentItem {
+  id: string;
+  kind: "ui_document";
+  sessionId: string;
+  turnId: string;
+  uiId: string;
+  title: string;
+  fallbackText: string;
+  document?: import("@autopilot-agent/core/ui").UiDocument;
+}
+
 export interface InputNoticeItem {
   id: string;
   kind: "input_notice";
@@ -112,6 +125,8 @@ export interface InputNoticeItem {
   state: "queued" | "joined" | "consumed";
   /** 宿主确认的用户原文；Runtime 事件本身不携带正文。 */
   content?: string;
+  /** 受信Inbox事实，只用于来源标签。 */
+  origin?: { kind: "thread"; threadId: string; purpose?: "reporting_agreement" };
   position?: PresentationInputPosition;
   cancelled?: boolean;
 }
@@ -178,7 +193,7 @@ export interface TurnSummaryItem {
   modifiedFileCount?: number;
 }
 
-export type AgentPresentationItem = ThinkingItem | ToolCallItem | ApprovalItem | UserQuestionItem | TodoSnapshotItem | AssistantAnswerItem | InputNoticeItem | ContextNoticeItem | UndoItem | JobItem | CapabilityNoticeItem | TurnSummaryItem;
+export type AgentPresentationItem = ThinkingItem | ToolCallItem | ApprovalItem | UserQuestionItem | TodoSnapshotItem | AssistantAnswerItem | UiDocumentItem | InputNoticeItem | ContextNoticeItem | UndoItem | JobItem | CapabilityNoticeItem | TurnSummaryItem;
 
 export interface ActiveOperation {
   kind: "thinking" | "tool" | "approval" | "question" | "context";
@@ -195,6 +210,8 @@ export interface AgentPresentationState {
   appliedEventIds: string[];
   lastSeqByTurn: Record<string, number>;
   turnStartedAt: Record<string, string>;
+  /** 从权威启动/等待/终态事件累计的执行段，不计用户等待与暂停。 */
+  executionByTurn?: Record<string, { elapsedMs: number; runningSince?: number }>;
   /** 最近一次已应用的 Todo 快照事件时间戳；跨 Turn 乱序回放时保证 latest-write-wins。 */
   todoLastUpdatedAt?: string;
   /** 各轮最后一次安全 Todo；Session latest selector 继续读取 items 单卡。 */

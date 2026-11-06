@@ -7,14 +7,26 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
+/** 只按可验证的进程退出事实忽略遗留写锁；未知、活跃或损坏锁继续阻塞升级。 */
+function hasExitedLockOwner(file: string): boolean {
+  try {
+    const metadata = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!Number.isSafeInteger(metadata?.pid) || metadata.pid <= 0) return false;
+    try { process.kill(metadata.pid, 0); }
+    catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+    return false;
+  } catch { return false; }
+}
+
 /** 迁移副本不能跟随链接或复制仍在写入的临界区；发现异常立即保留原目录。 */
 function assertPlainStateTree(root: string): void {
   const entry = fs.lstatSync(root);
   if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) throw new NodeStateError("STATE_SCHEMA_UNSAFE_PATH");
   if (!entry.isDirectory()) return;
   for (const name of fs.readdirSync(root)) {
-    if (name.endsWith(".lock")) throw new NodeStateError("STATE_SCHEMA_BUSY");
-    assertPlainStateTree(path.join(root, name));
+    const child = path.join(root, name);
+    assertPlainStateTree(child);
+    if (name.endsWith(".lock") && !hasExitedLockOwner(child)) throw new NodeStateError("STATE_SCHEMA_BUSY");
   }
 }
 
@@ -126,6 +138,15 @@ function createBackupPath(root: string, fromVersion: number, toVersion: number):
 function backupStateRoot(root: string, fromVersion: number, toVersion: number): string | undefined {
   if (!hasDurableState(root)) return undefined;
   assertPlainStateTree(root);
+  // Turn 仍持有新鲜租约时不得复制/切换状态根，阈值与 Core 的 45 秒租约一致。
+  const leases = path.join(root, "leases");
+  if (fs.existsSync(leases)) {
+    for (const file of fs.readdirSync(leases)) {
+      if (!file.endsWith(".json")) continue;
+      const record = JSON.parse(fs.readFileSync(path.join(leases, file), "utf8"));
+      if (Number.isFinite(record?.lease?.heartbeatAt) && Date.now() - record.lease.heartbeatAt <= 45_000) throw new NodeStateError("STATE_SCHEMA_BUSY");
+    }
+  }
   const backupPath = createBackupPath(root, fromVersion, toVersion);
   const backupRoot = path.dirname(backupPath);
   if (fs.existsSync(backupRoot) && fs.lstatSync(backupRoot).isSymbolicLink()) throw new NodeStateError("STATE_SCHEMA_UNSAFE_PATH");
@@ -217,6 +238,10 @@ export function createNodeStateSchemaManager(options: CreateNodeStateSchemaManag
       throw new NodeStateError("STATE_SCHEMA_VERSION_INVALID");
     }
 
+    // 先确认完整升级路径，未知版本不得创建副本或备份后才报告缺失。
+    for (let version = fromVersion; version < toVersion; version++) {
+      if (!options.migrations.some(function adjacent(step) { return step.fromVersion === version && step.toVersion === version + 1; })) throw new NodeStateError("STATE_SCHEMA_MIGRATION_MISSING");
+    }
     const backupPath = backup(fromVersion, toVersion);
     try {
       if (fs.existsSync(root)) fs.cpSync(root, stagingRoot, { recursive: true, errorOnExist: true });

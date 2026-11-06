@@ -1,5 +1,6 @@
 /** Presentation 纯 reducer：将安全 Runtime/Host 输入投影为可重放的统一视图状态。 */
 import type { AgentEventEnvelope, ToolDisplayFacts } from "@autopilot-agent/core";
+import { projectUiDocument } from "@autopilot-agent/core/ui";
 import { getRuntimeEventId, type PresentationInput } from "./input.js";
 import type { AgentPresentationItem, AgentPresentationState, ApprovalItem, ContextNoticeItem, ToolCallItem, ToolCallState, TurnState, UserQuestionItem } from "./model.js";
 import { createPresentationState } from "./model.js";
@@ -38,6 +39,7 @@ function applyToolDisplay(item: ToolCallItem, display: ToolDisplayFacts | undefi
     resultSummary: display.summary,
     metrics: display.metrics,
     detail: display.detail,
+    observation: display.observation,
     job: display.job,
     diff: display.diff,
     executionMode: display.executionMode,
@@ -152,6 +154,15 @@ export function resolvePresentationApproval(state: AgentPresentationState, appro
   };
 }
 
+/** 用 Core 当前恢复视图校准审批，历史 required 事件不能独立授予再次操作资格。 */
+export function reconcilePresentationApprovals(state: AgentPresentationState, approvalId?: string): AgentPresentationState {
+  const items = state.items.map(function reconcile(item) {
+    return item.kind === "approval" && item.state === "required" && item.approvalId !== approvalId ? { ...item, state: "resolved" as const } : item;
+  });
+  const activeOperation = state.activeOperation?.kind === "approval" && !items.some(function actionable(item) { return item.kind === "approval" && item.id === state.activeOperation?.id && item.state === "required"; }) ? undefined : state.activeOperation;
+  return { ...state, items, activeOperation };
+}
+
 /** 审批提交接口失败时恢复本地乐观状态；若工具已继续执行则尊重后续 Runtime 事实。 */
 export function restorePresentationApproval(state: AgentPresentationState, approvalId: string): AgentPresentationState {
   const approval = state.items.find(function findApproval(item): item is ApprovalItem {
@@ -178,8 +189,7 @@ function createTurnSummary(state: AgentPresentationState, envelope: AgentEventEn
   const modifiedTools = tools.filter(function isCompletedMutation(item) { return item.state === "completed" && (item.category === "write" || item.category === "edit"); });
   const targets = new Set(modifiedTools.filter(function hasTarget(item) { return Boolean(item.target); }).map(function getTarget(item) { return item.target as string; }));
   const diffFileCount = modifiedTools.reduce(function countDiffFiles(total, item) { return total + (item.diff?.files ?? 0); }, 0);
-  const startedAt = state.turnStartedAt[envelope.turnId];
-  const durationMs = startedAt ? Math.max(0, Date.parse(envelope.timestamp) - Date.parse(startedAt)) : undefined;
+  const durationMs = state.executionByTurn?.[envelope.turnId]?.elapsedMs;
   const summary = {
     id: `turn:${envelope.turnId}:summary`,
     kind: "turn_summary" as const,
@@ -192,13 +202,51 @@ function createTurnSummary(state: AgentPresentationState, envelope: AgentEventEn
   return { ...state, items: upsertItem(state.items, summary), turnSummary: summary, activeOperation: undefined };
 }
 
+/** 只按权威执行事件推进时钟，等待和终态立即冻结；重复事件已由 seq 门禁过滤。 */
+function updateExecutionClock(state: AgentPresentationState, envelope: AgentEventEnvelope): AgentPresentationState {
+  const type = envelope.event.type;
+  const previous = state.executionByTurn?.[envelope.turnId] ?? { elapsedMs: 0 };
+  const time = Date.parse(envelope.timestamp);
+  if (!Number.isFinite(time)) return state;
+  let clock = previous;
+  if (type === "turn_started" && previous.runningSince === undefined) clock = { ...previous, runningSince: time };
+  else if (["approval_required", "question_required", "turn_paused", "turn_completed", "turn_interrupted", "turn_failed", "turn_limit_reached"].includes(type) && previous.runningSince !== undefined) {
+    clock = { elapsedMs: previous.elapsedMs + Math.max(0, time - previous.runningSince) };
+  }
+  return clock === previous ? state : { ...state, executionByTurn: { ...state.executionByTurn, [envelope.turnId]: clock } };
+}
+
+/** 关闭旧执行段全部未决审批，工具进入恢复处理；取消状态仅来自真实结果或终态。 */
+function closeRequiredApprovals(state: AgentPresentationState, turnId: string, resuming = false): AgentPresentationState {
+  return { ...state, items: state.items.map(function close(item) {
+    if (item.kind === "approval" && item.turnId === turnId && item.state === "required") return { ...item, state: "resolved" as const };
+    if (item.kind === "tool_call" && item.turnId === turnId && item.state === "awaiting_approval") return { ...item, state: resuming ? "running" as const : "cancelled" as const };
+    return item;
+  }) };
+}
+
 /** 投影单个已按顺序到达的 Runtime 信封。 */
 function reduceRuntimeEvent(state: AgentPresentationState, envelope: AgentEventEnvelope): AgentPresentationState {
   const event = envelope.event;
   if (event.type === "reasoning_delta") return state;
+  if (event.type === "ui_document") {
+    const raw = event.document;
+    const uiId = typeof raw?.uiId === "string" && /^ui_[a-f0-9]{32}$/.test(raw.uiId) ? raw.uiId : `invalid:${event.callId}`;
+    const id = `ui:${envelope.sessionId}:${envelope.turnId}:${uiId}`;
+    if (state.items.some(function delivered(item) { return item.id === id; })) return state;
+    let document: import("@autopilot-agent/core/ui").UiDocument | undefined;
+    try { document = projectUiDocument(raw); } catch { /* 只保存回退，不将未知 spec 交给客户端。 */ }
+    const title = typeof raw?.title === "string" ? raw.title.slice(0, 80) : "交互内容";
+    const fallbackText = typeof raw?.fallbackText === "string" && raw.fallbackText ? raw.fallbackText.slice(0, 2000) : "此交互内容暂时无法显示。";
+    const base = completeActiveThinking(state);
+    // 分隔同一步前后文字，防止后续 delta 原位合并到交互块之前。
+    const answer = findItem(base.items, `answer:${envelope.turnId}`, "assistant_answer");
+    const items = answer ? archiveFinalAnswer(base.items, envelope.turnId, answer.stepId) : base.items;
+    return { ...base, items: [...items, { id, kind: "ui_document", sessionId: envelope.sessionId, turnId: envelope.turnId, uiId, title, fallbackText, ...(document ? { document } : {}) }] };
+  }
   if (event.type === "turn_started") {
     // 继续同一 Turn 时撤下旧中断总结，避免旧终态被宿主用于结束新 SSE。
-    const items = state.items.filter(item => item.kind !== "turn_summary" || item.turnId !== envelope.turnId);
+    const items = closeRequiredApprovals(state, envelope.turnId, true).items.filter(function retain(item) { return item.kind !== "turn_summary" || item.turnId !== envelope.turnId; });
     return { ...state, items, turnSummary: undefined, sessionId: envelope.sessionId, turnId: envelope.turnId, turnStartedAt: { ...state.turnStartedAt, [envelope.turnId]: state.turnStartedAt[envelope.turnId] ?? envelope.timestamp } };
   }
   if (event.type === "reasoning_summary") {
@@ -307,7 +355,7 @@ function reduceRuntimeEvent(state: AgentPresentationState, envelope: AgentEventE
   if (event.type === "turn_paused") return completeActiveThinking(state);
   if (event.type === "turn_completed" || event.type === "turn_interrupted" || event.type === "turn_failed" || event.type === "turn_limit_reached") {
     const turnState: TurnState = event.type === "turn_completed" ? "completed" : event.type === "turn_interrupted" ? "interrupted" : event.type === "turn_limit_reached" ? "limit_reached" : "failed";
-    const terminalState = event.type === "turn_interrupted" ? cancelRequiredUserQuestions(state, envelope.turnId) : state;
+    const terminalState = closeRequiredApprovals(cancelRequiredUserQuestions(state, envelope.turnId), envelope.turnId);
     return createTurnSummary(completeActiveThinking(terminalState), envelope, turnState);
   }
   return state;
@@ -340,7 +388,7 @@ export function reducePresentationInput(state: AgentPresentationState, input: Pr
   const eventId = getRuntimeEventId(envelope);
   // 同 Turn 的 seq 单调门禁已覆盖重复 ID，避免长历史上再扫描全部已应用事件。
   if (envelope.seq <= (state.lastSeqByTurn[envelope.turnId] ?? -1)) return state;
-  const next = reduceRuntimeEvent(state, envelope);
+  const next = reduceRuntimeEvent(updateExecutionClock(state, envelope), envelope);
   return { ...next, sessionId: envelope.sessionId, turnId: envelope.turnId, appliedEventIds: [...next.appliedEventIds, eventId], lastSeqByTurn: { ...next.lastSeqByTurn, [envelope.turnId]: envelope.seq } };
 }
 

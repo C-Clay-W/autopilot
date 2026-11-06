@@ -1,7 +1,7 @@
 /** Ink TUI Step 5.4 契约测试：stdin 只驱动 Action，Static 与安全事件不重复。 */
 
 import { render } from "ink-testing-library";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { CliTuiApp, createCliTuiStore, parseTuiControlAction, resolveTuiDeleteDirection } from "../src/tui.js";
 import { createInitialCliProjection } from "../src/event-projector.js";
 import type { CliController, CliControllerResult } from "../src/controller.js";
@@ -123,6 +123,36 @@ function renderTui(controller: CliController, store = createCliTuiStore()): { st
 }
 
 describe("Ink TUI", function inkTuiSuite() {
+  /** /cancel独立放行，取消返回也不能解除尚未完成的原执行busy。 */
+  it("C1 运行中 cancel 一次送达且不提前释放原 busy", async function cancelsWhileBusy() {
+    const calls: CliAction[] = [];
+    const controller = createController(calls);
+    const originalDispatch = controller.dispatch.bind(controller);
+    let finish!: () => void;
+    const gate = new Promise<void>(function deferred(resolve) { finish = resolve; });
+    controller.dispatch = async function dispatch(action) {
+      const result = await originalDispatch(action);
+      if (action.type === "submit_prompt") await gate;
+      if (action.type === "cancel_turn") result.projection.status = "interrupted";
+      return result;
+    };
+    const view = renderTui(controller);
+    try {
+      view.stdin.write("stay-running"); view.stdin.write("\r");
+      await vi.waitFor(function started() { expect(calls.filter(function submit(action) { return action.type === "submit_prompt"; })).toHaveLength(1); });
+      view.stdin.write("/cancel"); view.stdin.write("\r");
+      await vi.waitFor(function cancelled() { expect(calls.filter(function cancel(action) { return action.type === "cancel_turn"; })).toHaveLength(1); });
+      await vi.waitFor(function interrupted() { expect(view.store.getSnapshot().status).toBe("interrupted"); });
+      view.stdin.write("/skill"); view.stdin.write("\r");
+      await new Promise<void>(function frame(resolve) { setTimeout(resolve, 30); });
+      expect(calls.some(function skills(action) { return action.type === "list_skills"; })).toBe(false);
+      finish();
+      await new Promise<void>(function frame(resolve) { setTimeout(resolve, 30); });
+      view.stdin.write("/skill"); view.stdin.write("\r");
+      await vi.waitFor(function unblocked() { expect(calls.some(function skills(action) { return action.type === "list_skills"; })).toBe(true); });
+    } finally { finish(); view.unmount(); }
+  });
+
   it("dispatch 异常只显示通用错误并按显式开关记录脱敏分类", async function recordsSafeDispatchFailure() {
     const originalDiagnostics = process.env.AUTOPILOT_PERF_DIAGNOSTICS;
     const diagnosticKey = Symbol.for("autopilot.performanceDiagnostics");

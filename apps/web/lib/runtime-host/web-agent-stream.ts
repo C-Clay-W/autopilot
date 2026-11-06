@@ -107,8 +107,27 @@ export function createRuntimeAgentStream(input: {
           });
 
         for await (const event of eventStream) {
-          if (event.type === "turn_failed") terminalFailure = toWebTurnFailure(event.error, event.errorCode);
-          const browserEvent = event.type === "turn_failed" ? { ...event, error: terminalFailure!.message, failure: terminalFailure } : event as Record<string, unknown>;
+          if (event.type === "turn_failed") {
+            const failureMetadata = event as typeof event & { feedbackId?: unknown; failureStage?: unknown; providerHttpStatus?: unknown; providerFailureReason?: unknown; providerFailureDetail?: unknown };
+            terminalFailure = toWebTurnFailure(event.error, event.errorCode, {
+              feedbackId: failureMetadata.feedbackId,
+              failureStage: failureMetadata.failureStage,
+              providerHttpStatus: failureMetadata.providerHttpStatus,
+              providerFailureReason: failureMetadata.providerFailureReason,
+              providerFailureDetail: failureMetadata.providerFailureDetail,
+            });
+          }
+          const browserEvent = event.type === "turn_failed" ? {
+            ...event,
+            error: terminalFailure!.message,
+            errorCode: terminalFailure!.diagnostic.code,
+            failureStage: terminalFailure!.diagnostic.stage,
+            providerHttpStatus: terminalFailure!.diagnostic.providerHttpStatus,
+            providerFailureReason: terminalFailure!.diagnostic.providerFailureReason,
+            providerFailureDetail: terminalFailure!.diagnostic.providerFailureDetail,
+            feedbackId: terminalFailure!.feedbackId,
+            failure: terminalFailure,
+          } : event as Record<string, unknown>;
           if (["turn_completed", "turn_failed", "turn_limit_reached", "turn_interrupted"].includes(event.type)) terminalEvent = browserEvent;
           else send(browserEvent);
           projection = applyEvent(projection, event);
@@ -156,11 +175,11 @@ export function createRuntimeAgentStream(input: {
           streamOpen = false;
         }
       } catch (error) {
-        const failure = toWebTurnFailure(error);
+        const failure = toWebTurnFailure(error, undefined, { failureStage: "web_stream" });
         if (!controller.signal.aborted) {
           await persistAssistantMessage(input.runtime, input.sessionId, input.turnId, projection, projection.answer.trim(), failure).catch(() => undefined);
         }
-        sendHost({ type: "turn_failed", error: failure.message, failure });
+        sendHost({ type: "turn_failed", error: failure.message, feedbackId: failure.feedbackId, failure });
         if (streamOpen) {
           streamController.enqueue(encoder.encode("data: [DONE]\n\n"));
           streamController.close();

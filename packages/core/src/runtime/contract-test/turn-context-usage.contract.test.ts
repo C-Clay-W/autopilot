@@ -98,6 +98,7 @@ describe("turns.getContextUsage contract", () => {
     const usage = await runtime.turns.getContextUsage({ sessionId });
 
     expect(turn?.frozenProviderConfig?.contextWindowTokens).toBe(1_000_000);
+    expect(turn?.frozenProviderConfig?.supportsImageInput).toBe(true);
     expect(usageEvent?.type === "context_usage_updated" && usageEvent.usage?.contextWindowTokens).toBe(1_000_000);
     expect(usage).toMatchObject({ modelRef: "firstParty/deepseek-flash", contextWindowTokens: 1_000_000 });
   });

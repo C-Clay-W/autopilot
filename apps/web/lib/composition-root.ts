@@ -12,13 +12,17 @@ import type {
   AgentMessage,
   CapabilityLoader,
   CreateRuntimeBootstrapServiceOptions,
+  ModelRef,
   RunConfig,
   RuntimeBootstrapService,
+  RuntimePorts,
   SafeBootstrapConfig,
+  ThreadsCapability,
   WorkspaceTrustPolicy,
 } from "@autopilot-agent/core";
 import {
   createNodeCapabilityLoader,
+  createNodeThreadHandoffWriter,
   createNodeRuntimePorts,
   createNodeSettingsLoader,
   createNodeTrustPolicy,
@@ -33,6 +37,7 @@ import { createWorkPreviewService, type WebWorkPreviewService } from "./workspac
 import { extractWorkPreviewToolFacts } from "./workspace-host/work-preview-facts";
 import { loadCore } from "./core-loader";
 import { getWorkspaceRequestContext } from "./workspace-host/web-workspace-session";
+import { createWebStateRootId, createWebThreadModelCatalog, WEB_THREAD_ALLOWED_TOOLS, WEB_THREAD_PRINCIPAL_ID } from "./workspace-host/web-thread-capability";
 
 /** 将已有通义凭据显式接为 Web 的可选视觉角色，未配置时绝不注册视觉工具。 */
 function createDashScopeVisionFallback(): Partial<RunConfig> {
@@ -109,6 +114,9 @@ export interface CreateWebCompositionRootOptions {
   /** Web 与 CLI 可共享的 durable Runtime 状态根；未传时由共享 resolver 按 workspace identity 解析。 */
   stateRoot?: string;
 
+  /** Registry 签发的工作区不透明 ID；只供服务端装配协作能力，浏览器不能指定。 */
+  workspaceId?: string;
+
   /** 信任记录根；未传时兼容 stateRoot 相邻的 `.local/agent` 布局。 */
   trustRoot?: string;
 
@@ -139,6 +147,18 @@ export interface WebCompositionRoot {
 
   /** 当前 Workspace Context 的 Work 预览服务；工具能力与受限 Route 共用同一实例。 */
   workPreview: WebWorkPreviewService;
+
+  /** Web 协作宿主所需的 Port 集合；仅 bootstrap 完成且 Trust 建立后可用，浏览器不可达。 */
+  getRuntimePorts(): RuntimePorts | undefined;
+
+  /** 已装配的协作范围；projectId 绑定前返回 undefined，Turn 不注册协作工具。 */
+  getThreadsCapability(): ThreadsCapability | undefined;
+
+  /** 绑定当前 Workspace 的 Runner 唤醒回调；回调只在成功创建协作子会话后触发。 */
+  bindThreadRunnerWake(wake: () => void): void;
+
+  /** bootstrap 后把已确认 Project 绑定到协作范围；只由 Workspace Host 调用。 */
+  bindThreadsProject(projectId: string): void;
 
   /** Trust 后从 capability catalog 冻结本轮显式选择的 Skill。 */
   resolveSelectedSkills(selectedSkills: WebSelectedSkillInput[], pinnedSkills: SessionPinnedSkill[]): Promise<{
@@ -196,6 +216,28 @@ export function createWebCompositionRoot(
   const settingsLoader = createNodeSettingsLoader();
   const nodeCapabilityLoader = createNodeCapabilityLoader({ stateRoot, settingsLoader, webSearchFetch: options.webSearchFetch });
   let trustedSettingsWorkspaceRoot: string | undefined;
+  // 协作能力只从受信装配生成：状态根用不透明摘要，模型目录来自 settings，Project 由 Host 绑定。
+  const stateRootId = createWebStateRootId(stateRoot);
+  let runtimePorts: RuntimePorts | undefined;
+  let threadsProjectId: string | undefined;
+  let threadModelCatalog: readonly ModelRef[] = [];
+  let threadRunnerWake: (() => void) | undefined;
+
+  /** 组合当前宿主事实为协作范围；缺少 workspaceId 或 Project 时明确不提供，不猜默认值。 */
+  function currentThreadsCapability(): ThreadsCapability | undefined {
+    if (!options.workspaceId || !threadsProjectId) return undefined;
+    return {
+      workspaceId: options.workspaceId,
+      stateRootId,
+      projectId: threadsProjectId,
+      allowedTools: WEB_THREAD_ALLOWED_TOOLS,
+      executionHost: "web-work-v1",
+      modelCatalog: threadModelCatalog,
+      humanPrincipalId: WEB_THREAD_PRINCIPAL_ID,
+      onThreadCreated: function wakeThreadRunner() { threadRunnerWake?.(); },
+      ...(trustedSettingsWorkspaceRoot ? { handoff: createNodeThreadHandoffWriter({ workspaceRoot: trustedSettingsWorkspaceRoot }) } : {}),
+    };
+  }
 
   const defaultCapabilityLoader: CapabilityLoader = {
     ...nodeCapabilityLoader,
@@ -246,8 +288,10 @@ export function createWebCompositionRoot(
       // 只有 trust 建立后才创建 manifest；不在未信任 workspace 的快路径写状态根。
       const loadedSettings = settingsLoader.load(trustedWorkspace);
       trustedSettingsWorkspaceRoot = trustedWorkspace;
+      threadModelCatalog = createWebThreadModelCatalog(loadedSettings.settings);
       initializeNodeStateRoot(stateRoot);
-      return createNodeRuntimePorts({ stateRoot, trustRoot: options.trustRoot, workspaceRoot: trustedWorkspace, userSettingsPath: loadedSettings.paths.user });
+      runtimePorts = createNodeRuntimePorts({ stateRoot, trustRoot: options.trustRoot, workspaceRoot: trustedWorkspace, userSettingsPath: loadedSettings.paths.user });
+      return runtimePorts;
     },
     defaultRunConfig: {
       ...options.defaultRunConfig,
@@ -258,10 +302,15 @@ export function createWebCompositionRoot(
           ...staticDefaults,
           ...(options.defaultRunConfig?.getRuntimeDefaults?.() ?? {}),
         };
-        if (!trustedSettingsWorkspaceRoot) return mergeRuntimeDefaults(base, createDashScopeVisionFallback(), {});
+        /** 协作范围与 settings 同时逐 Turn 读取；Project 未绑定时不提供协作工具。 */
+        function withThreads(defaults: Partial<RunConfig>): Partial<RunConfig> {
+          const threads = currentThreadsCapability();
+          return threads ? { ...defaults, threads } : defaults;
+        }
+        if (!trustedSettingsWorkspaceRoot) return withThreads(mergeRuntimeDefaults(base, createDashScopeVisionFallback(), {}));
         const settings = settingsLoader.load(trustedSettingsWorkspaceRoot).settings;
         const fallback = base.providerSettings?.visionModelRef ? {} : createDashScopeVisionFallback();
-        return mergeRuntimeDefaults(base, fallback, createSettingsRunConfig(settings));
+        return withThreads(mergeRuntimeDefaults(base, fallback, createSettingsRunConfig(settings)));
       },
     },
   };
@@ -336,6 +385,20 @@ export function createWebCompositionRoot(
     getBootstrapService: () => bootstrapService,
 
     workPreview,
+
+    getRuntimePorts: () => runtimePorts,
+
+    getThreadsCapability: () => currentThreadsCapability(),
+
+    bindThreadRunnerWake: function bindThreadRunnerWake(wake) {
+      threadRunnerWake = wake;
+    },
+
+    /** 只接受 bootstrap 后由宿主确认的 Project；空值不绑定，避免协作范围漂移到其他项目。 */
+    bindThreadsProject: (projectId: string) => {
+      if (!projectId.trim()) return;
+      threadsProjectId = projectId;
+    },
 
     resolveSelectedSkills,
 

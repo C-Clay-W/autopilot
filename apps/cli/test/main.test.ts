@@ -1,6 +1,7 @@
 /** CLI 入口契约测试：帮助、usage error 和 Step 5.3 Runtime 委托。 */
 
 import { AgentRuntimeError, type AgentEvent, type AgentRuntime } from "@autopilot-agent/core";
+import { NodeStateError } from "@autopilot-agent/adapters";
 import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { exitCodeForSignal, main, type CliMainDependencies, type CliSignalSource } from "../src/main.js";
@@ -117,6 +118,9 @@ function createCompositionRoot(): { root: CliCompositionRoot; dependencies: CliM
     getTrustStatus: async function getTrustStatus() { return { workspaceRoot: "C:/workspace", status: "trusted", source: "test" }; },
     createRuntime: async function createRuntime() { return runtime; },
     bootstrap: async function bootstrap() { return runtime; },
+    bindThreadsProject: function bindThreadsProject() { return undefined; },
+    createHumanThreads: function createHumanThreads() { throw new Error("unused"); },
+    createThreadHost: function createThreadHost() { return createIdleThreadHost(); },
     getBootstrapService: function getBootstrapService() { throw new Error("unused"); },
     getStartupConfigurationError: function getStartupConfigurationError() { return undefined; },
     getRuntimeStatusDefaults: function getRuntimeStatusDefaults() { return {}; },
@@ -126,7 +130,27 @@ function createCompositionRoot(): { root: CliCompositionRoot; dependencies: CliM
   return { root, dependencies: { createCompositionRoot: function createCompositionRoot() { return root; }, signalSource: createSignalSource(), cwd: "C:/workspace" } };
 }
 
+/** 创建不驱动任何目标的常驻宿主替身；chat 用例不涉及协作执行。 */
+function createIdleThreadHost() {
+  return {
+    start: function start() { return undefined; },
+    stop: async function stop() { return undefined; },
+    isRunning: function isRunning() { return false; },
+  };
+}
+
 describe("CLI main", function cliMainSuite() {
+  /** 升级问题须给出稳定原因和可操作提示，不能再隐藏为 CLI_RUNTIME_ERROR。 */
+  it.each(["STATE_SCHEMA_VERSION_UNSUPPORTED", "STATE_SCHEMA_MIGRATION_FAILED", "STATE_SCHEMA_BUSY"] as const)("状态错误 %s 输出原因和恢复提示", async function stateError(code) {
+    const streams = createStreams();
+    const setup = createCompositionRoot();
+    setup.root.resolveTrust = async function unavailable() { throw new NodeStateError(code); };
+    expect(await main(["session", "list"], streams, setup.dependencies)).toBe(1);
+    expect(streams.stderr.value).toContain(code);
+    expect(streams.stderr.value).toContain("重试");
+    expect(streams.stderr.value).not.toContain("CLI_RUNTIME_ERROR");
+  });
+
   it("帮助返回 0 并写 stdout", async function returnsSuccessForHelp() {
     const streams = createStreams();
     await expect(main(["--help"], streams)).resolves.toBe(0);
@@ -395,6 +419,9 @@ describe("CLI main", function cliMainSuite() {
       getTrustStatus: async function getTrustStatus() { return { workspaceRoot: "C:/workspace", status: "trusted", source: "test" }; },
       createRuntime: async function createRuntime() { return runtime; },
       bootstrap: async function bootstrap() { return runtime; },
+      bindThreadsProject: function bindThreadsProject() { return undefined; },
+      createHumanThreads: function createHumanThreads() { throw new Error("unused"); },
+      createThreadHost: function createThreadHost() { return createIdleThreadHost(); },
       getBootstrapService: function getBootstrapService() { throw new Error("unused"); },
       getStartupConfigurationError: function getStartupConfigurationError() { return undefined; },
       getRuntimeStatusDefaults: function getRuntimeStatusDefaults() { return {}; },

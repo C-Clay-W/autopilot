@@ -26,7 +26,6 @@ interface ScheduledCall {
   resourceKey: string;
   concurrency: number;
   maxRetries: number;
-  timeoutMs?: number;
 }
 
 /** 解析 metadata 的资源键；未声明时每个工具独立共享自己的并发额度。 */
@@ -35,15 +34,6 @@ function resolveResourceKey(call: AgentToolCall, registry: ToolRegistry): string
   const resolved = typeof resourceKey === "function" ? resourceKey(call.input) : resourceKey;
   if (typeof resolved === "string" && resolved.trim()) return resolved;
   return `tool:${call.name}`;
-}
-
-/** 从工具输入中的 timeoutMs 读取请求值，并限制在 metadata 声明的可接受范围内。 */
-function resolveTimeoutMs(input: unknown, timeout: { defaultMs?: number; maxMs?: number } | undefined): number | undefined {
-  if (!timeout?.defaultMs) return undefined;
-  const requested = input && typeof input === "object" && typeof (input as { timeoutMs?: unknown }).timeoutMs === "number"
-    ? (input as { timeoutMs: number }).timeoutMs
-    : timeout.defaultMs;
-  return timeout.maxMs === undefined ? requested : Math.min(requested, timeout.maxMs);
 }
 
 /** 将调用转为已解析的调度约束；重试上限只在此处与 Stage 8 冻结限制取最小值。 */
@@ -55,7 +45,6 @@ function prepareCall(call: AgentToolCall, registry: ToolRegistry, globalMaxRetri
     resourceKey: resolveResourceKey(call, registry),
     concurrency: metadata.concurrency.max,
     maxRetries,
-    timeoutMs: resolveTimeoutMs(call.input, metadata.timeout),
   };
 }
 
@@ -80,10 +69,10 @@ export function createToolScheduler(
   /** 单次执行并在安全情况下最多重试指定次数。 */
   async function executeWithRetry(scheduled: ScheduledCall, options: ToolSchedulerOptions): Promise<ScheduledToolResult> {
     let retryCount = 0;
-    let result = await execute({ callId: scheduled.call.id, toolName: scheduled.call.name, input: scheduled.call.input }, { signal: options.signal, timeoutMs: scheduled.timeoutMs, ...(options.onProgress ? { onProgress: options.onProgress } : {}) });
+    let result = await execute({ callId: scheduled.call.id, toolName: scheduled.call.name, input: scheduled.call.input }, { signal: options.signal, ...(options.onProgress ? { onProgress: options.onProgress } : {}) });
     while (retryCount < scheduled.maxRetries && isSafelyRetryable(result) && !options.signal?.aborted) {
       retryCount++;
-      result = await execute({ callId: scheduled.call.id, toolName: scheduled.call.name, input: scheduled.call.input }, { signal: options.signal, timeoutMs: scheduled.timeoutMs, ...(options.onProgress ? { onProgress: options.onProgress } : {}) });
+      result = await execute({ callId: scheduled.call.id, toolName: scheduled.call.name, input: scheduled.call.input }, { signal: options.signal, ...(options.onProgress ? { onProgress: options.onProgress } : {}) });
     }
     return { call: scheduled.call, result, retryCount };
   }

@@ -10,7 +10,6 @@ import { useEffect, useState, type ReactNode } from "react";
 import { Box, Text } from "ink";
 import type { CliTurnStatus } from "./types.js";
 import type { TuiAnimationClock } from "./animation-clock.js";
-import { formatTuiDuration } from "./tui/format.js";
 
 export type CliActivityPhase = "requesting" | "thinking" | "waiting" | "transition" | "responding" | "stalled" | "terminal";
 
@@ -101,30 +100,21 @@ export function getCliActivityFrame(phase: CliActivityPhase, now: number): strin
   return CLI_ACTIVITY_SPINNER_FRAMES[Math.floor(Math.max(0, now) / CLI_ACTIVITY_SPINNER_FRAME_MS) % CLI_ACTIVITY_SPINNER_FRAMES.length] ?? "·";
 }
 
-function formatCliActivityElapsed(durationMs: number): string {
-  const totalSeconds = Math.max(1, Math.floor(Math.max(0, durationMs) / 1_000));
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes < 60) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
-  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m ${String(seconds).padStart(2, "0")}s`;
-}
-
 /** 返回活动阶段的稳定文案，供动画降级和 screen reader 使用。 */
-function getCliActivityLabel(phase: CliActivityPhase, input: { idleForMs?: number; hasActiveTool?: boolean } = {}): string {
+function getCliActivityLabel(phase: CliActivityPhase, input: { hasActiveTool?: boolean } = {}): string {
   switch (phase) {
     case "requesting": return "Preparing · waiting for first event";
     case "thinking": return "Thinking · planning next step";
     case "waiting": return input.hasActiveTool ? "Waiting · tool result" : "Waiting · provider response";
     case "transition": return "Running action · starting tool";
     case "responding": return "Answering · receiving output";
-    case "stalled": return `Still working · no new event for ${formatCliActivityElapsed(input.idleForMs ?? 0)}`;
+    case "stalled": return "Still working";
     case "terminal": return "Completed";
   }
 }
 
 /** 根据当前时间解析过场、stalled 和审批等待，形成最终可见活动状态。 */
-export function resolveCliActivityView(input: { activity: CliActivityState; status: CliTurnStatus; now: number; waitingForApproval?: boolean }): CliActivityView | undefined {
+export function resolveCliActivityView(input: { activity: CliActivityState; status: CliTurnStatus; now: number; waitingForApproval?: boolean; threadWait?: import("./types.js").CliProjection["threadWait"] }): CliActivityView | undefined {
   const { activity, status, now } = input;
   if (status === "idle") return undefined;
   if (status !== "running" && status !== "waiting_approval") return { phase: "terminal", label: status, frame: "" };
@@ -132,6 +122,11 @@ export function resolveCliActivityView(input: { activity: CliActivityState; stat
     return { phase: "waiting", label: "Waiting for approval", frame: getCliActivityFrame("waiting", now) };
   }
 
+  if (status === "running" && input.threadWait) {
+    const fact = input.threadWait;
+    const label = fact.phase === "processing" ? "正在处理关联结果" : fact.approvals > 0 ? `等待关联审批 · ${fact.approvals}项待处理 · Ctrl+A处理` : fact.running > 0 ? `等待关联任务 · ${fact.running}项运行中` : `等待关联任务 · ${fact.pending}项未完成`;
+    return { phase: "waiting", label, frame: getCliActivityFrame("waiting", now) };
+  }
   let phase = activity.phase;
   if (phase === "transition" && activity.transitionStartedAt !== undefined && now - activity.transitionStartedAt >= CLI_ACTIVITY_TRANSITION_MS) {
     phase = activity.hasActiveTool ? "waiting" : "thinking";
@@ -142,17 +137,17 @@ export function resolveCliActivityView(input: { activity: CliActivityState; stat
   }
   return {
     phase,
-    label: getCliActivityLabel(phase, { idleForMs: Math.max(0, now - activity.lastProgressAt), hasActiveTool: activity.hasActiveTool }),
+    label: getCliActivityLabel(phase, { hasActiveTool: activity.hasActiveTool }),
     frame: getCliActivityFrame(phase, now),
   };
 }
 
 /** 渲染稳定活动文案和可选的固定宽度离散帧。 */
-export function TuiActivityLine(props: { activity: CliActivityState; status: CliTurnStatus; waitingForApproval: boolean; useColor: boolean; screenReader: boolean; reducedMotion: boolean; animationActive: boolean; clock: TuiAnimationClock; startedAt?: number; activeForm?: string }): ReactNode {
+export function TuiActivityLine(props: { threadWait?: import("./types.js").CliProjection["threadWait"]; activity: CliActivityState; status: CliTurnStatus; waitingForApproval: boolean; useColor: boolean; screenReader: boolean; reducedMotion: boolean; animationActive: boolean; clock: TuiAnimationClock; startedAt?: number; elapsedMs?: number; runningSince?: number; activeForm?: string }): ReactNode {
   const [clockTime, setClockTime] = useState(props.clock.now());
-  const view = resolveCliActivityView({ activity: props.activity, status: props.status, now: clockTime, waitingForApproval: props.waitingForApproval });
+  const view = resolveCliActivityView({ activity: props.activity, status: props.status, now: clockTime, waitingForApproval: props.waitingForApproval, threadWait: props.threadWait });
   const shouldAnimate = props.animationActive && !props.screenReader && !props.reducedMotion && view !== undefined && view.phase !== "terminal";
-  const shouldTick = shouldAnimate || (props.startedAt !== undefined && (props.status === "running" || props.status === "waiting_approval"));
+  const shouldTick = shouldAnimate || (props.runningSince !== undefined && props.status === "running");
 
   useEffect(function subscribeActivityClock() {
     props.clock.setActive(shouldTick);
@@ -162,7 +157,7 @@ export function TuiActivityLine(props: { activity: CliActivityState; status: Cli
     }
     setClockTime(props.clock.now());
     return props.clock.subscribe(function updateActivityClock(time: number): void {
-      // 禁动画仍按秒刷新累计时间，复用同一枚时钟。
+      // 禁动画仍按秒检查静默状态，复用同一枚时钟。
       setClockTime(function next(previous) { return shouldAnimate || Math.floor(previous / 1000) !== Math.floor(time / 1000) ? time : previous; });
     });
   }, [props.clock, shouldAnimate, shouldTick]);
@@ -176,7 +171,7 @@ export function TuiActivityLine(props: { activity: CliActivityState; status: Cli
       <Box width={3} flexShrink={0}>
         <Text bold={isStalled} color={props.useColor ? "ansi256(208)" : undefined}>{frame}</Text>
       </Box>
-      <Text bold={isStalled} dimColor={props.useColor && !isStalled}>{props.activeForm ?? view.label}{props.startedAt !== undefined ? ` · ${formatTuiDuration(Math.max(0, clockTime - props.startedAt))}` : ""}</Text>
+      <Text bold={isStalled} dimColor={props.useColor && !isStalled}>{props.threadWait && props.status === "running" ? view.label : props.activeForm ?? view.label}</Text>
     </Box>
   );
 }

@@ -1,6 +1,7 @@
 /** 后台 Job 工具：通过 ToolExecutor/PolicyEngine 授权后启动受管非 PTY 子进程。 */
 
 import { z } from "zod";
+import { normalizeJobServiceUrl } from "../../../runtime/domain/job-service-url";
 import { decideCommandPermission, normalizeProgramName } from "../permissions/command-policy";
 import { createToolError } from "../tool-error";
 import type { JobService } from "../../../runtime/application/job-service";
@@ -26,8 +27,12 @@ export const startBackgroundJobSchema = schema;
 export function createStartBackgroundJobTool(input: { jobs: JobService; workspaceId: string; workspaceRoot: string; sessionId: string; turnId: string }): AgentToolDefinition<z.infer<typeof schema>, Record<string, unknown>> {
   return {
     name: "start_background_job",
-    description: "在当前工作区启动受管的非交互后台命令并返回安全 Job 引用。命令不使用 Shell；成功只表示已启动，最终完成状态必须再用 read_background_job 确认。",
+    description: "在当前工作区启动受管的非交互后台命令并返回安全 Job 引用。命令不使用 Shell；成功只表示已启动，最终完成状态必须再用 read_background_job 确认。常驻 Web/预览服务必须使用本工具而非等待退出的 run_command。serviceUrl 可选，只允许 loopback HTTP(S) origin（例如 http://127.0.0.1:8123），不能带页面路径、查询或凭据；open_preview.url 可带页面路径。超时或状态不明时先检查 Job 与监听事实，禁止盲重试启动第二个服务。",
     inputSchema: schema,
+    /** 审批前复用 JobService 的纯 origin 校验；不运行命令，也不查询端口。 */
+    async validateInput(value) {
+      if (value.serviceUrl !== undefined && !normalizeJobServiceUrl(value.serviceUrl)) throw createToolError("INVALID_INPUT", "serviceUrl 仅支持 loopback HTTP(S) origin（例如 http://127.0.0.1:8123），不能带页面路径、查询或凭据；页面路径传给 open_preview.url");
+    },
     metadata: { effect: "dynamic", destructive: false, concurrency: { max: 4, resourceKey: "workspace:background-job" }, retry: { safe: false }, timeout: { defaultMs: 10_000, maxMs: 10_000 } },
     async createActionFacts(value, context) {
       const result = decideCommandPermission(value.program, value.args);

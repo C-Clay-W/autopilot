@@ -19,6 +19,7 @@ import type { ModelBehaviorProfile } from "./model-behavior-profile";
 import { createDefaultModelBehaviorProfile } from "./model-behavior-profile";
 import { createAnthropicMessagesSampler } from "./anthropic-messages-adapter";
 import { createOpenAiChatCompletionsSampler } from "./openai-chat-completions-adapter";
+import { getModelCapabilityForRef } from "./model-capability-catalog";
 
 /**
  * 创建一个使用指定采样选项的 Chat Completions sampler（仅供旧内部调用路径）。
@@ -81,6 +82,8 @@ function createBaselineProtocolAdapters(): ProviderProtocolAdapter[] {
           authMode: input.providerConfig.credentialRef?.key === "USER_SETTINGS_ANTHROPIC_AUTH_TOKEN" ? "bearer" : "api_key",
           timeoutMs: input.providerConfig.timeoutMs,
           sampleOptions: input.providerConfig.sampleOptions ?? resolveFirstPartyModelSampleOptions(input.ref, input.reasoningProfile).sampleOptions,
+          // 只采信受信能力目录的逐模型声明；未登记模型按 none 处理，绝不因“兼容 Anthropic”推断支持。
+          promptCacheMode: getModelCapabilityForRef(input.ref)?.promptCacheMode ?? "none",
         });
       },
     },

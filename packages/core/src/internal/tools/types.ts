@@ -177,6 +177,8 @@ export interface ToolJobDisplayFacts {
 
 /** 供 Presentation 消费的安全工具展示事实；不包含原始 input、output 或 Provider 输出。 */
 export interface ToolDisplayFacts {
+  /** 协作观察的安全分组与有界状态明细，不携带原始input/output。 */
+  observation?: { key: string; phase: string; lines: string[]; approvalTargets?: string[] };
   titleKey: string;
   target?: string;
   summary?: string;
@@ -256,7 +258,7 @@ export interface ToolExecutionRequest {
 }
 
 export type ToolExecutionResult =
-  | { status: "success"; callId: string; toolName: string; output: unknown; meta: ToolExecutionMeta; display?: ToolDisplayFacts }
+  | { status: "success"; callId: string; toolName: string; output: unknown; meta: ToolExecutionMeta; display?: ToolDisplayFacts; images?: import("../types/agent-message").AgentImageReference[] }
   | { status: "question_required"; callId: string; toolName: string; request: UserQuestionRequest; meta: ToolExecutionMeta; display?: ToolDisplayFacts }
   | { status: "approval_required"; callId: string; toolName: string; approval: ToolApprovalRequest; display?: ToolDisplayFacts }
   | { status: "denied"; callId: string; toolName: string; error: ToolError; display?: ToolDisplayFacts }
@@ -330,6 +332,8 @@ export interface ToolEvent {
 }
 
 export interface ToolExecutionContext {
+  /** Kernel受信汇报约定元数据，不接受模型工具参数。 */
+  reportingAgreement?: { taskId: string; explicit: boolean };
   /** 仅RuntimePorts/Native宿主注入，不接受任何工具参数或持久配置覆盖。 */
   hostMutationProtection?: import("../../runtime/ports/host-mutation-protection").HostMutationProtection;
   /** Runtime私有Session归属，用于外部能力认领，不接受工具参数。 */
@@ -361,6 +365,8 @@ export interface ToolExecutionContext {
     readVisualEvidence?(visualEvidenceRef: string, signal?: AbortSignal): Promise<{ dataUrl: string; mimeType: string }>;
   };
   /** 当前 Runtime 中 read_file 的可信快照，供 edit_file 做 stale read 校验。 */
+  /** 仅返回当前模型可见消息，用于确认去重引用正文仍然存在。 */
+  getVisibleMessages?: () => readonly import("../types/agent-message").AgentMessage[];
   fileReadStates?: Map<string, { sha256: string; mtimeMs: number;
     /** 模型已观察的行范围；edit_file 只允许修改已观察区间内的内容 */
     observedRanges: Array<{ startLine: number; endLine: number }>;
@@ -427,6 +433,8 @@ export interface AgentToolDefinition<TInput, TOutput> {
   createActionFacts(input: TInput, context: ToolExecutionContext): ToolActionFacts | Promise<ToolActionFacts>;
   execute(input: TInput, context: ToolExecutionContext): Promise<TOutput>;
   serializeOutput(output: TOutput): unknown;
+  /** 仅本地工具实现可投影经宿主存储生成的图片引用，不能信任远端同名字段。 */
+  getImageReferences?(output: TOutput): import("../types/agent-message").AgentImageReference[];
   /** 可选的专用展示明细投影；从原始执行结果生成受控明细，模型 serialized 输出不携带这些字段。 */
   projectDisplayDetail?(output: TOutput): ToolDisplayDetail | undefined;
   /** 交互型工具可将可信执行结果转换为非 success 终态；普通工具不实现该钩子。 */
@@ -445,8 +453,12 @@ export interface ToolModelDefinition {
 }
 
 export interface ToolExecutionOptions {
+  /** Kernel受信汇报约定元数据，不接受模型工具参数。 */
+  reportingAgreement?: { taskId: string; explicit: boolean };
   signal?: AbortSignal;
-  /** Scheduler 已按工具 metadata 解析的单次执行超时；不覆盖 Runtime 的 AbortSignal。 */
+  /** 可信恢复专用：复用完整校验/Policy后只签发审批，绝不执行工具；不能放宽deny。 */
+  approvalOnly?: boolean;
+  /** 受信内部单次执行预算（如重定向剩余时间）；Executor 与请求及 metadata 上限取最小值，不覆盖 Runtime 的 AbortSignal。 */
   timeoutMs?: number;
   /** 工具执行期间的节流进度回调；仅长时工具（如 run_command）实现节流上报。 */
   onProgress?: (callId: string, chunk: string) => void;

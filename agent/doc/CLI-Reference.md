@@ -27,6 +27,7 @@
 9. [后台 Job 管理](#9-后台-job-管理)
 10. [撤销（Undo）](#10-撤销undo)
 11. [交互 slash 命令](#11-交互-slash-命令)
+12. [会话协作（thread）](#12-会话协作thread)
 
 ---
 
@@ -50,6 +51,8 @@ CLI 提供两个等价的 bin 名：`autopilot`（主命令）与 `ap`（等价�
 | `--scope <user\|project\|local>` | `config` 命令的 scope，必须显式提供 |
 | `--yes` | 确认类命令（session delete / mcp approve / undo）跳过交互确认 |
 | `--connectivity` | `doctor` 的 Provider 连通探测开关 |
+
+正常使用入口在完成 Trust 后自动备份并升级已知旧状态格式（含6/7→8）；更新 npm 包后仍使用原工作区和历史，不需要更换状态根或手改版本号。当前版重复打开不重复备份，普通查询 Store 不承担迁移。真正无法升级时，CLI 输出稳定 `STATE_SCHEMA_*` 原因及恢复提示，不再掩盖成 `CLI_RUNTIME_ERROR`；未知新版不会被降级。`doctor` 仍只读，不触发升级。
 
 ### 1.3 无色启动
 
@@ -84,6 +87,8 @@ NO_COLOR=1 ap
 Todo 任务链在三种输出中的一致行为：模型通过 `todo_write` 工具更新任务链时产生 `todo_updated` 安全事件（字段仅含 `todos` 与 `counts`，不携带 raw Tool args）。`text` 每次更新输出一行稳定摘要 `todo: <completed>/<total> completed[ · in progress: <activeForm>]`；`jsonl` 输出完整安全事件对象；`interactive` 动态区以单卡显示，详见 2.2。
 
 终态状态事件可带有 `termination: { reason?, recoverable, budget? }`：原因仅来自 Core 固定白名单，`recoverable` 是 Core 的布尔判定；可选预算只含 `used/limit/unit`，其中执行时长单位为 `ms`、Token 单位为 `tokens`。`text`、`jsonl`、交互时间线与备用 viewport 显示同一安全摘要。旧事件缺少投影时不补造原因或数值；Provider 原始错误、凭据和路径不会透传。
+
+失败 `status` 事件可带白名单 `code`、安全 `reason`、Recorder 生成的 UUID `feedbackId`、有限 `providerHttpStatus` 和受限 `providerFailureDetail`。Plain 与 TUI 显示原因、可用的 HTTP 状态、上游标识和反馈 ID，JSONL 保留结构化字段。Web 与 CLI 使用 Core 共享的中立原因提示，不在 CLI 按厂商或 HTTP 数字解释业务语义。Adapter 将可靠事实归一为有限原因，未知网关保持通用提示。旧持久 `deepseek_official` 仅经归一化入口迁移，ID 和合法 HTTP 状态保留；协议 code/type 标识经共享字符、长度和常见凭据形式校验后展示，不用于恢复；自由 message 不显示。短标识仍可能含敏感信息，用户已明确接受此残余风险。未知 429 保守拒绝，已确认余额/额度不重试，可靠限流/过载沿用有界恢复。
 
 ### 1.5 退出码
 
@@ -156,13 +161,15 @@ CLI 不注册结构化 `ask_user_question` Tool，也不显示问题卡或选项
 
 **Todo 任务链展示（interactive）**：每个 Turn 只显示该轮最后一次安全 `todo_updated` 的单卡，位于回答及过程之后、该轮终态摘要与冻结耗时之前；中间版本不重复写入历史。普通新轮没有自身更新时不显示旧卡，后续更新或清空不覆盖前轮最终快照。默认紧凑态显示 `Todo <completed>/<total> · <activeForm>`（无进行中任务时只显示计数），活动卡底部持续显示 `Ctrl+O 展开`，展开后切换为 `Ctrl+O 收起`；该按键在 picker 与审批等待之外随时切换完整清单，并同时切换工具调用分组行的展开明细（默认收起，展开后缩进显示组内各调用；screen reader 恒展开）。展开区最多占 10 行，矮终端会继续按可用高度收缩；in_progress 与最近完成优先，超出部分以一行隐藏计数收口。彩色模式以 `✓/■/□` glyph 加删除线/加粗/唯一橙色表达；screen reader 与 `NO_COLOR` 模式均输出中文状态文字。终态只固化一次最终清单，不再显示不可操作的快捷提示，并继续保留 screen reader 中文状态。当前进行中任务的 `activeForm` 也会作为动态区活动行的稳定文案，替代宿主猜测的工具动词短语。
 
-**活动耗时与引导原文（interactive）**：本轮累计耗时在输入框上方的既有活动状态旁显示，复用活动时钟；读屏、降低动态偏好仍按秒更新，终态停止并在历史保留冻结总耗时。已确认的 steer 原文按提交位置留在所属 Turn 内，消费后原位更新状态且仅显示一次；queue 原文在等待区可见，领取后成为新轮首条输入。回调晚到、消费先到或切轮均按 inputId 关联原轮，不读取私有 checkpoint 或附件展开内容。
+**总耗时与引导原文（interactive）**：每轮结束后仅在时间线保留一条冻结总耗时，累计同一 Turn 的实际执行段，不计审批/暂停等待；活动行、底部 tokens 行和首答不重复展示耗时，静默状态只显示 Still working。失败终态同时保留安全失败原因和 HTTP 状态，不被通用恢复性文案遮住。审批提交/恢复准备期间保持控制器执行权，后台观察不能撤销进行中的精确请求；决定已保存但旧宿主未继续时，`/resume` 复用该条决定继续，不重复提交。已确认的 steer 原文按提交位置留在所属 Turn 内，消费后原位更新状态且仅显示一次；queue 原文在等待区可见，领取后成为新轮首条输入。回调晚到、消费先到或切轮均按 inputId 关联原轮，不读取私有 checkpoint 或附件展开内容。
 
 **Todo 任务链续接规则**：任务链快照只在连续路径继承。运行中的普通输入（steer 引导）在当前 Turn 安全边界交给模型，模型随后以 `todo_write` 提交追加或调整后的完整列表；`/queue <prompt>` 领取后的下一 Turn 继承上一任务链的安全 Todo 快照（见 11.2）；`autopilot resume` 恢复同一 durable Turn 时沿用原 Todo 进度并保留继续更新能力。普通新 Turn 的任务链初始为空，不继承旧 Todo；用户输入正文不能直接改写任务链。
 
 **长调用链与恢复**：未显式配置 `maxSteps` 或 settings.json 的 `maxTurns` 时，正常交互不设循环轮数闸门；未显式配置 `maxDurationMs` / `AGENT_MAX_DURATION_MS` 时也不设累计执行段时长闸门。`maxTurns` 映射到内部 `maxSteps`，每轮为一次模型采样及其工具批次，可含多个工具，不按消息数或单个工具调用数计数；有效正整数无固定 100 轮封顶。显式轮数触顶产生 `limit_reached`，可用 `autopilot resume` 继续；Continue 复用冻结轮数值并开启新的执行段，不重置已完成工具事实。Runtime 在每个完整工具批次后保存最新 durable checkpoint，进程重启/恢复不会重放已完成工具；无法确认的未闭合副作用会先以 `TOOL_OUTCOME_UNKNOWN` 闭合，要求验证后再继续。显式 `runtime_budget` 与重复无进展护栏会以 `interrupted_recoverable` 暂停；执行段时长预算可在同一 Turn 上继续，保留已完成调用事实。耗尽的显式 `token_budget` 是 `failed` 终态，Core 拒绝继续执行。旧模式/旧默认值不在当前契约范围，本轮不提供迁移保证。
 
 **交互继续词**：当前 Session 存在 `awaiting_approval`、`awaiting_user_input`、`interrupted_recoverable` 或 `limit_reached` 的可恢复 Turn 时，在交互输入框提交精确的 `继续`、`继续执行` 或 `继续任务` 会直接复用该 Turn 的 `resume -> turns.continue()` 路径，不创建新 Turn；其中 `awaiting_user_input` 仍只显示“请在支持结构化回答的 Web 中处理”。没有可恢复 Turn 时，这些词保持普通 prompt 语义。
+
+**图片粘贴（Windows/macOS interactive）**：终端把 Ctrl+V 交给程序或发送空 bracketed paste 时可读取剪贴板截图与图片文件；若终端拦截 Ctrl+V，可尝试 Alt+V。Windows 使用 PowerShell STA，macOS 使用系统 osascript/AppKit；macOS 受控代码测试通过，系统桥接和真实终端尚待实机验证。输入显示 `[Image N]`，方向键跨越占位符，删除时按整张移除；文字可混合输入，单条最多 10 张。原图单张最多 20 MiB、4000 万像素，规范化副本总计最多 20 MiB，GIF 只发送静态首帧。纯文本 bracketed paste 保持原有输入语义；不支持文件会显示提示。终端快捷键是否到达程序取决于实际终端，真实 TTY 行为须由用户实测。
 
 **@ 文件提及（interactive）**：交互输入框中在行首或空白后输入 `@` 弹出工作区文件候选菜单（最多显示 5 行，↑/↓ 滚动选择，输入越完整候选越少，`@` 空查询列出工作区一层目录与文件）；Tab/Enter 插入选中项（文件尾随空格，目录尾随 `/` 可继续下钻），Esc 仅关闭菜单且已输入内容保留（再次 Esc 恢复既有取消语义；与 slash 菜单 Esc 清空输入不同）。提交时（新 Turn、运行中引导、`/queue` 与首轮 initial prompt 行为一致），@ 引用的工作区相对路径内容以 `<system-reminder>` 附加块追加到发送给模型的内容；时间线与 Esc 恢复始终只显示/恢复原文。引用限制：仅接受工作区内相对路径（绝对路径与 `..` 逃逸拒绝）；单文件超过 8MiB 拒绝读取；内容截断为前 2000 行 / 256KiB；目录只列一层，上限 100 项；路径未找到、越界或读取失败以 notice 提示且不阻断提交。非交互 `autopilot chat "<prompt>"` 中 `@` 按普通文本处理，不注入文件内容。
 
@@ -435,7 +442,7 @@ set "AUTOPILOT_PERF_DIAGNOSTICS_FILE=<diagnostics-file>.jsonl"
 ap chat "<prompt>"
 ```
 
-`AUTOPILOT_PERF_DIAGNOSTICS=1` 启用 Core、Provider、Runtime、TUI Store 和输入区的分段记录；`AUTOPILOT_PERF_DIAGNOSTICS_FILE` 指定退出时写入的 JSONL 文件。诊断记录只包含 `version`、`point`、`eventType`、`monotonicMs` 和可选 `durationMs`，不包含回答正文、输入文本、凭据或路径正文。文件在 CLI 进程退出时一次性写入，运行期间不会逐事件落盘。
+`AUTOPILOT_PERF_DIAGNOSTICS=1` 启用 Core、Provider、Runtime、TUI Store 和输入区的分段记录；`AUTOPILOT_PERF_DIAGNOSTICS_FILE` 指定退出时写入的 JSONL 文件。诊断记录包含 `version`、`point`、`eventType`、`monotonicMs` 和可选 `durationMs`；错误记录额外包含封闭 `errorCategory/errorCode`，Session 保存失败可包含内部 `storage`（固定 operation/target/phase、白名单 OS code、锁等待毫秒和清理失败标记），不包含回答正文、输入文本、凭据或路径正文。文件在 CLI 进程退出时一次性写入，运行期间不会逐事件落盘。
 
 CLI/TUI 当前没有查看诊断过程或结果的交互界面；需要用文本编辑器、脚本或测试宿主读取该 JSONL 文件。未设置输出文件时仍会在进程内收集，但退出后不会保留；只设置输出文件而不把开关设为 `1` 不会记录任何数据。
 
@@ -475,7 +482,8 @@ autopilot sandbox setup --yes
 
 ## 9. 后台 Job 管理
 
-TUI Job 请求带视图代次，Esc 返回后迟到详情不会重新打开弹层；详情与停止结果按 revision 同步缓存列表，因此停止后 Esc 返回仍显示 stopped。Windows 全屏请求按既有规则降级 inline；`NO_COLOR` 与 screen reader 场景只使用文字事实。
+TUI Job 请求带视图代次，Esc 返回后迟到详情不会重新打开弹层；详情与停止结果按 revision 同步缓存列表，因此停止后 Esc 返回仍显示 stopped。交互TUI统一使用inline主屏与终端原生滚动，不启用备用屏或正文内置滚动条；历史fullscreen环境变量不再启用备用屏，`NO_COLOR`只关闭颜色。按Ctrl+T呼出有界历史目录面板，按Ctrl+A进入关联任务/审批面板。
+待关联任务审批时显示“Ctrl+A原地处理”；待审批Session无需保留执行中的activeTurnId，宿主校验最新Turn归属与状态后展示当前审批。子会话自身同样保留当前有效审批卡；旧Turn/终态不恢复、不代批。
 
 Agent 启动后台 Job 后，活动工具卡持续显示 `/jobs 查看后台任务`。启动成功时可显示 Core 安全 DTO 提供的 executable basename（例如 `POWERSHELL`）：CLI 仅将该标签转为大写，并使用界面统一的橙色强调 token；目录、参数、PID 与输出不得进入该标签或启动卡。Job 离开 `starting/running` 后不再显示操作提示。
 
@@ -527,7 +535,8 @@ autopilot undo --session <id> --yes
 
 | 命令 | 用法 | 说明 |
 |---|---|---|
-| `/exit` | `/exit` | 退出当前 CLI 会话；有活动 Turn 时先取消 |
+| `/exit` | `/exit` | 退出整个 CLI 宿主，按本进程 owner 收尾并报告未决事实 |
+| `/resume` | `/resume` | 显式恢复当前选中会话的可恢复 Turn；查看/切换不执行此动作 |
 | `/cancel` | `/cancel` | 取消正在运行的 Turn |
 | `/queue` | `/queue <prompt>` | 把下一条 prompt 投递到 durable queue |
 | `/compact` | `/compact` | 压缩当前 Turn 上下文 |
@@ -563,12 +572,14 @@ autopilot undo --session <id> --yes
 
 状态栏在 model/effort/permission 行附近显示紧凑 Context 行：有快照时为 `context: 16.1% · measured` 或 `context: ≈16.1% · estimated`；无数据固定 `context: unknown`。`measured` 只表示当前上下文没有本地增量，下一次输出仍是预留而非实测。
 
+Context 行下方显示累计用量行 `tokens:`：数据与context行一起来自 `runtime.turns.getUsageSnapshot()` 的同一次checkpoint投影（与 `context_usage_updated` 事件同一节奏合并刷新；旧Runtime继续兼容单项查询），完整分项时为 `tokens: 12,345 in / 6,789 out · 2m 05s`，旧 checkpoint 缺分项时降级为 `tokens: 12,345 total · 2m 05s`，无 checkpoint 固定 `tokens: unknown`。耗时是当前执行段耗时（Continue 重开段计时），不是 Provider 实测成本；CLI 不自行累计 token 或换算费用。
+
 `/compact` 的反馈使用 Core 显式 outcome：changed 输出 `context compacted: estimated 120000 -> 52000`；skipped 输出 `context compact skipped: no compactable history; projection unchanged (estimated 120000 tokens)`；活动 Turn 中显示 `TURN_ALREADY_RUNNING: 当前 Turn 仍在运行，请等待结束或中断后再压缩`（退出码 1），不声称已排队或将在安全边界执行。`preTokens`/`postTokens` 一律标注 `estimated`（本地估算）。
 
 ### 11.3 其他 slash 命令要点
 
 - `/jobs`：打开当前 Session 的任务列表；`show` 查看安全详情，`output` 查看有限安全日志，`stop` 明确停止当前 Runtime 拥有的目标。TUI 中可用方向键、Enter、`o`、`s`、`r` 操作；Agent 执行中仍可调度。详情 Esc 返回列表，列表 Esc 返回原输入视图，不取消 Turn、不退出 CLI，输入状态保持。
-- 活动 Turn 为 `running` 时，状态栏持续显示 `Esc interrupt`、`Enter 引导` 与 `/queue <prompt> 排队`；Turn 离开运行态后隐藏这些运行期操作提示。
+- 可见会话侧栏优先消费Esc关闭（包括未聚焦侧栏），关闭/切换不取消Turn；状态栏同步提示Esc关闭侧栏。侧栏关闭且活动Turn为running时才提示Esc interrupt、Enter引导与/queue排队。取消提交时绑定精确Session/Turn并过滤终态/重复请求，不对Completed显示取消请求成功。
 - Trust 成功后，CLI 确保当前 canonical 项目根存在 `.autopilot/tmp`，仅作为 Agent 临时脚本、截图裁剪和中间产物目录；不因此创建项目级 `settings.json` 或 `settings.local.json`。临时目录不应写入 `node_modules`。
 - `/queue <prompt>`：仅在已有活动 Turn 时生效，投递到 durable inbox 队列；领取后的下一 Turn 标记为 claimed queue，因此仅继承上一任务链的安全 Todo 快照，不会从普通无关新 Turn 前复活旧 Todo；缺 prompt 返回用法错误。
 - `/permissions <mode>`：只接受三态工具权限模式；缺 mode 时打开 picker。
@@ -581,4 +592,171 @@ autopilot undo --session <id> --yes
 
 写后读回验证未完成时显示“等待修改文件读回验证 · 可继续”，既有精确继续词恢复同一 Turn。继续只补 read_file 验证和总结，不重放已完成写入或任意恢复 failed。停止当前 Session/Runtime 的精确 Job 不再弹额外操作审批，外部/不确定 owner 拒绝；全树停止失败仍为 stopping/JOB_STOP_FAILED，不能用包装进程 close 伪造 stopped。
 
+---
+
+## 12. 会话协作（thread）
+
+交互 TUI 在一个inline窗口管理当前Project的平级会话，正文回看使用终端原生滚动。Ctrl+T才按需读取历史目录，每页最多扫描20条元数据记录；目录只显示标题，UUID仅作内部精确路由，重名标题仍选择原UUID。PgDn到已载目录末尾时加载下一页，过滤后空页仍保留继续入口；目录不读transcript/checkpoint、不解析或保留presentation消息，不给未打开普通会话创建Controller/Store/React子树。Node可流式扫描旧Session JSON的结构字节跳过正文，不承诺零正文磁盘字节。Enter仅为精确目标创建视图并读首100条事件；Ctrl+L显式加载下一历史页，到尾后只按末尾游标增量跟进。选择、翻页和切换不执行start/continue/resume，恢复仍用/resume。只挂载当前会话正文；已打开会话保留Store、草稿/附件/光标，隐藏会话不做渲染派生或状态栏查询。
+
+正文仍每页100事件；生产宿主的当前交互直接采用Core安全执行投影，不等待摘要或正文追到尾。旧分页适配器路径仅供未提供统一投影的宿主兼容，不能覆盖已验证当前请求。同Turn恢复立即清旧审批，迟到旧正文只补历史；审批过期或失效给出刷新提示，提交不以放开running代替Core校验。
+
+父任务只有收到Core结构化thread_wait事实才显示等待关联任务/待审批数量；待审批提示Ctrl+A处理，新事实交回父任务时显示正在处理关联结果。关联目标存在本身不改变父执行标签，父等待文案不参与子审批输入许可。
+
+当前会话直接创建/显式关联的有效子审批自动显示带目标标题的真实卡片，同Project普通独立会话不混入。未打开关联目标只增量投影审批、阻塞、Todo及终态等安全状态，不保留回答或工具正文。自动到达的卡不抢输入焦点，主正文、草稿和光标保留。Ctrl+A聚焦首张卡，再按Ctrl+A按到达顺序轮转；Enter提交该卡冻结允许决定，d展开安全详情，PgUp/PgDn翻详情，Esc返回主输入。主会话保持选中，正文在聚焦期间仍可见。快照不足只显示待确认及刷新提示，关联审批交互不会自动切换子会话，Ctrl+T仍用于会话选择。输入通过根唯一订阅路由并在layout提交时绑定当前输入handler，避免切换后被动订阅空窗。
+
+父入口与子自身入口复用同一个Controller/Store和原Session/Turn/approvalId。批准/拒绝沿原Controller提交，Core校验冻结调用、范围、TTL与唯一决定，批准后自动continue原Turn。父入口仅锁定具体审批请求，子consume保留原owner/取消登记，长执行不占父输入。非分组本机继续的dispatch Promise等待该段消费结束。分组已存交互在Core持久接受交接后返回，兼容Runner独立消费原Turn。已有决定撤下可操作旧卡，恢复失败如实展示“审批决定已保存，尚未恢复执行”；Ctrl+A聚焦后Enter重试，按精确原审批身份读取和复用持久决定，不再次提交批准。`controller.resume(expectedApproval?)`可选期望只用于该精确重试，普通/resume沿原恢复规则。Core在领取租约后复核当前执行段，迟到旧恢复不能重放已完成或后续暂停段。
+
+审批继续异常保留`CLI_APPROVAL_CONTINUE_FAILED/<白名单错误码>`阶段标记，即使后续状态校准失败也保留原安全分类。Runner的stderr诊断同时给出`THREAD_HOST_ERROR <封闭类别>/<白名单错误码>`，未知异常回退固定标记，异常正文、cause、路径和凭据不进入这些诊断。
+
+轻量元数据一旦确认关联目标的当前Turn改变、身份未知或已终态，立即在等待历史页前失效旧审批/问答及原地菜单；同Turn仍有效的审批保留，不等分页追赶。Controller/Projector的`invalidateObservedTurn?({turnId?,status})`只清除旧交互/执行身份，不合成事件、不恢复执行；旧提交/事件流/恢复查询的迟到响应不得复活旧状态或继续旧Turn。页返回再次核对原Controller与当前权威身份，结果同步只取原目标Controller当前投影。已打开正文保留为最后观察到的历史，草稿/附件/光标不清除。
+
+
+CLI关联与普通目标的生产状态来自Core统一执行投影；父Ctrl+A和进入子会话引用同一原Session/Turn/approvalId请求，不等待正文101页或交互摘要游标追到尾。当前请求可见性独立于Session/Turn滞后running摘要；已有决定、过期、状态待确认、执行失联与摘要尚未同步均提供明确提示。提交仍走Core当前执行段/冻结输入/范围/TTL/重复校验，切换不授权、也不自动continue。Runner错误在stderr显示THREAD_HOST_ERROR，并在已挂载TUI增加关联任务状态提交失败提示。
+
+首个有效交互即时保存20字输入短标题，首个成功回答沿Web范式取20字更新由本Controller建立的自动标题；手工标题不覆盖，无新模型采样。历史空标题显示“新对话”；交互顶栏、目录、底栏、提示及普通详情均不展示会话UUID，UUID仅在内部寻址及resume/非交互管理场景保留。新建委派目标由共享Core继承创建时当前有效permissionMode偏好，既有/显式ask目标仍可切入审批；不继承具体批准、Trust、凭据或Job，已冻结Turn不追改。
+
+选择只读取既有安全 transcript 与已持久展示消息，不调用 start/continue/resume、不领取 lease。后台输入处理器和鼠标绑定显式关闭，显示隐藏不作为权限门；后台事件按 Session/Turn/seq 去重，仅更新原目标提醒，不抢焦点。审批、steer/queue、取消及恢复提交时固定目标身份，迟到结果写回原会话。新 Thread 只增加目录项，不另开窗口。
+
+Ctrl+C、/exit、EOF 退出整个宿主：先停止观察与自动 queue，再仅取消本 controller/Runner 持有的 running Turn，等待审批/输入保留；仅释放本 owner 未启动的 claimed。stderr 分别陈述确认中断、等待、未交付、可恢复、未确认，不能把前台 Completed 当全部完成或宣称外部副作用已停止。无隐藏 daemon；重开后显式 /resume 或 ap resume 恢复。
+
+
+同机的多个 `ap` 会话可以在同一个 canonical workspace / stateRoot / Project 内协作：用户通过 prompt 表达分工需求，Agent 首次创建子会话时按需建立根组，再投递任务并读取结果；人类启用/停用命令保留为管理接口。**真正的执行只由在线 `ap` 常驻会话持有的 Runner 驱动**；短命令只提交意图或观察事实，不启动隐藏服务、不接管其他窗口的 TTY。
+
+### 12.1 通用约定
+
+- `/resume`遇awaiting_approval且Core不再交付有效approval身份时，只委托原Core重签当前冻结调用审批；不发新任务、不批准或执行工具。已有有效审批仍显示待处理，不通过resume跳过。
+
+- 模型工具 `resume_thread({ threadId, expectedTurnId, groupId? })` 需本次单次确认，所有权限模式都不能跳过；仅恢复精确原 Turn，重复请求不会排入额外run。原审批/问答仍留在目标；旧恢复批准不能跨到同Turn后来一次暂停。accepted 不表示执行开始，`recoveryAction=open_target_continue` 时切入目标使用已有 `/resume`，无需更改状态文件。短命令未新增 `thread resume` 子命令。
+- 中断立即撤下旧审批；失败提交校准 Core 当前状态，过期身份通过原恢复入口重新签发。执行耗时累计共享启动事件到审批/提问/暂停/终态的真实执行段，等待冻结，恢复真实启动后续加；活动、结果与相关状态栏使用一致口径，不修改安全runtimeBudget。
+- CLI 不装配 `open_preview` 或 Intelligent UI。共享 `start_background_job` 在审批前复用纯 serviceUrl 校验，只接受loopback HTTP(S) origin；页面路径属于Web的open_preview.url。前台命令不适合常驻服务，超时先检查执行/端口事实，不能盲重试。
+
+- 组用 `--group <groupId>`、会话用 `--thread <threadId>` 指定；`threadId` 就是 Session ID。
+- 除采用版本 CAS 的 `bind-host` 外，写命令必须显式提供 `--request-id <id>`（调用方生成并保存的 UUID）。相同 requestId 与相同内容重试返回原回执；同键不同内容返回 `THREAD_REQUEST_CONFLICT`，不覆盖原记录。
+- 正文、交接摘要和共享板值从文件或 stdin 读取，避免 shell 引号与转义二次解释。
+- 输出是单行 JSON（`watch` 为每行一条事件 JSON）；错误只写 stderr 的稳定错误码或固定提示，不含宿主路径或底层异常正文。
+- 退出码：`0` 成功；`1` 运行期失败（`THREAD_SCOPE_DENIED`、`THREAD_STATE_CONFLICT`、`THREAD_HANDOFF_WRITE_FAILED` 等）；`2` 参数错误（含 Core `INVALID_INPUT`）；`130`/`143` 表示观察被 SIGINT/SIGTERM 结束。
+- 全局选项 `--state-root`、`--trust-root`、`--workspace-root` 可写在 `thread` 之前或之后；其余选项必须匹配所在子命令。
+- 短命令不启动 Runner，也不探测其他进程是否在线：回执只表示消息已接受，不写“已启动/已完成”。只有宿主能确定离线时才返回 `hostOffline`。
+- 未建立 Project 或协作能力未装配时返回 `THREADS_UNAVAILABLE`；所有协作命令仍需工作区 Trust。
+- 受信普通 Work 新 `start` 在根会话无组时可由首次 `create_thread` 按需建立根组；`continue`、Chat 与协作子会话不会获得该自举权限。组创建来源仍记录真实 thread actor，人类 owner 单独记录；`create_thread` 创建子会话本身不启动 Turn。
+- Web 与 CLI 共用本机人类身份，因此同一 workspace / stateRoot / Project 下 Web 建的组可由 CLI 读取和投递；不同主体、工作区或 Project 仍被拒绝。该固定身份是首版本机单用户约定，不是认证凭据。
+
+### 12.2 `autopilot thread group enable|disable`
+
+```bash
+ap thread group enable --thread <rootThreadId> --request-id <id>
+ap thread group disable --group <groupId> --request-id <id>
+```
+
+- `enable`：为一个空闲 Work 会话建立协作组，并把它作为根成员。会话必须存在、属于当前 Project 且处于 `idle`；重复启用同一根会话返回同组。
+- `disable`：拒绝后续 create/send/state.update/interrupt，保留成员、历史、回执与未交付消息；**不停止正在执行的 Turn**。需要停止时先 `interrupt` 并观察 owner 确认。
+- 输出：`enable` 返回 `group`（含 `groupId`、`rootThreadId`、`enabled`、`allowedTools`、`members`）；`disable` 返回 `{ groupId, enabled: false }`。
+
+### 12.3 `autopilot thread create|associate|list|read|bind-host`
+
+`ap thread associate --group <groupId> --thread <threadId> --request-id <id>` 由已完成 Trust 的本机人类 owner 显式关联已有普通 Work 会话。Core 逐次验证同 workspace/Project、当前状态根 Store、真实 Session 和 owner，幂等重试不重复成员；模型无此关联工具，目标 ID 或创建血缘不产生授权。关联不启动模型。
+
+
+```bash
+ap thread create --group <groupId> --thread <parentThreadId> --request-id <id> [--title <t>] [--role <label>] [--model <provider/modelId>] [--effort <none|low|medium|high|max>]
+ap thread list --group <groupId> [--cursor <c>] [--limit <n>]
+ap thread read --group <groupId> --thread <threadId> [--cursor <c>] [--limit <n>]
+```
+
+- `create`：在组内创建正常 Work Session 并绑定成员；创建**不启动推理**。`--thread` 是父会话，必须是组成员。`--model`/`--effort` 只能从宿主当前目录选择，非法值返回 `MODEL_NOT_FOUND` 或参数错误。输出含 `threadId`、`groupId`、`parentThreadId` 与 Web 相对链接。
+- `list`：分页返回本组成员及当前组 `revision`（默认 20，最大 100），成员保留可选 `executionHost`。
+- `read`：只读安全投影，返回会话摘要、最近 Turn、最近助手消息与有界历史；**不 resume、不启动、不确认已读**。
+- `--cursor` 由上一次输出原样带回；跨视图、跨组或过期游标返回 `THREAD_CURSOR_INVALID`。
+
+`ap thread bind-host --group <groupId> --thread <threadId> --expected-revision <revision> --execution-host <cli-work-v1|web-work-v1>` 用于人类确认尚无执行事实，或原执行权威completed且没有活动owner/claim的歧义旧目标。可先用 `ap session list` 取得会话id，再用 `ap thread group of --thread <id>` 只读取得groupId/revision，随后执行 `ap thread list --group <groupId>`，从同次结果取得目标和 `revision`，再明确选择执行档位。成功返回目标、档位和协议版本。此命令以 `expectedRevision` 做 CAS，版本变化后重新读取并确认。参数错误沿用 usage 退出码，权限/状态错误沿用协作错误映射。活动 owner、已知档位和无法证明兼容的旧执行事实受 Core 保护。模型没有绑定入口，命令自身不启动 Runner。
+
+CLI capability、交互与短命令的人类 Facade、模型协作和 Runner 共用 `cli-work-v1`，Web 使用 `web-work-v1`。已有有效归属和原 Turn 冻结能力保持，跨端查看与投递保留目标档位。缺档位旧记录经执行证据和组 CAS 补齐，无法消歧时具名宿主保持等待。直接启动和恢复也遵守相同兼容门禁。
+
+### 12.4 `autopilot thread send`
+
+```bash
+ap thread send --group <groupId> --thread <threadId> --mode <notify|run|steer> --request-id <id> \
+  (--message-file <path> | --message-stdin) [--reply-to <messageId>] [--expected-turn-id <turnId>] \
+  [--handoff-title <title> --handoff-file <path>]
+```
+
+- `--mode` 必填，语义固定：`notify` 只投递通知，不启动空闲目标；`run` 由在线 Runner 启动下一 Turn（目标忙时排到后续 Turn）；`steer` 只进入发送时匹配的活动 Turn。
+- 正文二选一：`--message-file <path>` 或 `--message-stdin`（配合管道）。空正文在投递前拒绝。
+- `steer` 必须给 `--expected-turn-id`；其他模式禁止该字段。Turn 已变化返回 `THREAD_TURN_MISMATCH`，目标空闲返回 `THREAD_NOT_RUNNING`，不降级成新 Turn。
+- 交接（可选，仅 `--mode run`）：`--handoff-title` 与 `--handoff-file` 必须成对提供。宿主先原子写入 `<workspace>/.autopilot/thread-passdown-<handoffId>.md`，再接受消息；文件失败或内容冲突时不投递、不启动目标，返回 `THREAD_HANDOFF_WRITE_FAILED` / `THREAD_HANDOFF_CONFLICT`。交接只用于用户明确要求“换会话继续当前任务”。
+- 输出：`messageId`、`deliverySeq`、`deliveryStatus`（接受即 `pending`），交接成功时另有 `handoffRef`。接受不等于目标已执行或任务完成。
+
+### 12.5 `autopilot thread wait|watch`
+
+```bash
+ap thread wait --group <groupId> --thread <id> [--thread <id> ...] [--cursor <threadId>=<cursor> ...] [--task <threadId>=<messageId> ...] [--timeout-ms <n>]
+ap thread watch --group <groupId> [--cursor <c>] [--limit <n>]
+```
+
+- `wait`：只观察 1–8 个不同目标的进展、完成、失败或需关注状态，**不启动、不恢复、不取消**任何目标；`--timeout-ms` 取 0–30000（默认 30000）。没有游标时立即返回当前快照；带上游标后等待变化。Ctrl+C 只结束本次等待。
+- `watch`：按组事件序列持续输出 JSON 行（`member_created`、`message_accepted/delivered/blocked`、`shared_state_changed`、`turn_attention/terminal` 等）。Ctrl+C 只断开观察，不停止任何目标。
+
+指定 `--task <threadId>=<messageId>` 时只等待该次 run 任务，taskId 等于 send 回执的 messageId；每个 --thread 最多指定一个 task。任务等待只取对应 delivery/真实消费 Turn，目标后续用户新 Turn 不混入；游标绑定 task，不能跨任务复用。省略 --task 仍为显式会话级观察，不能据其 latest 状态推断原委派完成。会话累计 pendingProgress 保持包含已淘汰摘要的语义，任务视图只计该任务（同样包含已淘汰条目）。
+
+### 12.6 `autopilot thread state read|set|remove`
+
+```bash
+ap thread state read --group <groupId>
+ap thread state set --group <groupId> --request-id <id> --expected-revision <n> --key <k> (--value <json> | --value-file <path>)
+ap thread state remove --group <groupId> --request-id <id> --expected-revision <n> --key <k>
+```
+
+- 共享板只承载用户显式放入的 JSON（目标、约束、结论、引用等），不承载凭据、审批、checkpoint 或宿主绝对路径。
+- 写入必须给 `--expected-revision`；版本不匹配返回 `THREAD_STATE_CONFLICT` 并附当前 revision，调用方需重新读取后重试，不自动合并。
+- `--value` 必须是合法 JSON；复杂内容用 `--value-file` 读取，避免命令行转义问题。
+
+### 12.7 `autopilot thread interrupt`
+
+```bash
+ap thread interrupt --group <groupId> --thread <threadId> --expected-turn-id <turnId> --request-id <id>
+```
+
+向当前 owner 提交中断意图并返回 `{ accepted, controlId, hostOffline }`；**接受不等于已停止**，实际终态需用 `read` 或 `wait` 查询。Turn 不匹配返回 `THREAD_TURN_MISMATCH`，目标没有运行中 Turn 返回 `THREAD_NOT_RUNNING`。
+
+### 12.8 常驻宿主与退出
+
+- 交互 `ap` 会话（含 `chat`/`resume`）会在启动时发现当前状态根下已启用的协作组，并接管本进程的 Runner；没有组时保持轻量复查，不产生执行轮询。
+- 关闭或退出该 `ap` 会话会停止本进程持有的驱动：已取消与未确认的 Turn 数量写到 stderr（`thread runner stopped: cancelled=<n> unconfirmed=<n>`），不会把未完成任务写成成功。
+- 另一个窗口的短命令与 `watch` 只读取同一份持久事实；执行仍取决于是否有在线且已授权的 `ap` 宿主。
+
+示例（正文从文件读取，避免 shell 重新解释）：
+
+```bash
+ap thread send --group <groupId> --thread <threadId> --mode run --request-id <uuid> --message-file ./task.md
+ap thread send --group <groupId> --thread <threadId> --mode run --request-id <uuid> --message-file ./continue.md --handoff-title "交接当前任务" --handoff-file ./handoff.md
+printf '%s' "$PROMPT" | ap thread send --group <groupId> --thread <threadId> --mode notify --request-id <uuid> --message-stdin
+```
+
 Job 的 running 指包装进程运行，缺少原生 ready 协议时目标状态未知；安全 read/list 的 execution 可带执行阶段、关闭信号及 reported Win32 错误码。Windows 宿主执行 Job（`sandbox.execution: "host"`）没有包装进程，spawn 的子进程即目标本身，`phase` 为 `host_running` / `host_spawn_failed`，停止以进程树终止加 close 观察为实际证据。
+
+终端尺寸由最外层界面统一采集和提交给Ink，当前正文只消费分配宽高，不能把正文列宽上限当作物理宽度回写。resize主动重排，输出代理只通知Ink失效缓存，不旁路清屏或定时整屏刷新。交互采用inline原生滚动，输入框不参与弹性压缩；视觉行派生按词和完整grapheme顺序处理，ANSI为零宽原子，避免长文本每行重扫/重包剩余全文。
+
+普通会话切入后的审批卡与关联原地卡共用有界安全详情区域和底部固定允许决定；长原因/命令不会把允许/拒绝移出屏幕，PgUp/PgDn只滚动审批详情，Esc只收起当前审批详情而不取消Turn。关闭会话侧栏后下一次独立按键按实时面板/Session身份接收，不依赖Ink旧订阅闭包及时刷新；同事件消费标记继续防止切换Enter/关闭Esc穿透。
+
+### 历史结构化问答与持久恢复
+
+新 CLI 任务继续使用纯文本澄清。目标会话存在历史结构化问题时，按 Core 安全题目逐题输入选项编号或自定义文本，纯数字自定义使用 `其他 <内容>`。问题输入期间 `@` 按原样保存，不打开文件候选或扩展文件内容，也不登记为新任务 Prompt。提交绑定原 Session/Turn/requestId，异步查询遇到请求换代时拒绝旧输入。Core 校验失败后重新显示权威当前问题。
+
+`/resume` 对未答问题显示逐题入口，已答问题复用原 requestId 和持久答案。审批决定与答案分别显示保存事实。已启用协作组通过 Core requestInteractionContinuation 交给兼容宿主，离线时显示等待并提示保持或启动对应 Web/CLI 宿主，`/resume` 可重试原请求。后续真实执行与终态单独观察。旧分页兼容入口消费真实 `question_required` 事件。
+
+### 根输入与轻量观察
+
+Ctrl+A优先聚焦关联待审批或可重试的已存决定卡，无审批但存在等待问题时打开关联列表并定位问题目标，Enter进入该会话回答。BOUNDARY_CHANGED表示执行结果未确认，提供核对提示并关闭自动恢复卡。Ctrl+T独立管理会话查看。新卡到达保留父正文、草稿、附件和光标，焦点只随显式输入改变。
+
+根handleSessionList固定当前模式和目标，通过同步ref及layout输入桥处理按键。目录加载期间只缓存同一模式代次的列表按键，反复打开复用Manager同一个在途目录读取，过期回调失效。关闭根面板后的输入桥补齐当前目标的提交间隙，其他覆盖视图已消费的输入不排入prompt。裸Esc先由现有Ink解码，同chunk的Meta组合沿原解码语义。
+
+周期刷新只给当前选中正文读取一页，普通隐藏历史保留Controller/Store/草稿和游标，重选后从原游标补齐。关联活动读取安全交互投影。选择或停止会话会取消原状态查询，Core安全投影的分页与main关联摘要循环响应同一signal，迟到结果不提交到新目标。目录仍按需分页，查看保持只读语义。
+
+
+`ap thread group of --thread <id>` 是既有Core人类Facade.groupOf的只读CLI薄映射，返回协议版本、可选group与安全revision。旧归属错误在交互与普通命令输出中提示这条发现路径及bind-host完整参数。通过list的同次revision确认目标，选择cli-work-v1或web-work-v1后，使用兼容宿主正常开始该Session的新任务。等待审批/问答、中断、未知副作用及活动owner继续沿原恢复规则，completed绑定不会继续原Turn。
+
+### 实机修复后的 inline 输出与命名失败
+
+稳定 prompt 和终态内容由单窗口唯一 Static 追加，切会话及缩窗不重挂历史所有者。同一 Turn 恢复后的终态仅追加新事件段。活动内容显示最新尾部，完整终态写入终端原生历史；输入行有界但草稿与光标保留，审批决定区独立显示，长详情用 PgUp/PgDn 查看。关联审批默认提示，Ctrl+A 聚焦一张卡，循环切换目标；新卡不抢输入。等待审批不播放动画，运行态共享时钟为 120ms。
+
+自动标题是附属步骤：只有 STATE_STORAGE_UNAVAILABLE 且重新读取后的完整会话事实（除 title/updatedAt）相同、Work 身份有效、无活动 Turn 且可开始新任务，才保留原记录继续，并提示标题未保存。schema、安全路径、身份变化、读取失败或消失均拒绝降级；不新增存储重试。TUI 存储失败显示稳定码和固定提示，内部诊断不会投影给模型或 Web。

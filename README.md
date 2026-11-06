@@ -52,7 +52,7 @@ flowchart TB
 需要 Node.js `>=20.11.0 <22`，建议 Node 20.20.2 与 npm 10。
 
 ```bash
-npm install -g autopilot-agent@0.2.0
+npm install -g autopilot-agent@0.3.0
 ap --help
 ```
 
@@ -84,9 +84,9 @@ node apps/cli/dist/main.js --help
 | [@autopilot-agent/presentation](packages/presentation/README.md) | 共享安全事件投影、时间线、分组和展示文案 |
 | [apps/web](apps/web/README.md) | Next.js 本地 Chat / Work 界面，源码运行，不作为 npm 应用分发 |
 
-源码与五个 npm 包当前版本均为 **0.2.0**；Web 仍仅通过源码运行。详见 [更新日志](CHANGELOG.md)。
+源码与五个 npm 包当前版本均为 **0.3.0**；Web 仍仅通过源码运行。详见 [更新日志](CHANGELOG.md)。
 
-Web Work 新增内置预览面板及 `open_preview`：模型只准备导航，不读取或验证网页；Chat/CLI 不提供此工具。预览与后台 Job 绑定由宿主核验，仍需完整浏览器与 Provider 实机验收。
+CLI 支持单窗口多会话与主子 Thread 会话，可分派任务、沟通消息、汇报进展并集中处理审批。Web 支持 Thread 协议，创建平行会话并发处理任务，保持主控上下文；Chat 支持 Intelligent UI，动态展示图表、表格、选项、时间线和步骤。
 
 ## 文档
 
@@ -97,6 +97,28 @@ Web Work 新增内置预览面板及 `open_preview`：模型只准备导航，�
 - [源码启动与使用](agent/doc/HowToUse.md)
 
 必要测试、配置及合成 fixture 随源码提供。真实 env、凭据、会话/数据库和内部运行记录不公开。
+
+## 0.3.0 示例截图
+
+<p align="center">
+  <img src=".github/Autopilot-0.3.0-cli-collaboration.png" alt="Autopilot 0.3.0 CLI 主子会话协作" width="960"><br>
+  <em>CLI 主子会话协作</em>
+</p>
+
+<p align="center">
+  <img src=".github/Autopilot-0.3.0-chat-charts.png" alt="Intelligent UI" width="960"><br>
+  <em>Intelligent UI</em>
+</p>
+
+<p align="center">
+  <img src=".github/Autopilot-0.3.0-web-approval.png" alt="Autopilot 0.3.0 Web Work 子会话审批提示" width="960"><br>
+  <em>Web Work 子会话审批提示</em>
+</p>
+
+<p align="center">
+  <img src=".github/Autopilot-0.3.0-web-progress.png" alt="Autopilot 0.3.0 Web Work 协作进展" width="960"><br>
+  <em>Web Work 协作进展</em>
+</p>
 
 ## 界面截图
 

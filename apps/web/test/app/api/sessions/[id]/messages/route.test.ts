@@ -9,6 +9,7 @@ const mocks = vi.hoisted(function createCompactRouteMocks() {
     getSessionMessages: vi.fn(),
     getSharedWebRuntime: vi.fn(),
     persistCompactionRecord: vi.fn(),
+    turnHostStart: vi.fn(),
     WebRouteError: TestWebRouteError,
   };
 });
@@ -34,7 +35,12 @@ vi.mock("@/lib/session-store", function mockSessionStore() {
     getSessionMeta: mocks.getSessionMeta,
     getSessionMessages: mocks.getSessionMessages,
     updatePinnedSkills: vi.fn(),
+    updateSessionPermissionMode: vi.fn(),
   };
+});
+
+vi.mock("@/lib/workspace-host/web-workspace-session", function mockWorkspaceSession() {
+  return { requireWorkspaceTurnHost: () => ({ start: mocks.turnHostStart }) };
 });
 
 vi.mock("@/lib/session-attachment-store", function mockAttachmentStore() {
@@ -43,7 +49,14 @@ vi.mock("@/lib/session-attachment-store", function mockAttachmentStore() {
 
 vi.mock("@/lib/composition-root", function mockCompositionRoot() {
   return {
-    getDefaultWebCompositionRoot: vi.fn(),
+    getDefaultWebCompositionRoot: vi.fn(function getDefaultWebCompositionRootMock() {
+      return {
+        prepareTurnContext: async function prepareTurnContext() { return undefined; },
+        resolveSelectedSkills: async function resolveSelectedSkills() { return { skills: [], pinnedSkills: [], diagnostics: [] }; },
+        createAttachmentInstruction: function createAttachmentInstruction() { return undefined; },
+        createSelectedSkillsInstruction: function createSelectedSkillsInstruction() { return undefined; },
+      };
+    }),
     getSharedWebRuntime: mocks.getSharedWebRuntime,
   };
 });
@@ -170,5 +183,71 @@ describe("POST /api/sessions/:id/messages compact", function compactRouteSuite()
     const payload = await response.json();
     expect(payload).toMatchObject({ outcome: "skipped", reason: "no_compactable_history", contextUsage: usageFixture });
     expect(mocks.persistCompactionRecord).not.toHaveBeenCalled();
+  });
+});
+
+/** 构造普通发送请求。 */
+function createSendRequest(body: Record<string, unknown>): Request {
+  return new Request("http://localhost/api/sessions/session-1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ content: "任务", clientMessageId: "fixture-input-01", ...body }),
+  });
+}
+
+describe("POST /api/sessions/:id/messages 权限模式", function permissionModeSuite() {
+  beforeEach(function resetPermissionMocks() {
+    vi.clearAllMocks();
+    mocks.readRequestObject.mockImplementation(async function readBody(request: Request) { return await request.json(); });
+    mocks.getSessionMeta.mockResolvedValue({ id: "session-1", title: "T", createdAt: 1, updatedAt: 1 });
+    mocks.getSessionMessages.mockResolvedValue([]);
+    mocks.getSharedWebRuntime.mockResolvedValue({
+      turns: { getState: vi.fn().mockResolvedValue({ turn: null, checkpoint: null }) },
+      inbox: { post: vi.fn() },
+    });
+    mocks.turnHostStart.mockReturnValue(undefined);
+  });
+
+  it("合法权限模式随 runConfig 启动并持久化为会话缺省", async function persistsPermissionMode() {
+    const { updateSessionPermissionMode } = await import("@/lib/session-store");
+    const response = await POST(createSendRequest({ permissionMode: "auto_approve" }), { params: Promise.resolve({ id: "session-1" }) });
+    expect(response.status).toBe(202);
+    expect(mocks.turnHostStart).toHaveBeenCalledTimes(1);
+    expect(mocks.turnHostStart.mock.calls[0]![0]!.runConfig).toMatchObject({ permissionMode: "auto_approve" });
+    expect(updateSessionPermissionMode).toHaveBeenCalledWith(expect.anything(), "session-1", "auto_approve");
+  });
+
+  it("缺省权限模式为 ask，未知值拒绝且不持久化", async function rejectsUnknownPermissionMode() {
+    const { updateSessionPermissionMode } = await import("@/lib/session-store");
+    const defaulted = await POST(createSendRequest({}), { params: Promise.resolve({ id: "session-1" }) });
+    expect(defaulted.status).toBe(202);
+    expect(mocks.turnHostStart.mock.calls[0]![0]!.runConfig).toMatchObject({ permissionMode: "ask" });
+    expect(updateSessionPermissionMode).not.toHaveBeenCalled();
+
+    const rejected = await POST(createSendRequest({ permissionMode: "yolo" }), { params: Promise.resolve({ id: "session-1" }) });
+    expect(rejected.status).toBe(500);
+    expect(updateSessionPermissionMode).not.toHaveBeenCalled();
+    expect(mocks.turnHostStart).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("POST /api/sessions/:id/messages 暂停任务", function pausedTurnSuite() {
+  beforeEach(function resetPausedMocks() {
+    vi.clearAllMocks();
+    mocks.readRequestObject.mockImplementation(async function readBody(request: Request) { return await request.json(); });
+    mocks.getSessionMeta.mockResolvedValue({ id: "session-1", title: "T", createdAt: 1, updatedAt: 1 });
+    mocks.getSessionMessages.mockResolvedValue([]);
+    mocks.getSharedWebRuntime.mockResolvedValue({
+      turns: { getState: vi.fn().mockResolvedValue({ turn: { id: "turn-1", status: "interrupted" }, checkpoint: { turnId: "turn-1", status: "interrupted" } }) },
+      inbox: { post: vi.fn() },
+    });
+    mocks.turnHostStart.mockReturnValue(undefined);
+  });
+
+  it("暂停会话发新输入返回 409 active_turn_paused 并引导恢复", async function rejectsPausedTurnWithGuidance() {
+    const response = await POST(createSendRequest({}), { params: Promise.resolve({ id: "session-1" }) });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ code: "active_turn_paused", error: "当前任务已暂停；点击「继续执行」恢复，或新建任务" });
+    expect(mocks.turnHostStart).not.toHaveBeenCalled();
   });
 });

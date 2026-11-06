@@ -25,6 +25,7 @@ import type {
   ChatAttachmentView,
   InputDeliveryNotice,
   ContextUsageView,
+  TurnUsageSummaryView,
   SelectedSkill,
 } from "../chat-page-types";
 
@@ -45,6 +46,7 @@ class HistoryStageError extends Error {
 const MAX_HISTORY_AUTO_RETRY = 3;
 
 interface UseSessionConversationOptions {
+  active?: boolean;
   workspaceId: string;
   sessionId: string;
   isChat: boolean;
@@ -57,8 +59,8 @@ interface UseSessionConversationOptions {
 const getWorkspaceSessionUrl = sessionApiUrl;
 
 /** 承接原 ChatPageContent 的 History/SSE/Turn 生命周期逻辑；语句顺序、请求体与依赖数组保持不变。 */
-export function useSessionConversation({ workspaceId, sessionId, isChat, notifyNewProgress, setSelectedSkills, setPinnedSkills }: UseSessionConversationOptions) {
-  const { manager } = useSessionTaskContext();
+export function useSessionConversation({ workspaceId, sessionId, isChat, active = false, notifyNewProgress, setSelectedSkills, setPinnedSkills }: UseSessionConversationOptions) {
+  const { manager, invalidateThreadDirectory } = useSessionTaskContext();
   const [messages, setMessages] = useState<Message[]>([]);
   const [presentation, setPresentation] = useState<AgentPresentationState>(createPresentationState);
   const [activity, setActivity] = useState<WebActivityState | undefined>();
@@ -75,6 +77,8 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
   const [resumePendingSessionId, setResumePendingSessionId] = useState<string | null>(null);
   /** Core 最新安全 Context Usage 快照；undefined 表示无可用展示事实，绝不表现为 0%。 */
   const [contextUsage, setContextUsage] = useState<ContextUsageView | undefined>();
+  /** Core 最近 Turn 的累计用量汇总（输入/输出/总量与执行段耗时）；undefined 表示无可用展示事实。 */
+  const [turnUsage, setTurnUsage] = useState<TurnUsageSummaryView | undefined>();
   /** 当前 URL 选中的 Session；旧 Session 的异步 SSE/History 不能回写新 Session。 */
   const currentSessionIdRef = useRef(sessionId);
   // eslint-disable-next-line react-hooks/refs -- 模式自原 page.tsx 原样迁入：每次渲染同步刷新 Session 身份，供异步回调读取最新值。
@@ -114,7 +118,12 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
   const awaitingUserInputRef = useRef(false);
   /** 执行代次：开始/停止/继续各自认领一段执行，旧请求的 finally 只能清理自己的执行段（H2）。 */
   const executionEpochRef = useRef(0);
-  const queueExecutionRequestedRef = useRef(false);
+  const streamSeqRef = useRef<Record<string, number>>({});
+  const streamVersionRef = useRef(0);
+  const executionFactRef = useRef<{ epoch: number; turnId: string } | null>(null);
+  const frameEpochRef = useRef(0);
+  const waitingInteractionIdentityRef = useRef<string | undefined>(undefined);
+  const queuedFollowUpTurnIdRef = useRef<string | null>(null);
   const presentationFrameBatcherRef = useRef<WebPresentationFrameBatcher | null>(null);
   const presentationFrameBatcherKeyRef = useRef("");
 
@@ -137,15 +146,29 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
     setPresentation((current) => current.transport === transport ? current : reduceWebTransportEvent(current, transport));
   }
 
+  /** 只在真实交互身份变化时推进执行代次，重复事件/History不会使当前提交失效。 */
+  function markInteractionEpoch(sid: string, turnId: string, requestId: string | undefined): void {
+    if (!requestId) return;
+    const identity = JSON.stringify([sid, turnId, requestId]);
+    if (waitingInteractionIdentityRef.current !== identity) {
+      waitingInteractionIdentityRef.current = identity;
+      executionEpochRef.current++;
+    }
+  }
+
   /** Keep a paused turn cancellable even though its original SSE request has already closed. */
-  function markAwaitingApproval(sid: string, turnId: string): void {
+  function markAwaitingApproval(sid: string, turnId: string, approvalId?: string): void {
+    markInteractionEpoch(sid, turnId, approvalId ? `approval:${approvalId}` : undefined);
+    awaitingUserInputRef.current = false;
     awaitingApprovalRef.current = true;
     activeTurnRef.current = { sessionId: sid, turnId };
     setActiveTurnId(turnId);
   }
 
   /** 保持等待结构化回答的 Turn 可取消，原始 SSE 已正常结束也不释放控制权。 */
-  function markAwaitingUserInput(sid: string, turnId: string): void {
+  function markAwaitingUserInput(sid: string, turnId: string, requestId?: string): void {
+    markInteractionEpoch(sid, turnId, requestId ? `question:${requestId}` : undefined);
+    awaitingApprovalRef.current = false;
     awaitingUserInputRef.current = true;
     activeTurnRef.current = { sessionId: sid, turnId };
     setActiveTurnId(turnId);
@@ -175,9 +198,10 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
   /** 将同一帧内的连续 delta 按到达顺序一次性交给 Activity 与 Presentation reducer。 */
   function applyPresentationDeltaFrame(events: Array<Record<string, unknown>>): void {
     const targetSessionId = currentSessionIdRef.current;
-    if (!targetSessionId || events.length === 0) return;
+    if (!targetSessionId || events.length === 0 || frameEpochRef.current !== executionEpochRef.current) return;
     const turnId = events[events.length - 1]?.turnId;
     if (typeof turnId !== "string") return;
+    markRunning(targetSessionId, turnId);
     activeTurnRef.current = { sessionId: targetSessionId, turnId };
     setActiveTurnId(turnId);
     notifyNewProgress();
@@ -219,26 +243,30 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
   }
 
   /** 首次 History 恢复失败时安排有界自动重试；返回 true 表示已调度本次重试，调用方不得覆盖成终态错误提示。 */
-  function scheduleHistoryAutoRetry(sid: string): boolean {
+  function scheduleHistoryAutoRetry(sid: string, observation = false): boolean {
     const previous = historyAutoRetryRef.current;
     const count = previous && previous.sid === sid ? previous.count : 0;
     if (count >= MAX_HISTORY_AUTO_RETRY) return false;
     historyAutoRetryRef.current = { sid, count: count + 1 };
     window.setTimeout(function retryHistoryLoad() {
       if (currentSessionIdRef.current !== sid || currentWorkspaceIdRef.current !== workspaceId) return;
-      void loadHistory(sid);
+      void loadHistory(sid, undefined, observation);
     }, 500 * 2 ** count);
     return true;
   }
 
   // 加载历史消息
-  const loadHistory = useCallback(async (sid: string, prefetchedData?: SessionHistoryPayload) => {
-    if (currentSessionIdRef.current !== sid || currentWorkspaceIdRef.current !== workspaceId) return false;
+  const loadHistory = useCallback(async function loadHistory(sid: string, prefetchedData?: SessionHistoryPayload, observation = false, signal?: AbortSignal) {
+    if (signal?.aborted || currentSessionIdRef.current !== sid || currentWorkspaceIdRef.current !== workspaceId) return false;
+    if (observation && !prefetchedData && requestAbortRef.current) return false;
     const controller = getSessionController(sid);
     const requestId = controller.beginHistoryRequest();
-    const isCurrentRequest = () => controller.isLatestHistoryRequest(requestId) && currentSessionIdRef.current === sid && currentWorkspaceIdRef.current === workspaceId;
-    // Session 变化与所有失败路径先清空旧 Context Usage，再应用当前请求结果，避免旧 Session 值泄漏。
+    const requestEpoch = executionEpochRef.current;
+    const streamVersion = streamVersionRef.current;
+    const isCurrentRequest = () => !signal?.aborted && executionEpochRef.current === requestEpoch && streamVersionRef.current === streamVersion && controller.isLatestHistoryRequest(requestId) && currentSessionIdRef.current === sid && currentWorkspaceIdRef.current === workspaceId;
+    // Session 变化与所有失败路径先清空旧 Context Usage / Turn Usage，再应用当前请求结果，避免旧 Session 值泄漏。
     setContextUsage(undefined);
+    setTurnUsage(undefined);
     if (!sid) {
       transportDisconnectedRef.current = false;
       setMessages([]);
@@ -268,7 +296,7 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
       if (!data) {
         let res: Response;
         try {
-          res = await fetch(getWorkspaceSessionUrl(workspaceId, sid)!);
+          res = await fetch(getWorkspaceSessionUrl(workspaceId, sid)!, { signal });
         } catch {
           throw new HistoryStageError("fetch");
         }
@@ -292,7 +320,7 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
           clearActiveTurn();
           setLoading(false);
           // 首次恢复失败自动再次获取历史；穷尽后保留提示，不让会话静默空白。
-          if (!canRetry || !scheduleHistoryAutoRetry(sid)) {
+          if (!canRetry || !scheduleHistoryAutoRetry(sid, observation)) {
             const retryCount = historyAutoRetryRef.current?.sid === sid ? historyAutoRetryRef.current.count : 0;
             console.warn("[useSessionConversation] History load failed", { phase: "http", status: res.status, sessionId: sid, retryCount });
             setHistoryError({ phase: "http", status: res.status, message: failure.error || `历史记录加载失败（HTTP ${res.status}）`, manualRetry: false });
@@ -307,10 +335,13 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
       }
       if (!isCurrentRequest()) return false;
       const restoredPresentation = (data.presentation as AgentPresentationState | undefined) ?? createPresentationState();
+      if (Object.entries(streamSeqRef.current).some(function newer([key, seq]) { return key.startsWith(JSON.stringify([workspaceId, sid]).slice(0, -1) + ",") && (restoredPresentation.lastSeqByTurn[JSON.parse(key)[2]] ?? 0) < seq; })) return false;
+      for (const [turn, seq] of Object.entries(restoredPresentation.lastSeqByTurn)) streamSeqRef.current[JSON.stringify([workspaceId, sid, turn])] = seq;
       if (isChat && data.meta.productMode !== "chat") { setReadOnlyReason("会话身份不匹配"); return false; }
       setSessionMeta(data.meta);
       setReadOnlyReason(data.readOnlyReason);
       setContextUsage(data.contextUsage ?? undefined);
+      setTurnUsage(data.turnUsage ?? undefined);
       setChatAttachments(isChat ? data.attachments ?? [] : []);
       setHistoryReady(true);
       setHistoryError(null);
@@ -330,36 +361,40 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
       setActivity(Number.isFinite(restoredStart) && restoredActiveOperation ? { turnId: restoredPresentation.turnId, startedAt: restoredStart, phase: "waiting", lastProgressAt: Date.now(), hasActiveTool: restoredActiveOperation.kind === "tool", stallable: false } : undefined);
       const restoredPins = (data.meta as SessionMeta).pinnedSkills ?? [];
       setPinnedSkills(restoredPins);
-      setSelectedSkills(restoredPins.map((skill) => ({ skillRef: skill.skillRef, pinned: true })));
+      if (!observation || sessionMetaIdRef.current !== sid) setSelectedSkills(restoredPins.map((skill) => ({ skillRef: skill.skillRef, pinned: true })));
       manager.updateRuntimeState(createWorkspaceSessionKey(workspaceId, sid), data.meta.runtimeStatus, data.meta.activeTurnId ?? agent?.turnId);
-      const recoverableTurnId = agent?.recoverable && (agent.status === "interrupted_recoverable" || agent.status === "limit_reached")
+      const continuationPending = Boolean(agent?.continuation && ["pending", "claimed", "executing"].includes(agent.continuation.state));
+      const continuationUnconfirmed = (agent?.status === "awaiting_approval" || agent?.status === "awaiting_user_input") && agent.continuation?.failureCode === "BOUNDARY_CHANGED";
+      const recoverableTurnId = agent?.recoverable && !continuationUnconfirmed && (agent.status === "interrupted_recoverable" || agent.status === "limit_reached" || (agent.status === "awaiting_approval" && (!agent.approvalId || agent.interactionState === "decided")) || (agent.status === "awaiting_user_input" && (agent.interactionState === "decided" || continuationPending && agent.requestId)))
         ? agent.turnId
         : undefined;
-      const mapped: Message[] = data.messages.map(function mapMessage(m) { return mapHistoryMessage(m, agent, recoverableTurnId); });
+      const mapped: Message[] = data.messages.map(function mapMessage(m) { return { ...mapHistoryMessage(m, agent, recoverableTurnId), ...(m.turnId === agent?.turnId && agent?.requestId ? { questionRequestId: agent.requestId } : {}) }; });
       const restoredPendingInputs = (data.pendingInputs as PendingAgentInput[] | undefined) ?? [];
       const restoredTurnId = typeof data.turnId === "string" ? data.turnId : restoredPresentation.turnId;
-      const hasRestoredActiveTurn = Boolean(restoredActiveOperation && restoredTurnId);
+      const hasRestoredActiveTurn = Boolean(restoredActiveOperation && restoredTurnId && (!agent?.execution || agent.execution === "active"));
       setPendingInputs(restoredPendingInputs);
       pendingInputsRef.current = restoredPendingInputs;
       joinedInputIdsRef.current = new Set(restoredPresentation.items.flatMap(function consumed(item) { return item.kind === "input_notice" && item.state !== "queued" ? [item.inputId] : []; }));
       historyInputIdsRef.current = new Set(data.messages.flatMap(function queued(message) { return message.role === "user" && message.turnId && message.clientRecordId?.startsWith("input:") ? [message.clientRecordId.slice(6)] : []; }));
       for (const inputId of historyInputIdsRef.current) joinedInputIdsRef.current.add(inputId);
       setInputDeliveryNotice(null);
-      setResumePendingSessionId(!isChat && !data.readOnlyReason && data.canAutoStartNext === true && restoredPendingInputs.length > 0 ? sid : null);
-      if (agent?.status === "awaiting_approval" || agent?.status === "awaiting_user_input") {
-        if (agent.status === "awaiting_approval") markAwaitingApproval(sid, agent.turnId);
-        else markAwaitingUserInput(sid, agent.turnId);
-        if (!mapped.some((message) => message.turnId === agent.turnId)) mapped.push({ id: `agent-turn-${agent.turnId}`, role: "assistant", content: "", turnId: agent.turnId });
+      setResumePendingSessionId(!observation && !isChat && !data.readOnlyReason && data.canAutoStartNext === true && restoredPendingInputs.length > 0 ? sid : null);
+      if ((agent?.status === "awaiting_approval" && agent.approvalId && (!agent.interactionState || agent.interactionState === "pending")) || agent?.status === "awaiting_user_input") {
+        setLoading(false);
+        if (agent.status === "awaiting_approval") markAwaitingApproval(sid, agent.turnId, agent.approvalId);
+        else markAwaitingUserInput(sid, agent.turnId, agent.requestId);
+        if (!mapped.some((message) => message.role === "assistant" && message.turnId === agent.turnId)) mapped.push({ id: `agent-turn-${agent.turnId}`, role: "assistant", content: "", createdAt: Date.parse(restoredPresentation.turnStartedAt[agent.turnId] ?? "") || undefined, turnId: agent.turnId });
       } else if (hasRestoredActiveTurn) {
         activeTurnRef.current = { sessionId: sid, turnId: restoredTurnId! };
         setActiveTurnId(restoredTurnId!);
         setLoading(true);
-        if (!mapped.some((message) => message.turnId === restoredTurnId)) mapped.push({ id: `agent-turn-${restoredTurnId}`, role: "assistant", content: "", turnId: restoredTurnId, activity: "answer" });
+        if (!mapped.some((message) => message.role === "assistant" && message.turnId === restoredTurnId)) mapped.push({ id: `agent-turn-${restoredTurnId}`, role: "assistant", content: "", createdAt: Date.parse(restoredPresentation.turnStartedAt[restoredTurnId!] ?? "") || undefined, turnId: restoredTurnId, activity: "answer" });
       } else {
         clearActiveTurn();
         setLoading(false);
-        if (agent && !mapped.some((message) => message.turnId === agent.turnId)) mapped.push({
+        if (agent && !mapped.some((message) => message.role === "assistant" && message.turnId === agent.turnId)) mapped.push({
           id: `agent-turn-${agent.turnId}`,
+          createdAt: Date.parse(restoredPresentation.turnStartedAt[agent.turnId] ?? "") || undefined,
           role: "assistant",
           content: "",
           turnId: agent.turnId,
@@ -367,8 +402,10 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
           canContinue: Boolean(recoverableTurnId && agent.recoverable),
         });
       }
+      const stateNotice = continuationUnconfirmed ? "原决定或答案已保存，执行结果未确认，请先核对原任务状态" : continuationPending ? `${agent?.status === "awaiting_user_input" ? "答案" : "审批决定"}已保存，等待兼容宿主继续原任务` : agent?.interactionState === "decided" ? `${agent.status === "awaiting_user_input" ? "答案" : "审批决定"}已保存，${agent.continuation?.state === "failed" ? "继续失败，可重试原请求" : "等待兼容宿主继续原任务"}` : agent?.interactionState === "expired" ? "审批已过期，请继续任务刷新审批" : agent?.interactionState === "unconfirmed" ? "交互状态待确认，请稍后刷新" : agent?.warning === "summary_lag" ? "执行状态尚未同步，当前审批仍待处理" : agent?.execution === "lost" ? "执行已失联，结果未确认" : agent?.execution === "unconfirmed" ? "执行状态待确认，结果未确认" : undefined;
+      if (stateNotice && agent) mapped.push({ id: `execution-notice-${agent.turnId}`, role: "assistant", content: stateNotice, turnId: agent.turnId, canContinue: Boolean(recoverableTurnId && agent.recoverable), questionRequestId: agent.requestId });
       setMessages((current) => mergeHistoryIntoChatMessages(current, mapped));
-      notifyNewProgress();
+      if (!observation) notifyNewProgress();
       transportDisconnectedRef.current = false;
       historyAutoRetryRef.current = null;
       return true;
@@ -397,7 +434,7 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
       // 首次恢复失败自动再次获取历史；穷尽后保留提示，不让会话静默空白。
       const stage = error instanceof HistoryStageError ? error.stage : "mapping";
       const canRetry = shouldRetryHistoryFailure(stage);
-      if (!canRetry || !scheduleHistoryAutoRetry(sid)) {
+      if (!canRetry || !scheduleHistoryAutoRetry(sid, observation)) {
         const retryCount = historyAutoRetryRef.current?.sid === sid ? historyAutoRetryRef.current.count : 0;
         console.warn("[useSessionConversation] History load failed", { phase: stage, sessionId: sid, retryCount });
         const message = canRetry ? "历史记录自动重试后仍未加载成功，请刷新页面重试" : "历史记录加载失败，请刷新页面重试";
@@ -408,17 +445,38 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
   // eslint-disable-next-line react-hooks/exhaustive-deps -- controller 以当前已挂载 Session 为键，不能因父级重渲染重新触发 History。
   }, [notifyNewProgress, workspaceId]);
 
+  /** 新运行事实统一撤下本Turn旧恢复标记；accepted响应不调用这里。 */
+  function markRunning(sid: string, turnId: string): void {
+    executionFactRef.current = { epoch: executionEpochRef.current, turnId };
+    awaitingApprovalRef.current = false;
+    awaitingUserInputRef.current = false;
+    setLoading(true);
+    manager.updateRuntimeState(createWorkspaceSessionKey(workspaceId, sid), "running", turnId);
+    setMessages(function resumed(current) { return current.map(function target(item) { return item.role === "assistant" && item.turnId === turnId ? { ...item, activity: "answer", canContinue: false, recoveryError: undefined, termination: undefined, stopState: undefined, questionRequestId: undefined } : item; }); });
+  }
+
   /** 将 Agent SSE 交给共享 Presentation reducer；页面只处理连接、队列和终态控制。 */
   function applyAgentStreamEvent(messageId: string, sid: string, data: Record<string, unknown>): void {
-    if (currentSessionIdRef.current !== sid || currentWorkspaceIdRef.current !== workspaceId) return;
+    if (currentSessionIdRef.current !== sid || currentWorkspaceIdRef.current !== workspaceId || (typeof data.sessionId === "string" && data.sessionId !== sid)) return;
     const turnId = typeof data.turnId === "string" ? data.turnId : undefined;
+    if (!isChat && turnId && data.type === "tool_result" && data.toolName === "create_thread" && (data.result as { status?: unknown } | undefined)?.status === "success" && Number.isSafeInteger(data.seq)) {
+      invalidateThreadDirectory?.(workspaceId, sid, turnId, data.seq as number);
+    }
     const cancelled = Boolean(turnId && cancelledTurnIdsRef.current.has(turnId));
     const terminal = data.type === "turn_completed" || data.type === "turn_failed" || data.type === "turn_interrupted" || data.type === "turn_limit_reached";
     if (cancelled && !terminal) return;
     const sessionKey = createWorkspaceSessionKey(workspaceId, sid);
     const currentTurnId = manager.getSessionSnapshot(sessionKey)?.activeTurnId;
-    if (terminal && currentTurnId && turnId && currentTurnId !== turnId) return;
+    if (currentTurnId && turnId && currentTurnId !== turnId) return;
+    if (turnId && Number.isSafeInteger(data.seq)) {
+      const key = JSON.stringify([workspaceId, sid, turnId]);
+      if ((data.seq as number) <= (streamSeqRef.current[key] ?? 0)) return;
+      streamSeqRef.current[key] = data.seq as number;
+    }
+    streamVersionRef.current++;
     if (isWebPresentationDelta(data)) {
+      if (frameEpochRef.current !== executionEpochRef.current) presentationFrameBatcherRef.current?.cancel();
+      frameEpochRef.current = executionEpochRef.current;
       streamingMessageIdRef.current = messageId;
       getPresentationFrameBatcher().enqueue(data);
       return;
@@ -431,6 +489,7 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
       setActiveTurnId(turnId);
       setMessages((current) => current.map((message) => message.id === messageId ? { ...message, turnId, activity: "answer" } : message));
     }
+    if (turnId && !cancelled && ["turn_started", "step_started", "tool_call", "tool_result", "answer", "reasoning_summary"].includes(String(data.type))) markRunning(sid, turnId);
     if (data.type === "turn_started") {
       manager.updateRuntimeState(sessionKey, "running", turnId);
       // 新 Turn 开始即视为用户活动，清除上一轮残留的 History 错误条。
@@ -444,7 +503,13 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
     }
     if (data.type === "turn_failed") {
       // Host 已构建并持久化的 DTO 直接沿用；只有裸错误文本才重新分类（沙箱类别不降级）。
-      const failure = isWebTurnFailure(data.failure) ? data.failure : toWebTurnFailure(data.error ?? data.failure);
+      const failure = isWebTurnFailure(data.failure) ? data.failure : toWebTurnFailure(data.error ?? data.failure, data.errorCode, {
+        feedbackId: data.feedbackId,
+        failureStage: data.failureStage,
+        providerHttpStatus: data.providerHttpStatus,
+        providerFailureReason: data.providerFailureReason,
+        providerFailureDetail: data.providerFailureDetail,
+      });
       setMessages((current) => current.map((message) => message.id === messageId ? { ...message, failure } : message));
       manager.updateRuntimeState(sessionKey, "failed");
       manager.applyTerminalEvent(sessionKey, "turn_failed");
@@ -464,14 +529,33 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
       // Core 已在安全边界脱敏；usage 为 null 表示明确清空旧状态。
       const usage = data.usage;
       setContextUsage(usage && typeof usage === "object" ? usage as ContextUsageView : undefined);
+      // turnUsage 字段缺省（旧事件/compact 直发事件）表示无新事实，保留已有展示，不清空。
+      if ("turnUsage" in data) {
+        const turnUsageValue = data.turnUsage;
+        setTurnUsage(turnUsageValue && typeof turnUsageValue === "object" ? turnUsageValue as TurnUsageSummaryView : undefined);
+      }
       return;
     }
     setActivity((current) => reduceWebActivityState(current, data));
     setPresentation((current) => reduceWebPresentationEvent(current, data, sid));
-    if ((data.type === "input_joined" || data.type === "input_consumed") && typeof data.inputId === "string") removeConsumedPendingInput(data.inputId);
-    if (data.type === "approval_required" && turnId) markAwaitingApproval(sid, turnId);
-    if (data.type === "question_required" && turnId) markAwaitingUserInput(sid, turnId);
-    if (data.type === "turn_completed") queueExecutionRequestedRef.current = true;
+    if ((data.type === "input_joined" || data.type === "input_consumed") && typeof data.inputId === "string") {
+      removeConsumedPendingInput(data.inputId);
+      // 实时协作输入正文和来源只能从受信Inbox历史恢复，SSE不接受客户端自报来源。
+      if (data.type === "input_joined") void loadHistory(sid, undefined, true);
+    }
+    if (data.type === "approval_required" && turnId) {
+      const approval = (data.result as { approval?: { approvalId?: unknown } } | undefined)?.approval;
+      markAwaitingApproval(sid, turnId, typeof approval?.approvalId === "string" ? approval.approvalId : undefined);
+      setMessages(function newApproval(current) { return current.map(function target(item) { return item.turnId === turnId ? { ...item, activity: undefined, canContinue: false, recoveryError: undefined, termination: undefined, stopState: undefined } : item; }); });
+      setLoading(false);
+    }
+    if (data.type === "question_required" && turnId) {
+      markAwaitingUserInput(sid, turnId, typeof data.requestId === "string" ? data.requestId : undefined);
+      setMessages(function newQuestion(current) { return current.map(function target(item) { return item.turnId === turnId ? { ...item, questionRequestId: undefined, canContinue: false, recoveryError: undefined } : item; }); });
+      setLoading(false);
+    }
+    // 只记录完成身份：排队 Turn 的调度与启动由宿主完成，页面随后只读发现。
+    if (data.type === "turn_completed") queuedFollowUpTurnIdRef.current = turnId ?? null;
     if (data.type === "turn_completed" || data.type === "turn_interrupted" || data.type === "turn_failed" || data.type === "turn_limit_reached") {
       // SSE 终态已由 Web 服务端 DTO 白名单化；客户端只消费 Core 已确认的可恢复字段。
       const termination = data.termination as SessionAgentState["termination"];
@@ -483,6 +567,7 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
         activity: undefined,
         canContinue,
         recoveryError: undefined,
+        stopState: undefined,
         // 新终态整体覆盖旧 termination：完成/失败不带 termination 时清掉上一段恢复留下的旧停止提示（P17 问题2）。
         termination,
       } : message));
@@ -509,10 +594,15 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
 
   /** 消费任意 Agent SSE；空闲尾流以同 Turn 的服务端终态做有界校准，并返回收口结果供调用方决定 History fallback。 */
   async function consumeAgentStream(response: Response, messageId: string, sid: string): Promise<SessionTaskStreamOutcome> {
+    const epoch = executionEpochRef.current;
+    const targetWorkspace = workspaceId;
+    /** 消费期间新审批、停止或切换会话使旧流失效。 */
+    function currentStream(): boolean { return executionEpochRef.current === epoch && currentSessionIdRef.current === sid && currentWorkspaceIdRef.current === targetWorkspace; }
     try {
       return await getSessionController(sid).consume(response, messageId, {
+        shouldApplyEvent: currentStream,
         getTerminalSnapshot: function readDurableTerminal(turnId) { return getDurableTerminalSnapshot(sid, turnId); },
-        applyTerminalSnapshot: function restoreDurableTerminal(_turnId, snapshot) { return loadHistory(sid, snapshot as SessionHistoryPayload); },
+        applyTerminalSnapshot: function restoreDurableTerminal(_turnId, snapshot) { return currentStream() ? loadHistory(sid, snapshot as SessionHistoryPayload, true) : Promise.resolve(false); },
       });
     } finally {
       presentationFrameBatcherRef.current?.flush();
@@ -522,9 +612,10 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
   /** URL 切换后始终加载目标 Session；旧发送请求由 Session 身份校验阻止回写。进入会话时重置自动重试预算。 */
   useEffect(function loadSelectedSessionHistory() {
     if (sessionId && locallyCreatedSessionRef.current === sessionId) return;
+    if (!active && sessionMetaIdRef.current === sessionId) return;
     historyAutoRetryRef.current = null;
-    void loadHistory(sessionId);
-  }, [workspaceId, sessionId, loadHistory]);
+    void loadHistory(sessionId, undefined, true);
+  }, [workspaceId, sessionId, active, loadHistory]);
 
   useEffect(function syncPendingInputsRef() {
     pendingInputsRef.current = pendingInputs;
@@ -553,6 +644,7 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
     inputDeliveryNotice, setInputDeliveryNotice,
     resumePendingSessionId, setResumePendingSessionId,
     contextUsage, setContextUsage,
+    turnUsage, setTurnUsage,
     currentSessionIdRef,
     currentWorkspaceIdRef,
     requestAbortRef,
@@ -568,7 +660,8 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, notifyN
     awaitingApprovalRef,
     awaitingUserInputRef,
     executionEpochRef,
-    queueExecutionRequestedRef,
+    executionFactRef,
+    queuedFollowUpTurnIdRef,
     getSessionController,
     setTransportState,
     markAwaitingUserInput,

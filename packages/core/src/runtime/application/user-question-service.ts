@@ -109,7 +109,7 @@ export function createUserQuestionService(dependencies: {
 }
 
 /** 归一化并校验模型提出的问题，拒绝未冻结的多选与伪造 Other 选项。 */
-function normalizeQuestions(questions: UserQuestionItem[]): UserQuestionItem[] {
+export function normalizeQuestions(questions: UserQuestionItem[]): UserQuestionItem[] {
   if (!Array.isArray(questions) || questions.length < 1 || questions.length > 3) {
     throw new AgentRuntimeError("QUESTION_ANSWER_INVALID", "问题数量必须在 1 到 3 之间");
   }

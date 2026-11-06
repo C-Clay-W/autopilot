@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import type { CreateProjectInput, Project, ProjectStore } from "@autopilot-agent/core";
 import { atomicReplace, readJsonFile, safeFilePath, withFileLock } from "../file-utils";
-import { ensureNodeStateRoot, getNodeStatePaths } from "../state-root";
+import { assertNodeStateSchema, ensureNodeStateRoot, getNodeStatePaths } from "../state-root";
 import type { NodeStoreOptions } from "../types";
 
 /** 创建基于共享状态根的 ProjectStore。 */
@@ -26,8 +26,8 @@ export function createNodeProjectStore(options: NodeStoreOptions): ProjectStore 
 
   return {
     async get(id: string): Promise<Project | null> {
-      ensureDir();
-      return withFileLock(filePath(id), () => readJsonFile<Project>(filePath(id)));
+      assertNodeStateSchema(paths.root);
+      return readJsonFile<Project>(filePath(id));
     },
 
     async save(project: Project): Promise<void> {
@@ -38,8 +38,9 @@ export function createNodeProjectStore(options: NodeStoreOptions): ProjectStore 
     },
 
     async list(): Promise<Project[]> {
-      ensureDir();
+      assertNodeStateSchema(paths.root);
       const projects: Project[] = [];
+      if (!fs.existsSync(paths.projectsDir)) return projects;
       for (const file of fs.readdirSync(paths.projectsDir).filter((entry) => entry.endsWith(".json"))) {
         const project = readJsonFile<Project>(filePath(file.slice(0, -5)));
         if (project) projects.push(project);

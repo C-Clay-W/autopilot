@@ -4,6 +4,17 @@ export interface HttpFailure {
   message: string;
 }
 
+/** Work/Chat 共用状态升级错误文案；异常路径、备份和底层正文只留在宿主侧。 */
+export const STATE_HTTP_FAILURES: Readonly<Record<string, HttpFailure>> = {
+  STATE_SCHEMA_VERSION_UNSUPPORTED: { status: 409, message: "状态数据格式不受当前版本支持，请更新程序后重试；现有数据已保留" },
+  STATE_SCHEMA_BUSY: { status: 409, message: "状态数据正在使用或升级，请停止其他运行实例后重试" },
+  STATE_SCHEMA_MIGRATION_FAILED: { status: 409, message: "状态数据升级未完成，原数据和恢复备份已保留，请停止其他运行实例后重试；仍失败请联系支持" },
+  STATE_SCHEMA_MIGRATION_MISSING: { status: 409, message: "当前程序缺少此状态版本的升级步骤，请更新程序后重试；现有数据已保留" },
+  STATE_SCHEMA_RECOVERY_REQUIRED: { status: 409, message: "状态数据需要恢复，原数据已保留，请停止其他运行实例后重试；仍失败请联系支持" },
+  STATE_SCHEMA_MANIFEST_CORRUPTED: { status: 409, message: "状态版本信息已损坏，现有数据已保留，请联系支持恢复" },
+  STATE_SCHEMA_VERSION_INVALID: { status: 409, message: "状态版本信息无效，现有数据已保留，请联系支持恢复" },
+};
+
 /** Web 自有请求/入口错误；领域失败继续由其原有错误类表达。 */
 export class WebRouteError extends Error {
   /** 保存封闭的入口错误码和标准堆栈，不承载底层异常正文。 */

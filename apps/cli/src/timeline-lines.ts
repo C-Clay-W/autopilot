@@ -1,7 +1,6 @@
 /** TUI 时间线视觉行模型；统一文字换行、样式片段与源文本坐标，暂不接入渲染。 */
 
 import stringWidth from "string-width";
-import wrapAnsi from "wrap-ansi";
 
 /** 时间线原始文本的样式范围；坐标使用 JavaScript 字符串偏移。 */
 export interface TimelineTextSpan {
@@ -50,37 +49,37 @@ function clipTimelineSpans(spans: TimelineTextSpan[], sourceStart: number, sourc
   });
 }
 
-/** 找到包含给定偏移的完整 Unicode grapheme，避免换行截断组合 emoji。 */
-function getTimelineGraphemeEnd(source: string, offset: number): number {
-  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
-  for (const segment of segmenter.segment(source)) {
-    const end = segment.index + segment.segment.length;
-    if (segment.index < offset && offset < end) return end;
-  }
-  return offset;
-}
+const timelineSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
-/** 复用现有 wrap-ansi 规则生成视觉行，同时把被截断的 grapheme 收拢到同一行。 */
+/** 一次按词与grapheme顺序换行；ANSI为零宽原子，源坐标不含合成控制序列。 */
 function wrapTimelineSource(source: string, columns: number): Array<{ text: string; sourceStart: number; sourceEnd: number }> {
   const lines: Array<{ text: string; sourceStart: number; sourceEnd: number }> = [];
+  let lineStart = 0;
   let offset = 0;
-  while (offset < source.length) {
-    const newline = source.indexOf("\n", offset);
-    const sourceEnd = newline < 0 ? source.length : newline;
-    const remaining = source.slice(offset, sourceEnd);
-    if (remaining.length === 0) {
-      lines.push({ text: "", sourceStart: offset, sourceEnd: offset });
-      offset = newline < 0 ? source.length : newline + 1;
-      continue;
-    }
-    const candidate = wrapAnsi(remaining, columns, { hard: true, trim: false, wordWrap: true }).split("\n")[0] ?? remaining;
-    const candidateEnd = getTimelineGraphemeEnd(source, offset + candidate.length);
-    const visualEnd = Math.min(sourceEnd, Math.max(offset + 1, candidateEnd));
-    lines.push({ text: source.slice(offset, visualEnd), sourceStart: offset, sourceEnd: visualEnd });
-    offset = visualEnd;
-    if (offset === sourceEnd && newline >= 0) offset += 1;
+  let width = 0;
+  /** 只切源字符串一次，不从头扫描已处理的grapheme。 */
+  function emit(end: number): void {
+    lines.push({ text: source.slice(lineStart, end), sourceStart: lineStart, sourceEnd: end });
+    lineStart = end; width = 0;
   }
-  if (source.endsWith("\n")) lines.push({ text: "", sourceStart: source.length, sourceEnd: source.length });
+  const tokens = source.matchAll(/\n| |[^ \n]+/gu);
+  for (const token of tokens) {
+    const word = token[0];
+    if (word === "\n") { emit(offset); offset++; lineStart = offset; continue; }
+    const wordWidth = stringWidth(word);
+    if (word === " " && width >= columns) emit(offset);
+    else if (word !== " " && width > 0 && (wordWidth <= columns ? width + wordWidth > columns : Math.floor((wordWidth - 1) / columns) < Math.floor((wordWidth - (columns - width) - 1) / columns) + 1)) emit(offset);
+    const segments = timelineSegmenter.segment(word);
+    let local = 0;
+    while (local < word.length) {
+      const escape = word.charCodeAt(local) === 27 ? /^(?:\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007]*(?:\u0007|\u001b\\))/u.exec(word.slice(local))?.[0] : undefined;
+      const character = escape ?? (word.charCodeAt(local) >= 32 && word.charCodeAt(local) < 127 && (local + 1 === word.length || word.charCodeAt(local + 1) < 127) ? word[local]! : segments.containing(local)!.segment);
+      const characterWidth = escape ? 0 : stringWidth(character);
+      if (width > 0 && width + characterWidth > columns) emit(offset);
+      width += characterWidth; local += character.length; offset += character.length;
+    }
+  }
+  if (offset > lineStart || source.endsWith("\n")) emit(offset);
   return lines;
 }
 

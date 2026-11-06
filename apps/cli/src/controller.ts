@@ -6,15 +6,22 @@
  * 生成 callId、toolName、normalizedInputHash 或冻结工具输入。
  */
 
+import { createCliSessionTitle, getCliSessionDisplayTitle } from "./session-title.js";
+import { recordTuiRuntimeErrorDiagnostic } from "./tui/performance-diagnostics.js";
+import { classifyCliError } from "./error-diagnostics.js";
 import { randomUUID } from "node:crypto";
-import { AgentRuntimeError } from "@autopilot-agent/core";
+import { AgentRuntimeError, normalizeWorkImage } from "@autopilot-agent/core";
+import { createNodeSessionImageStore } from "@autopilot-agent/adapters";
 import type {
   AgentEvent,
+  AgentEventEnvelope,
   ApprovalDecision,
   ContextUsageView,
   ContinueTurnInput,
   ReasoningEffort,
   StartTurnInput,
+  AgentMessage,
+  SessionImageRef,
 } from "@autopilot-agent/core";
 import { createCliEventProjector } from "./event-projector.js";
 import { formatPlainContextReport } from "./context-report.js";
@@ -43,6 +50,11 @@ import type {
 
 /** 让 Ink 在连续微任务事件之间获得一次绘制机会，避免回答结束后才整段出现。 */
 const CLI_RENDER_YIELD_EVERY_ANSWER_EVENTS = 4;
+
+/** 将已受信存储的图片身份与用户正文组合为可恢复的消息。 */
+function createImageMessage(content: string, images: SessionImageRef[]): AgentMessage {
+  return { role: "user", content: [{ type: "text", text: content }, ...images.map(function toImage(image) { return { type: "image-ref" as const, id: image.id, sha256: image.sha256, width: image.width, height: image.height }; })] };
+}
 
 /** 只有成功完成的 Turn 才自动领取 queue；失败、中断和达到上限都保留给用户处理。 */
 const CLI_QUEUE_CLAIMABLE_STATUSES: ReadonlySet<CliTurnStatus> = new Set<CliTurnStatus>(["completed"]);
@@ -115,6 +127,8 @@ export interface CreateCliControllerOptions {
   /** 读取已热更新的安全 Runtime 默认值；仅用于 idle/Completed 状态栏，不参与 Turn 冻结。 */
   getRuntimeStatusDefaults?: () => CliRuntimeStatusDefaults;
   onEvent?: CliEventListener;
+  /** 普通执行与现有 Runner 共享 owner 索引；不因前台选择转移 owner。 */
+  registerExecution?(input: { threadId: string; turnId: string; cancel(): void }): { activate(): void; release(): void };
   /** 自动启动 queue Turn 前通知交互 TUI，避免等待 prompt 残留在底部。 */
   onQueuedInputStarted?: CliQueuedInputStartedListener;
   now?: () => Date;
@@ -124,10 +138,18 @@ export interface CreateCliControllerOptions {
 export interface CliController {
   dispatch(action: CliAction): Promise<CliControllerResult>;
   consume(events: AsyncIterable<AgentEvent>): Promise<CliControllerResult>;
-  resume(): Promise<CliControllerResult>;
+  resume(expectedApproval?: { turnId: string; approvalId: string }): Promise<CliControllerResult>;
+  /** 只读回放安全事件，不领取输入、执行lease或恢复Turn。 */
+  observe?(events: readonly AgentEventEnvelope[]): void;
+  /** 只读权威身份改变时失效旧交互与在途结果，不恢复或执行。 */
+  invalidateObservedTurn?(input: { turnId?: string; status: CliTurnStatus }): void;
+  /** 同步权威当前交互，不改变正文回放游标。 */
+  syncObservedInteraction?(input: { turnId: string; status: CliTurnStatus; approval?: AgentEventEnvelope; requestId?: string }): void;
+  isExecuting?(): boolean;
+  beginShutdown?(): void;
   getProjection(): CliProjection;
   /** 读取当前 Session 默认或活动 Turn frozen 的脱敏状态栏视图。 */
-  getStatusView?(): Promise<CliStatusView>;
+  getStatusView?(input?: { signal?: AbortSignal }): Promise<CliStatusView>;
   setSession(sessionId: string): void;
   setEventListener(listener?: import("./types.js").CliEventListener): void;
   /** 绑定 queue Turn 启动通知；Plain 宿主不需要注册。 */
@@ -137,10 +159,17 @@ export interface CliController {
 /** 创建无 React 依赖的 Controller；Renderer 和 Runtime 均通过参数注入。 */
 export function createCliController(options: CreateCliControllerOptions): CliController {
   const projector = createCliEventProjector({ sessionId: options.sessionId, now: options.now });
+  let observationGeneration = 0;
   let eventListener = options.onEvent;
   let queuedInputListener = options.onQueuedInputStarted;
   let sessionId = options.sessionId;
   let turnId: string | undefined;
+  let executing = 0;
+  let stopping = false;
+  let statusRevision = 0;
+  let statusQuery: { sessionId?: string; turnId?: string; generation: number; revision: number; subscribers: Set<AbortSignal | undefined>; promise: Promise<CliStatusView> } | undefined;
+  const automaticTitles = new Map<string, string>();
+  const cancellationRequests = new Set<string>();
   let pendingUndoTurnId: string | undefined;
   let selectedSkills: Array<{ skillId: string; contentHash: string; qualifiedName: string }> = [];
 
@@ -206,24 +235,64 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
     return (await options.runtime.sessions.get(sessionId)) ?? undefined;
   }
 
+  /** 每Controller最多一个在途读取；各调用方独立取消，旧身份完成后才允许新身份查询。 */
+  async function getStatusView(input: { signal?: AbortSignal } = {}): Promise<CliStatusView> {
+    if (input.signal?.aborted || stopping) throw new DOMException("Status query no longer active", "AbortError");
+    if (statusQuery && (statusQuery.sessionId !== sessionId || statusQuery.turnId !== turnId || statusQuery.generation !== observationGeneration || statusQuery.revision !== statusRevision)) {
+      await statusQuery.promise.catch(function ignoreInvalidated() {});
+      return getStatusView(input);
+    }
+    if (!statusQuery) {
+      const query = { sessionId, turnId, generation: observationGeneration, revision: statusRevision, subscribers: new Set<AbortSignal | undefined>([input.signal]), promise: undefined as unknown as Promise<CliStatusView> };
+      statusQuery = query;
+      query.promise = readStatusView(query).finally(function releaseQuery() { if (statusQuery === query) statusQuery = undefined; });
+    } else statusQuery.subscribers.add(input.signal);
+    const query = statusQuery;
+    const next = await query.promise;
+    if (input.signal?.aborted || query.sessionId !== sessionId || query.turnId !== turnId || query.generation !== observationGeneration || query.revision !== statusRevision) throw new DOMException("Status query no longer active", "AbortError");
+    return next;
+  }
+
   /** 读取当前状态栏的脱敏配置；活动 Turn 优先使用 frozen 值。 */
-  async function getStatusView(): Promise<CliStatusView> {
-    const session = await getSession();
+  async function readStatusView(query: NonNullable<typeof statusQuery>): Promise<CliStatusView> {
+    /** 在每个异步边界拦住已失效调用方；已开始的同步解析不能取消。 */
+    function assertCurrent(): void {
+      if (stopping || query.sessionId !== sessionId || query.turnId !== turnId || query.generation !== observationGeneration || query.revision !== statusRevision || ![...query.subscribers].some(function active(signal) { return !signal?.aborted; })) {
+        throw new DOMException("Status query no longer active", "AbortError");
+      }
+    }
+    assertCurrent();
+    const targetSessionId = query.sessionId;
+    const targetTurnId = query.turnId;
+    const session = targetSessionId && options.runtime?.sessions ? (await options.runtime.sessions.get(targetSessionId)) ?? undefined : undefined;
+    assertCurrent();
     const sessionConfig = session?.defaultRunConfig;
     const runtimeDefaults = options.getRuntimeStatusDefaults?.() ?? {};
     const currentProjection = projector.getProjection();
-    const isActive = (currentProjection.status === "running" || currentProjection.status === "waiting_approval") && Boolean(sessionId && turnId);
-    const frozen = isActive && options.runtime && sessionId && turnId
-      ? await options.runtime.turns.getFrozenRunConfig({ sessionId, turnId })
+    const isActive = (currentProjection.status === "running" || currentProjection.status === "waiting_approval") && Boolean(targetSessionId && targetTurnId);
+    const frozen = isActive && options.runtime && targetSessionId && targetTurnId
+      ? await options.runtime.turns.getFrozenRunConfig({ sessionId: targetSessionId, turnId: targetTurnId })
       : undefined;
+    assertCurrent();
     const hasSessionDefaults = Boolean(sessionConfig && Object.keys(sessionConfig).length > 0);
     const labels = getConfigLabels(frozen ?? { ...runtimeDefaults, ...sessionConfig });
     const sessionPermission = sessionConfig?.permissionMode ?? runtimeDefaults.permissionMode ?? "ask";
     const nextLabels = getConfigLabels({ ...runtimeDefaults, ...sessionConfig });
-    // 无 Runtime/Session 时省略字段；测试 double 缺 turns 或 getContextUsage 能力时同样跳过；查询失败 fail closed 为 null（unknown），不伪造 0%。
-    const contextUsage = session && options.runtime?.turns && typeof options.runtime.turns.getContextUsage === "function"
-      ? await options.runtime.turns.getContextUsage({ sessionId: session.id }).catch(function failClosed() { return null; })
-      : undefined;
+    const turns = options.runtime?.turns;
+    // 新Runtime在同一checkpoint上生成两个投影；旧能力保持兼容，边界间仍检查取消。
+    let contextUsage: CliStatusView["contextUsage"];
+    let turnUsage: CliStatusView["turnUsage"];
+    if (session && turns && typeof turns.getUsageSnapshot === "function") {
+      const usage = await turns.getUsageSnapshot({ sessionId: session.id }).catch(function failClosed() { return { contextUsage: null, turnUsage: null }; });
+      assertCurrent();
+      contextUsage = usage.contextUsage;
+      turnUsage = usage.turnUsage;
+    } else if (session && turns) {
+      contextUsage = typeof turns.getContextUsage === "function" ? await turns.getContextUsage({ sessionId: session.id }).catch(function failClosed() { return null; }) : undefined;
+      assertCurrent();
+      turnUsage = typeof turns.getTurnUsageSummary === "function" ? await turns.getTurnUsageSummary({ sessionId: session.id }).catch(function failClosed() { return null; }) : undefined;
+      assertCurrent();
+    }
     return {
       ...labels,
       workspaceRoot: options.workspaceRoot,
@@ -232,6 +301,7 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
       nextModel: frozen && nextLabels.model !== labels.model ? nextLabels.model : undefined,
       nextEffort: frozen && nextLabels.effort !== labels.effort ? nextLabels.effort : undefined,
       contextUsage,
+      turnUsage,
     };
   }
 
@@ -309,29 +379,78 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
       ...(session.defaultRunConfig ?? {}),
       permissionMode: mode,
     });
+    statusRevision++;
     const statusView = await getStatusView();
     const isActive = statusView.source === "turn_frozen";
     const suffix = isActive ? "；当前 Turn 保持 frozen，下一个 Turn 生效" : "；下一个 Turn 生效";
     return result("ok", 0, [`permission: ${permissionLabel(mode)} (${mode})${suffix}`], { statusView });
   }
 
+  let titleWarning: string | undefined;
+
+  /** 首次交互立即存短输入兜底；仅更新本controller建立且尚未手工改名的自动标题。 */
+  async function updateSessionTitle(targetSessionId: string, content: string, provisional: boolean): Promise<void> {
+    const sessions = options.runtime?.sessions;
+    if (!sessions?.get || !sessions.rename) return;
+    const session = await sessions.get(targetSessionId);
+    if (!session) return;
+    const automatic = automaticTitles.get(targetSessionId);
+    const empty = getCliSessionDisplayTitle(session.title, session.id) === "新对话" && (!session.title?.trim() || session.title === session.id);
+    if (provisional ? !empty : !automatic || session.title !== automatic) return;
+    const title = createCliSessionTitle(content);
+    try { await sessions.rename(targetSessionId, title); }
+    catch (error) {
+      recordTuiRuntimeErrorDiagnostic(error);
+      if (classifyCliError(error).code !== "STATE_STORAGE_UNAVAILABLE") throw error;
+      const persisted = await sessions.get(targetSessionId);
+      // 仅标题/更新时间允许变化，其余持久身份与执行事实必须逐字段保持一致。
+      const before = { ...session, title: undefined, updatedAt: undefined };
+      const after = persisted ? { ...persisted, title: undefined, updatedAt: undefined } : undefined;
+      if (!persisted || persisted.id !== targetSessionId || persisted.productMode !== "work" || !persisted.projectId
+        || !["idle", "completed", "failed"].includes(persisted.status) || persisted.activeTurnId
+        || JSON.stringify(before) !== JSON.stringify(after)) throw error;
+      titleWarning = "STATE_STORAGE_UNAVAILABLE：自动标题未保存，已核对原会话身份，任务继续；可稍后手动重命名";
+      return;
+    }
+    if (provisional) automaticTitles.set(targetSessionId, title);
+    else automaticTitles.delete(targetSessionId);
+  }
+
   /** 消费一段 Core AgentEvent，统一补本地 seq、归约和渲染。 */
   async function consume(events: AsyncIterable<AgentEvent>): Promise<CliControllerResult> {
+    const generation = observationGeneration;
     const lines: string[] = [];
+    const targetSessionId = sessionId;
     await consumeStream(events, lines);
+    if (generation !== observationGeneration) return result("error", 2, [], "CLI_TURN_IDENTITY_CHANGED");
+    const completed = projector.getProjection();
+    if (targetSessionId && sessionId === targetSessionId && completed.status === "completed" && completed.answer.trim()) await updateSessionTitle(targetSessionId, completed.answer, false);
     // Turn 到达终态后自动领取遗留 queue 输入启动新 Turn；对齐 Web start_next 的 claim→consume→start 语义。
     await drainQueuedInputs(lines).catch(function ignoreDrainFailure(error) {
       // 领取是 best-effort 增强；任何失败都不应把已完成的 Turn 翻转为错误退出码。
       lines.push(`queued input drain skipped: ${error instanceof Error ? error.message : String(error)}`);
     });
+    if (titleWarning) { lines.push(titleWarning); titleWarning = undefined; }
     return result("ok", 0, lines);
   }
 
   /** 消费一个事件流并把渲染行追加到同一 lines；不改变调用方的结果语义。 */
   async function consumeStream(events: AsyncIterable<AgentEvent>, lines: string[]): Promise<void> {
+    const generation = observationGeneration;
     let answerEventsSinceYield = 0;
+    let owner: ReturnType<NonNullable<CreateCliControllerOptions["registerExecution"]>> | undefined;
+    executing += 1;
+    try {
     for await (const event of events) {
+      if (generation !== observationGeneration) continue;
       turnId = event.turnId;
+      if (event.type === "turn_started" && sessionId) cancellationRequests.delete(JSON.stringify([sessionId, turnId]));
+      if (!owner && sessionId && options.registerExecution) {
+        const ownedSession = sessionId;
+        const ownedTurn = event.turnId;
+        owner = options.registerExecution({ threadId: ownedSession, turnId: ownedTurn, cancel: async function cancelOwnedExecution() { await options.runtime?.turns.cancel({ sessionId: ownedSession, turnId: ownedTurn }); } });
+        owner.activate();
+      }
       const previousCount = projector.getProjection().events.length;
       const projected = projector.project(event);
       if (projected.added) {
@@ -354,11 +473,12 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
         }
       }
     }
+    } finally { executing -= 1; owner?.release(); }
   }
 
   /** Turn 终态后领取遗留排队输入并启动新 Turn；CLI 无 start_next 按钮，不领取则排队输入永久滞留。 */
   async function drainQueuedInputs(lines: string[]): Promise<void> {
-    if (!sessionId || !options.runtime) return;
+    if (!sessionId || !options.runtime || stopping) return;
     const inbox = options.runtime.inbox;
     // 测试 double 或宿主未注入可用 inbox（缺 claimNext 能力）时跳过领取，不影响主流程。
     if (!inbox || typeof inbox.claimNext !== "function") return;
@@ -366,6 +486,11 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
       if (!CLI_QUEUE_CLAIMABLE_STATUSES.has(projector.getProjection().status)) return;
       const claimed = await inbox.claimNext({ sessionId });
       if (!claimed) return;
+      const queuedImages = claimed.attachments.length && options.workspaceRoot
+        ? await Promise.all(claimed.attachments.map(async function resolveImage(attachment) { return (await createNodeSessionImageStore(options.workspaceRoot!).read({ sessionId: sessionId!, id: attachment.id })).image; }))
+        : [];
+      if (claimed.attachments.length && queuedImages.length !== claimed.attachments.length) throw new Error("会话图片不可用");
+      if (claimed.attachments.some(function mismatched(attachment, index) { return attachment.sha256 && (queuedImages[index]?.sha256 !== attachment.sha256 || queuedImages[index]?.bytes !== attachment.bytes || queuedImages[index]?.width !== attachment.width || queuedImages[index]?.height !== attachment.height); })) throw new Error("会话图片校验失败");
       const nextTurnId = randomUUID();
       if (!(await inbox.consume({ sessionId, inputId: claimed.inputId, turnId: nextTurnId }))) continue;
       const startedInput: CliQueuedInputStarted = {
@@ -384,6 +509,7 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
           sessionId,
           turnId: nextTurnId,
           content: claimed.content,
+          messages: queuedImages.length ? [createImageMessage(claimed.content, queuedImages)] : undefined,
           activeSkills: activeSkills.length > 0 ? activeSkills : undefined,
           continuity: { source: "claimed_queue" },
         }), lines);
@@ -407,28 +533,44 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
   }
 
   /** 启动新 turn，或将运行中的普通输入按 Web 同一语义投递为 steer/queue。 */
-  async function submitPrompt(content: string, delivery?: "steer" | "queue"): Promise<CliControllerResult> {
+  async function submitPrompt(content: string, delivery?: "steer" | "queue", images?: Extract<CliAction, { type: "submit_prompt" }>["images"]): Promise<CliControllerResult> {
+    if (stopping) return result("error", 1, [], "CLI_HOST_STOPPING");
+    const submittedTurnId = turnId;
+    const submittedStatus = projector.getProjection().status;
     if (!sessionId) return result("error", 1, [], "CLI_SESSION_REQUIRED");
     if (!options.runtime) return result("error", 1, [], "CLI_RUNTIME_NOT_ATTACHED");
-    const status = projector.getProjection().status;
-    if (delivery === undefined && isCliContinuePrompt(content) && status !== "running") {
+    if ((images?.length ?? 0) > 10 || (images?.length && !options.workspaceRoot)) return result("error", 2, [], "CLI_IMAGE_INVALID");
+    if (submittedStatus === "waiting_user_input") {
+      if (images?.length) return result("error", 2, [], "结构化问题只接受选项编号或自定义文本");
+      return answerQuestion(content, projector.getProjection().questionRequestId);
+    }
+    const normalized = await Promise.all((images ?? []).map(async function normalize(image) { const result = await normalizeWorkImage(image); return { name: image.name, mimeType: result.mimeType, bytes: result.bytes }; }));
+    if (normalized.reduce(function total(size, image) { return size + image.bytes.byteLength; }, 0) > 20 * 1024 * 1024) return result("error", 2, [], "CLI_IMAGE_INVALID");
+    const imageStore = options.workspaceRoot ? createNodeSessionImageStore(options.workspaceRoot) : undefined;
+    const stored = [];
+    for (const image of normalized) stored.push(await imageStore!.put({ sessionId, ...image }));
+    const status = submittedStatus;
+    if (stored.length === 0 && delivery === undefined && isCliContinuePrompt(content) && status !== "running") {
       const recoverable = await options.runtime.turns.getRecoverableState({ sessionId, turnId });
       if (recoverable?.recoverable) return resume();
     }
-    if ((status === "running" || status === "waiting_approval") && turnId) {
+    if ((status === "running" || status === "waiting_approval") && submittedTurnId) {
       const input = await options.runtime.turns.steer({
         sessionId,
-        turnId,
+        turnId: submittedTurnId,
         content,
+        attachments: stored,
         delivery: delivery ?? "steer",
         selectedSkills: toInboxSkillRefs(),
       });
       return result("ok", 0, [`input queued: ${input.inputId} (${input.delivery})`], { submittedInput: { inputId: input.inputId, delivery: input.delivery } });
     }
     if (delivery === "queue") return result("error", 2, [], "CLI_QUEUE_REQUIRES_ACTIVE_TURN");
+    await updateSessionTitle(sessionId, content, true);
     const input: StartTurnInput = {
       sessionId,
       content,
+      messages: stored.length ? [createImageMessage(content, stored)] : undefined,
       activeSkills: selectedSkills.length > 0 ? selectedSkills.map(function toActiveSkill(skill) {
         return { skillId: skill.skillId, contentHash: skill.contentHash };
       }) : undefined,
@@ -436,56 +578,169 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
     return consume(options.runtime.turns.start(input));
   }
 
-  /** 使用当前安全审批视图提交决定，并把 allow 类映射为 Core continue 的 allow。 */
-  async function approve(decision: Extract<CliAction, { type: "approve" }>['decision']): Promise<CliControllerResult> {
-    const pending = projector.getProjection().pendingApproval;
-    if (!sessionId || !turnId || !pending) return result("error", 2, [], "CLI_APPROVAL_NOT_AVAILABLE");
-    if (!options.runtime) return result("error", 1, [], "CLI_RUNTIME_NOT_ATTACHED");
-    if (pending.toolName === "run_command" && (decision === "allow_session" || decision === "allow_workspace") && !pending.allowedDecisions?.includes(decision)) {
-      return result("error", 2, [], "CLI_COMMAND_APPROVAL_ALLOW_ONCE_ONLY");
-    }
-    const approvalInput = { sessionId, turnId, approvalId: pending.approvalId, decision };
-    if (options.approvalSubmit) await options.approvalSubmit(approvalInput);
-    else await options.runtime.approvals.submit(approvalInput);
-    const continueInput: ContinueTurnInput = {
-      sessionId,
-      turnId,
-      approval: { approvalId: pending.approvalId, decision: decision === "deny" ? "deny" : "allow" },
-    };
-    return consume(options.runtime.turns.continue(continueInput));
+  /** 当前目标内逐题收集历史问题答案，按精确requestId提交，原文只交给私有问题服务。 */
+  let questionDraft: { turnId: string; requestId: string; answers: Array<{ id: string; selected: string[]; custom?: string }> } | undefined;
+
+  /** 将受信问题的当前题目与原选项投影为终端提示，数字选择与自定义文本共用原Core校验。 */
+  function questionLines(question: NonNullable<NonNullable<import("@autopilot-agent/core").TurnExecutionView["interaction"]>["question"]>, index = 0): string[] {
+    const item = question.questions[index];
+    return item ? [`等待回答（${index + 1}/${question.questions.length}） ${item.header}`, item.question, ...item.options.map(function option(option, n) { return `${n + 1}. ${option.label} — ${option.description}`; }), "输入选项编号，或直接输入自定义答案（纯数字补充用“其他 <内容>”）"] : [];
   }
 
-  /** 取消当前 turn；取消细节由 Core Runtime 和 checkpoint 负责。 */
+  /** 已保存决定先交给受信宿主控制面；无协作组时沿原本机continue入口执行。 */
+  async function continueSavedInteraction(input: { sessionId: string; turnId: string; approvalId?: string; requestId?: string }, approval?: ContinueTurnInput["approval"]): Promise<CliControllerResult> {
+    const handoff = await options.runtime!.turns.requestInteractionContinuation?.(input);
+    if (handoff?.queued) {
+      const view = await options.runtime!.turns.getExecutionState({ sessionId: input.sessionId, turnId: input.turnId }).catch(function unavailable() { return null; });
+      const host = view?.executionHost === "web-work-v1" ? "请保持或启动 Web 宿主" : view?.executionHost === "cli-work-v1" ? "请保持或启动 CLI 宿主" : "执行归属待确认";
+      return result("ok", 0, [`${input.requestId ? "答案" : "审批决定"}已保存，等待兼容宿主继续原任务；${host}，/resume 可重试原请求`]);
+    }
+    return consume(options.runtime!.turns.continue({ sessionId: input.sessionId, turnId: input.turnId, requestId: input.requestId, approval }));
+  }
+
+  /** 只处理当前安全投影里的历史问题；迟到输入不能回答后续新请求。 */
+  async function answerQuestion(content: string, expectedRequestId: string | undefined): Promise<CliControllerResult> {
+    if (!sessionId || !options.runtime) return result("error", 1, [], "CLI_SESSION_REQUIRED");
+    const targetSessionId = sessionId;
+    const generation = observationGeneration;
+    const view = await options.runtime.turns.getExecutionState({ sessionId: targetSessionId, turnId });
+    if (!expectedRequestId || generation !== observationGeneration || view?.waiting !== "user_input" || !view.interaction?.question || view.interaction.requestId !== expectedRequestId) return result("error", 2, [], "当前问题已变化，请刷新后重新回答");
+    const question = view.interaction.question;
+    if (view.interaction.state === "decided") return isCliContinuePrompt(content) ? continueSavedInteraction({ sessionId: targetSessionId, turnId: view.turnId, requestId: question.requestId }) : result("ok", 0, ["答案已保存，请通过 /resume 继续原请求"]);
+    if (view.interaction.state !== "pending") return result("error", 2, [], "问题状态待确认，请刷新后重试");
+    if (questionDraft?.requestId !== question.requestId || questionDraft.turnId !== view.turnId) questionDraft = { turnId: view.turnId, requestId: question.requestId, answers: [] };
+    const item = question.questions[questionDraft.answers.length];
+    const text = content.trim();
+    if (!item || !text) return result("error", 2, [], "请输入当前题目的选项编号或自定义文本");
+    const custom = text.startsWith("其他 ") ? text.slice(3).trim() : undefined;
+    if (custom === "") return result("error", 2, [], "请输入自定义答案内容");
+    const number = custom === undefined && /^\d+$/u.test(text) ? Number(text) : undefined;
+    if (number !== undefined && (number < 1 || number > item.options.length)) return result("error", 2, questionLines(question, questionDraft.answers.length), "选项编号超出范围");
+    questionDraft.answers.push(number !== undefined ? { id: item.id, selected: [item.options[number - 1].label] } : { id: item.id, selected: [], custom: custom ?? text });
+    if (questionDraft.answers.length < question.questions.length) return result("ok", 0, questionLines(question, questionDraft.answers.length));
+    if (!options.runtime.questions) { questionDraft = undefined; return result("unavailable", 1, [], "当前宿主不支持提交历史问题答案"); }
+    executing++;
+    try {
+      await options.runtime.questions.submit({ sessionId: targetSessionId, turnId: view.turnId, requestId: question.requestId, answers: questionDraft.answers });
+      questionDraft = undefined;
+      return await continueSavedInteraction({ sessionId: targetSessionId, turnId: view.turnId, requestId: question.requestId });
+    } catch (error) {
+      questionDraft = undefined;
+      const current = await options.runtime.turns.getExecutionState({ sessionId: targetSessionId, turnId: view.turnId }).catch(function unavailable() { return null; });
+      if (current?.interaction?.state === "decided") return result("error", 1, [], "答案已保存，继续失败，请通过 /resume 重试原请求");
+      if (current?.interaction?.state === "pending" && current.interaction.question) return result("error", 2, questionLines(current.interaction.question), "答案尚未保存，请重新回答");
+      throw error;
+    } finally { executing--; }
+  }
+
+  /** 记录已提交的冻结审批身份，避免重复决定再次继续执行。 */
+  const approvalRequests = new Set<string>();
+
+  /** 冻结审批三元身份并防止重复提交；迟到界面不得批准下一请求。 */
+  async function approve(decision: Extract<CliAction, { type: "approve" }>['decision'], expected?: Extract<CliAction, { type: "approve" }>['expected']): Promise<CliControllerResult> {
+    // 提交决定与后续continue共同持有执行权，后台观察不能抢先失效本次审批。
+    executing += 1;
+    try {
+      const generation = observationGeneration;
+      const pending = projector.getProjection().pendingApproval;
+      if (!sessionId || !turnId || !pending) return result("error", 2, [], "CLI_APPROVAL_NOT_AVAILABLE");
+      if (!options.runtime) return result("error", 1, [], "CLI_RUNTIME_NOT_ATTACHED");
+      if (pending.toolName === "run_command" && (decision === "allow_session" || decision === "allow_workspace") && !pending.allowedDecisions?.includes(decision)) {
+        return result("error", 2, [], "CLI_COMMAND_APPROVAL_ALLOW_ONCE_ONLY");
+      }
+      const targetSessionId = sessionId;
+      const targetTurnId = turnId;
+      const identity = JSON.stringify([targetSessionId, targetTurnId, pending.approvalId]);
+      if (expected && (expected.sessionId !== targetSessionId || expected.turnId !== targetTurnId || expected.approvalId !== pending.approvalId)) return result("error", 2, [], "CLI_APPROVAL_NOT_AVAILABLE");
+      if (approvalRequests.has(identity)) return result("error", 2, [], "CLI_APPROVAL_NOT_AVAILABLE");
+      if (pending.allowedDecisions && !pending.allowedDecisions.includes(decision)) return result("error", 2, [], "CLI_APPROVAL_NOT_AVAILABLE");
+      approvalRequests.add(identity);
+      projector.syncObservedInteraction({ turnId: targetTurnId, status: "waiting_approval" });
+      const approvalInput = { sessionId: targetSessionId, turnId: targetTurnId, approvalId: pending.approvalId, decision };
+      try {
+        if (options.approvalSubmit) await options.approvalSubmit(approvalInput);
+        else await options.runtime.approvals.submit(approvalInput);
+      } catch (error) {
+        approvalRequests.delete(identity);
+        if (generation !== observationGeneration) return result("error", 2, [], "CLI_APPROVAL_NOT_AVAILABLE");
+        const state = await options.runtime.turns.getRecoverableState({ sessionId: targetSessionId, turnId: targetTurnId });
+        if (generation !== observationGeneration) return result("error", 2, [], "CLI_APPROVAL_NOT_AVAILABLE");
+        if (state) projector.restore({ ...state, approval: state.approval?.approvalId === pending.approvalId ? undefined : state.approval });
+        throw error;
+      }
+      if (generation !== observationGeneration) return result("error", 2, [], "CLI_APPROVAL_NOT_AVAILABLE");
+      const continueInput: ContinueTurnInput = {
+        sessionId: targetSessionId,
+        turnId: targetTurnId,
+        approval: { approvalId: pending.approvalId, decision: decision === "deny" ? "deny" : "allow" },
+      };
+      try {
+        return await continueSavedInteraction({ sessionId: targetSessionId, turnId: targetTurnId, approvalId: pending.approvalId }, continueInput.approval);
+      } catch (error) {
+        const classification = classifyCliError(error);
+        const state = await options.runtime.turns.getRecoverableState({ sessionId: targetSessionId, turnId: targetTurnId }).catch(function unavailable() { return null; });
+        if (state && generation === observationGeneration) projector.restore(state);
+        return result("error", 1, [], `审批决定已保存，恢复执行失败（CLI_APPROVAL_CONTINUE_FAILED/${classification.code}），请重试原决定继续`);
+      }
+    } finally { executing -= 1; }
+  }
+
+  /** 仅对提交瞬间精确活动Turn请求一次取消；终态/重复请求不输出误导notice。 */
   async function cancelTurn(): Promise<CliControllerResult> {
     if (!sessionId || !turnId) return result("error", 2, [], "CLI_ACTIVE_TURN_REQUIRED");
     if (!options.runtime) return result("error", 1, [], "CLI_RUNTIME_NOT_ATTACHED");
-    await options.runtime.turns.cancel({ sessionId, turnId });
-    const state = await options.runtime.turns.getRecoverableState({ sessionId, turnId });
-    if (state) projector.restore(state);
-    return result("ok", 0, ["turn cancellation requested"]);
+    const targetSessionId = sessionId;
+    const targetTurnId = turnId;
+    const identity = JSON.stringify([targetSessionId, targetTurnId]);
+    if (!["running", "waiting_approval", "waiting_user_input"].includes(projector.getProjection().status) || cancellationRequests.has(identity)) return result("ok", 0);
+    cancellationRequests.add(identity);
+    try {
+      const session = await options.runtime.sessions?.get?.(targetSessionId);
+      if (session && (session.activeTurnId !== targetTurnId || !["running", "waiting_approval", "waiting_user_input"].includes(session.status))) return result("ok", 0);
+      await options.runtime.turns.cancel({ sessionId: targetSessionId, turnId: targetTurnId });
+      const state = await options.runtime.turns.getRecoverableState({ sessionId: targetSessionId, turnId: targetTurnId });
+      if (state && sessionId === targetSessionId && turnId === targetTurnId) projector.restore(state);
+      return result("ok", 0, state && ["completed", "failed"].includes(state.status) ? [] : ["turn cancellation requested"]);
+    } catch (error) { cancellationRequests.delete(identity); throw error; }
   }
 
   /** 从 Core 脱敏恢复视图恢复当前投影，并继续同一个 turn。 */
-  async function resume(): Promise<CliControllerResult> {
-    if (!sessionId) return result("error", 1, [], "CLI_SESSION_REQUIRED");
-    if (!options.runtime) return result("error", 1, [], "CLI_RUNTIME_NOT_ATTACHED");
-    const state = await options.runtime.turns.getRecoverableState({ sessionId, turnId });
-    if (!state) return result("error", 1, [], "CLI_RECOVERABLE_TURN_NOT_FOUND");
-    turnId = state.turnId;
-    projector.restore(state);
-    if (!state.recoverable) return result("error", 1, [], `CLI_TURN_NOT_RESUMABLE: ${state.status}`);
-    if (state.status === "awaiting_approval") {
-      return result("ok", 0, [
-        `approval required: ${state.approval?.approvalId ?? "unknown"}${state.approval ? ` (${state.approval.toolName})` : ""}`,
-      ]);
-    }
-    if (state.status === "awaiting_user_input") {
-      return result("ok", 0, ["请在支持结构化回答的 Web 中处理"]);
-    }
-    if (state.status === "interrupted_recoverable" || state.status === "limit_reached") {
-      return consume(options.runtime.turns.continue({ sessionId, turnId }));
-    }
-    return result("error", 1, [], `CLI_TURN_NOT_RESUMABLE: ${state.status}`);
+  async function resume(expectedApproval?: { turnId: string; approvalId: string }): Promise<CliControllerResult> {
+    if (executing > 0) return result("error", 2, [], "CLI_TURN_ALREADY_EXECUTING");
+    // 恢复视图读取也属于本控制器执行，避免目录/迟到正文在首个事件前重置身份。
+    executing += 1;
+    try {
+      const generation = observationGeneration;
+      if (!sessionId) return result("error", 1, [], "CLI_SESSION_REQUIRED");
+      if (!options.runtime) return result("error", 1, [], "CLI_RUNTIME_NOT_ATTACHED");
+      const state = await options.runtime.turns.getRecoverableState({ sessionId, turnId });
+      if (generation !== observationGeneration) return result("error", 2, [], "CLI_TURN_IDENTITY_CHANGED");
+      if (!state) return result("error", 1, [], "CLI_RECOVERABLE_TURN_NOT_FOUND");
+      if (expectedApproval && (state.turnId !== expectedApproval.turnId || state.approval?.approvalId !== expectedApproval.approvalId || state.interactionState !== "decided")) return result("error", 2, [], "CLI_APPROVAL_NOT_AVAILABLE");
+      turnId = state.turnId;
+      projector.restore(state);
+      if (!state.recoverable) return result("error", 1, [], `CLI_TURN_NOT_RESUMABLE: ${state.status}`);
+      if (state.status === "awaiting_approval" && state.approval) {
+        // 旧宿主可能在决定落盘后退出；复用精确持久决定继续，不能再次提交同一审批。
+        const decision = await options.runtime.approvals?.getDecision?.({ sessionId, turnId, approvalId: state.approval.approvalId });
+        if (generation !== observationGeneration) return result("error", 2, [], "CLI_TURN_IDENTITY_CHANGED");
+        if (decision) return await continueSavedInteraction({ sessionId, turnId, approvalId: state.approval.approvalId }, { approvalId: state.approval.approvalId, decision: decision.decision === "deny" ? "deny" : "allow" });
+        return result("ok", 0, [
+          `approval required: ${state.approval?.approvalId ?? "unknown"}${state.approval ? ` (${state.approval.toolName})` : ""}`,
+        ]);
+      }
+      if (state.status === "awaiting_user_input") {
+        const view = await options.runtime.turns.getExecutionState({ sessionId, turnId });
+        if (!view?.interaction?.question) return result("error", 1, [], "问题身份或内容待确认，请刷新后重试");
+        projector.syncObservedInteraction({ turnId, status: "waiting_user_input", requestId: view.interaction.question.requestId });
+        if (view.interaction.state === "decided") return await continueSavedInteraction({ sessionId, turnId, requestId: view.interaction.question.requestId });
+        return result("ok", 0, questionLines(view.interaction.question));
+      }
+      if (state.status === "interrupted_recoverable" || state.status === "limit_reached" || (state.status === "awaiting_approval" && !state.approval)) {
+        return await consume(options.runtime.turns.continue({ sessionId, turnId }));
+      }
+      return result("error", 1, [], `CLI_TURN_NOT_RESUMABLE: ${state.status}`);
+    } finally { executing -= 1; }
   }
 
   /** 只读查询当前 Session 的上下文用量安全 DTO；未知输出固定为 unknown，exit 0。 */
@@ -584,6 +839,7 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
       ...(session.defaultRunConfig ?? {}),
       modelRef: { provider: capability.provider, modelId: capability.modelId },
     });
+    statusRevision++;
     const statusView = await getStatusView();
     const suffix = statusView.source === "turn_frozen" ? "；当前 Turn 保持 frozen，下一个 Turn 生效" : "；下一个 Turn 生效";
     return result("ok", 0, [`model: ${capability.provider}/${capability.modelId}${suffix}`], { statusView });
@@ -620,6 +876,7 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
       ...(session.defaultRunConfig ?? {}),
       reasoningProfile: { effort: effort as ReasoningEffort },
     });
+    statusRevision++;
     const statusView = await getStatusView();
     const suffix = statusView.source === "turn_frozen" ? "；当前 Turn 保持 frozen，下一个 Turn 生效" : "；下一个 Turn 生效";
     return result("ok", 0, [`effort: ${effort}${suffix}`], { statusView });
@@ -731,9 +988,10 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
 
   /** 处理宿主 Action；未进入对应 Runtime Step 的能力返回明确 unavailable。 */
   async function dispatch(action: CliAction): Promise<CliControllerResult> {
-    if (action.type === "submit_prompt") return submitPrompt(action.content, action.delivery);
-    if (action.type === "approve") return approve(action.decision);
+    if (action.type === "submit_prompt") return submitPrompt(action.content, action.delivery, action.images);
+    if (action.type === "approve") return approve(action.decision, action.expected);
     if (action.type === "cancel_turn") return cancelTurn();
+    if (action.type === "resume") return resume();
     if (action.type === "compact") return compact();
     if (action.type === "show_context") return showContext(action.all);
     if (action.type === "undo_preview") return previewUndo();
@@ -754,9 +1012,6 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
     if (action.type === "read_job_output") return readJobOutput(action.jobId);
     if (action.type === "stop_job") return stopJob(action.jobId);
     if (action.type === "exit") {
-      if (projector.getProjection().status === "running" || projector.getProjection().status === "waiting_approval") {
-        await cancelTurn();
-      }
       return result("exit", 0, []);
     }
     return result("error", 2, [], "CLI_UNKNOWN_ACTION");
@@ -766,6 +1021,33 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
     dispatch,
     consume,
     resume,
+    /** 观察只更新当前固定 Session 的安全投影；不进入 consume 的自动队列执行路径。 */
+    observe: function observe(events) {
+      for (const envelope of events) {
+        const previousCount = projector.getProjection().events.length;
+        const projected = projector.observe(envelope);
+        if (!projected.added) continue;
+        turnId = envelope.turnId;
+        for (const event of projected.projection.events.slice(previousCount)) eventListener?.(event, projected.projection);
+      }
+    },
+    /** 清除旧Turn执行/审批身份，旧异步采样或审批返回后不得继续旧目标。 */
+    invalidateObservedTurn: function invalidateObservedTurn(input) {
+      observationGeneration++;
+      turnId = input.turnId;
+      projector.invalidateObservedTurn(input);
+    },
+    /** 审批代次改变即失效旧提交响应；只同步安全展示，不恢复执行。 */
+    syncObservedInteraction: function syncObservedInteraction(input) {
+      const before = JSON.stringify([projector.getProjection().pendingApproval?.approvalId, projector.getProjection().questionRequestId]);
+      const event = input.approval?.event;
+      const submitted = event?.type === "approval_required" && approvalRequests.has(JSON.stringify([sessionId, input.turnId, event.result.approval.approvalId]));
+      const next = projector.syncObservedInteraction(submitted ? { ...input, approval: undefined } : input);
+      if (before !== JSON.stringify([next.pendingApproval?.approvalId, next.questionRequestId])) observationGeneration++;
+      turnId = input.turnId;
+    },
+    beginShutdown: function beginShutdown() { stopping = true; },
+    isExecuting: function isExecuting() { return executing > 0; },
     getProjection: function getProjection() { return projector.getProjection(); },
     getStatusView,
     setSession: function setSession(nextSessionId: string) {

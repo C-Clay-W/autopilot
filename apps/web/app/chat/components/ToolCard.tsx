@@ -170,7 +170,7 @@ export default function ToolCard({ tool, content, toolNames: providedToolNames }
   const contentId = `tool-body-${tool.callId}`;
   const toolNames = providedToolNames?.length ? [...new Set(providedToolNames)].filter(Boolean) : [tool.toolName];
   // 编辑 diff 与工具专用明细共用同一个局部展开状态；没有安全结果体时不显示虚假展开入口。
-  const canExpand = Boolean(tool.detail || tool.diff?.text);
+  const canExpand = Boolean(tool.detail || tool.diff?.text || tool.observation?.lines.length);
   const diffStats = getDiffStats(tool.diff);
   const displayText = getToolDisplayText(tool, content, toolNames);
   const diffStatsText = formatDiffStats(diffStats);
@@ -208,6 +208,7 @@ export default function ToolCard({ tool, content, toolNames: providedToolNames }
         <div id={contentId} className="ml-6">
           <ToolDiff tool={tool} />
           <ToolDetail detail={tool.detail} />
+          {tool.observation?.lines.map(function observed(line, index) { return <p key={index} className="whitespace-pre-wrap break-words py-1 text-muted">{line}</p>; })}
         </div>
       )}
       {tool.executionMode === "unisolated" && <p className="ml-6 mt-0.5 text-[10px] text-error">未隔离执行：本次命令未经沙箱隔离，由宿主直接运行</p>}

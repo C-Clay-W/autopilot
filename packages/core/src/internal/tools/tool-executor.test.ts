@@ -450,6 +450,8 @@ describe("P4 工具执行器", () => {
     }, {
       workspaceRoot,
       permissionMode: "full_access",
+      executionSessionId: "spill-session",
+      toolCallId: "spill-call",
       sandboxPolicy: createFakeSandboxScope(workspaceRoot, createFakeSandboxPort().port),
       agentFlow: { async search() { return []; } },
     });
@@ -461,6 +463,35 @@ describe("P4 工具执行器", () => {
     expect(String(output.stdout)).toContain("…[输出已截断]…");
     expect(String(output.stdout).startsWith("x")).toBe(true);
     expect(String(output.stdout).endsWith("x")).toBe(true);
+    // 截断后完整输出落盘到工作区临时目录，模型可用 read_file 回读且无需重跑命令。
+    const spilledPath = (output.spilledOutput as { stdout: string }).stdout;
+    expect(spilledPath).toMatch(/^\.autopilot\/tmp\/spill-session\/spill-call-[a-f0-9]{16}\.stdout\.log$/);
+    const spilledStdout = await readFile(path.join(workspaceRoot, spilledPath), "utf8");
+    expect(Buffer.byteLength(spilledStdout, "utf8")).toBe(65_536);
+    expect(spilledStdout).not.toContain("…[输出已截断]…");
+    expect(spilledStdout.startsWith("x")).toBe(true);
+    expect(spilledStdout.endsWith("x")).toBe(true);
+  });
+
+  it("未超限输出不落盘，也不生成临时日志", async function skipsSpillForSmallOutput() {
+    const workspaceRoot = await createTemporaryWorkspace();
+    const tool = createRunCommandTool();
+    const output = await tool.execute({
+      program: process.execPath,
+      args: ["-e", "process.stdout.write('small-output')"],
+      cwd: ".",
+      timeoutMs: 5_000,
+    }, {
+      workspaceRoot,
+      permissionMode: "full_access",
+      executionSessionId: "spill-session",
+      toolCallId: "small-call",
+      sandboxPolicy: createFakeSandboxScope(workspaceRoot, createFakeSandboxPort().port),
+      agentFlow: { async search() { return []; } },
+    });
+    expect(output.stdoutTruncated).toBe(false);
+    expect(output.spilledOutput).toBeUndefined();
+    await expect(readFile(path.join(workspaceRoot, ".autopilot/tmp/spill-session/small-call.stdout.log"), "utf8")).rejects.toThrow();
   });
 
   it("超时会终止命令的完整子进程树", async function terminatesCommandProcessTreeOnTimeout() {

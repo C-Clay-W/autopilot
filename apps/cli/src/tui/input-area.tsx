@@ -5,7 +5,7 @@ import { useInput, type Key } from "ink";
 import type { CliAction, CliEffortOption, CliModelOption, CliPermissionOption, CliSkillSummary, CliSlashCommand } from "../types.js";
 import { getSlashCommandSuggestions } from "../parser.js";
 import { usePickers } from "./hooks/use-pickers.js";
-import { usePromptInput } from "./hooks/use-prompt-input.js";
+import { usePromptInput, type CliTuiDraftRef } from "./hooks/use-prompt-input.js";
 import type { FileMentionIndex } from "./hooks/use-file-mention-index.js";
 import { extractFileMentionToken, filterFileMentionCandidates } from "./input/file-mention.js";
 import { createTuiPromptLayout } from "./input/prompt-layout.js";
@@ -24,6 +24,7 @@ export interface TuiInputDerivedState {
   slashCommandSuggestions: CliSlashCommand[];
   fileMentionSuggestions: string[];
   handleTuiViewportKey: (key: Key) => boolean;
+  handleApprovalKey?: (value: string, key: Key) => boolean;
 }
 
 /** React ref 形状；输入子树与父级共享同一份派生值容器。 */
@@ -58,7 +59,9 @@ function getTuiPickerHeight(input: {
 /** 将 prompt 状态、输入分发和 picker 展示隔离到独立子树。 */
 export const TuiInputArea = memo(function TuiInputArea(props: {
   store: CliTuiStore;
+  draftRef?: CliTuiDraftRef;
   columns: number;
+  maximumPromptRows?: number;
   busy: { current: boolean };
   keepOpenAfterCancel: { current: boolean };
   lastSubmittedPromptRef: { current: string | undefined };
@@ -69,6 +72,10 @@ export const TuiInputArea = memo(function TuiInputArea(props: {
   onRequestCancel: () => void;
   isRawModeSupported: boolean;
   isInputActive: boolean;
+  /** 每次按键按宿主实时模式再检查，不能只依赖render时isActive。 */
+  canReceiveInput?(value?: string, key?: Key): boolean;
+  bindInputHandler?(handler: ((value: string, key: Key) => void) | undefined): void;
+  onAttachmentsChange?(names: string[]): void;
   showInput: boolean;
   useColor: boolean;
   screenReader: boolean;
@@ -79,8 +86,10 @@ export const TuiInputArea = memo(function TuiInputArea(props: {
 }): ReactNode {
   const pickers = props.pickers;
   const { input, cursorIndex, handleInput } = usePromptInput({
+    draftRef: props.draftRef,
     store: props.store,
     columns: props.columns,
+    onAttachmentsChange: props.onAttachmentsChange,
     busy: props.busy,
     keepOpenAfterCancel: props.keepOpenAfterCancel,
     lastSubmittedPromptRef: props.lastSubmittedPromptRef,
@@ -109,7 +118,7 @@ export const TuiInputArea = memo(function TuiInputArea(props: {
     ? filterFileMentionCandidates(props.fileMentionIndex?.entries ?? [], fileMentionToken.query)
     : [];
   props.derivedRef.current.fileMentionSuggestions = fileMentionSuggestions;
-  const promptHeight = props.showInput ? createTuiPromptLayout(input, cursorIndex, Math.max(1, props.columns - 4)).lines.length + 3 : 0;
+  const promptHeight = props.showInput ? Math.min(props.maximumPromptRows ?? Infinity, createTuiPromptLayout(input, cursorIndex, Math.max(1, props.columns - 4)).lines.length) + 3 : 0;
   const pickerHeight = props.showInput
     ? getTuiPickerHeight({ permissions: pickers.permissionPickerOptions, models: pickers.modelPickerOptions, efforts: pickers.effortPickerOptions, skills: pickers.skillPickerSkills, slashCommands: slashCommandSuggestions, fileMentionCandidates: fileMentionSuggestions })
     : 0;
@@ -133,11 +142,22 @@ export const TuiInputArea = memo(function TuiInputArea(props: {
     pickers.updateFileMentionIndex(0);
   }, [fileMentionSuggestions.join("\u0000")]);
 
-  useInput(handleInput, { isActive: props.isRawModeSupported && props.isInputActive });
+  /** React订阅尚未刷新时仍拒绝旧会话/列表已消费事件，原草稿和光标保持不变。 */
+  function handleActiveInput(value: string, key: Key): void {
+    if (props.canReceiveInput?.(value, key) === false) return;
+    handleInput(value, key);
+  }
+  /** 根输入桥在layout提交时就绪，不依赖新会话useInput的被动订阅时序。 */
+  useLayoutEffect(function bindCurrentInput() {
+    if (!props.bindInputHandler) return;
+    props.bindInputHandler(props.isRawModeSupported && props.isInputActive ? handleActiveInput : undefined);
+    return function unbind() { props.bindInputHandler?.(undefined); };
+  });
+  useInput(handleActiveInput, { isActive: !props.bindInputHandler && props.isRawModeSupported && props.isInputActive });
 
   if (!props.showInput) return null;
   return <>
-    <TuiPromptInput input={input} cursorIndex={cursorIndex} columns={props.columns} useColor={props.useColor} screenReader={props.screenReader} busy={props.busy.current} />
+    <TuiPromptInput maximumRows={props.maximumPromptRows} input={input} cursorIndex={cursorIndex} columns={props.columns} useColor={props.useColor} screenReader={props.screenReader} busy={props.busy.current} />
     {pickers.permissionPickerOptions ? (
       <TuiPermissionPicker options={pickers.permissionPickerOptions} selectedIndex={pickers.permissionPickerIndex} useColor={props.useColor} screenReader={props.screenReader} />
     ) : pickers.modelPickerOptions ? (

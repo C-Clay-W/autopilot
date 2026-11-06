@@ -1,11 +1,11 @@
 /**
- * Context Usage 安全报告格式化。
+ * Context / Turn 用量安全报告格式化。
  *
- * 所有输入只来自 Core 白名单 ContextUsageView DTO；宿主只做展示转换，
+ * 所有输入只来自 Core 白名单 ContextUsageView / TurnUsageSummaryView DTO；宿主只做展示转换，
  * 不重算 token、不猜测窗口、不为非零分类强塞至少一格。
  */
 
-import type { ContextUsageCategoryView, ContextUsageView } from "@autopilot-agent/core";
+import type { ContextUsageCategoryView, ContextUsageView, TurnUsageSummaryView } from "@autopilot-agent/core";
 
 /** Core 固定枚举到 CLI 稳定中文标签的映射；不携带动态名称。 */
 const CONTEXT_CATEGORY_LABELS: Readonly<Record<ContextUsageCategoryView["kind"], string>> = {
@@ -184,4 +184,16 @@ export function formatPlainContextReport(usage: ContextUsageView | null, expande
 export function formatTuiContextStatus(usage: ContextUsageView | null): string {
   if (!usage) return "unknown";
   return `${Math.round(Math.max(0, 1 - usage.usageRatio) * 100)}%`;
+}
+
+/**
+ * 状态栏累计用量行：优先展示累计输入/输出分项，旧 checkpoint 缺少分项时降级为总量，
+ * 无数据（null/undefined）显示 unknown，不伪造 0；耗时仅在时间线末尾展示。
+ */
+export function formatTuiTurnUsageStatus(usage: TurnUsageSummaryView | null | undefined): string {
+  if (!usage) return "unknown";
+  const counts = usage.inputTokens !== undefined && usage.outputTokens !== undefined
+    ? `${formatTokens(usage.inputTokens)} in / ${formatTokens(usage.outputTokens)} out`
+    : `${formatTokens(usage.totalTokens)} total`;
+  return counts;
 }

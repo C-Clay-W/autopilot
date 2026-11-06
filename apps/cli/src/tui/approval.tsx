@@ -1,7 +1,7 @@
 /** 审批菜单：根据待审批工具收窄选项，并以 CC 风格上下选择、回车确认。 */
 
-import { type ReactNode } from "react";
-import { Box, Text } from "ink";
+import { useLayoutEffect, useRef, type ReactNode } from "react";
+import { Box, Text, measureElement, type DOMElement } from "ink";
 import type { CliAction, CliProjection } from "../types.js";
 import { TUI_ACCENT_COLOR } from "../design-tokens.js";
 import { getTuiToolLabel } from "./format.js";
@@ -42,11 +42,19 @@ export function createTuiApprovalOptions(pendingApproval: NonNullable<CliProject
 }
 
 /** 以 CC 风格上下选择、回车确认渲染当前审批菜单。 */
-export function TuiApprovalPrompt(props: { pendingApproval: NonNullable<CliProjection["pendingApproval"]>; selectedIndex: number; useColor: boolean; screenReader: boolean }): ReactNode {
+export function TuiApprovalPrompt(props: { pendingApproval: NonNullable<CliProjection["pendingApproval"]>; selectedIndex: number; useColor: boolean; screenReader: boolean; details?: boolean; height?: number; offset?: number; onMaximumOffset?(maximum: number): void }): ReactNode {
   const options = createTuiApprovalOptions(props.pendingApproval);
   const selectedIndex = Math.max(0, Math.min(props.selectedIndex, options.length - 1));
+  const contentRef = useRef<DOMElement>(null);
+  const viewportRef = useRef<DOMElement>(null);
+  /** 以实际换行高度收敛详情滚动范围，固定决定区始终留在卡片底部。 */
+  useLayoutEffect(function measureApprovalDetails() {
+    if (contentRef.current && viewportRef.current) props.onMaximumOffset?.(Math.max(0, measureElement(contentRef.current).height - measureElement(viewportRef.current).height));
+  });
   return (
-    <Box borderStyle="single" borderColor={props.useColor ? TUI_ACCENT_COLOR : undefined} paddingX={1} flexDirection="column">
+    <Box height={props.height} flexShrink={0} overflow="hidden" borderStyle="single" borderColor={props.useColor ? TUI_ACCENT_COLOR : undefined} paddingX={1} flexDirection="column">
+      <Box ref={viewportRef} height={props.height === undefined ? undefined : Math.max(1, props.height - options.length - 3)} flexDirection="column" overflow="hidden" flexShrink={0}>
+      <Box ref={contentRef} flexDirection="column" flexShrink={0} marginTop={-(props.offset ?? 0)}>
       <Text bold color={props.useColor ? TUI_ACCENT_COLOR : undefined}>需要你的确认</Text>
       <Text>操作：{props.pendingApproval.display?.operation ?? getTuiToolLabel(props.pendingApproval.toolName)}</Text>
       <Text>原因：{props.pendingApproval.reason}</Text>
@@ -82,11 +90,14 @@ export function TuiApprovalPrompt(props: { pendingApproval: NonNullable<CliProje
       {props.pendingApproval.display?.effect === "external" && props.pendingApproval.toolName !== "run_command" && options.some(function hasWorkspaceOption(option) { return option.decision === "allow_workspace"; }) ? (
         <Text dimColor={props.useColor}>选择“此工作区允许”将把该规则写入工作区 .autopilot/settings.local.json</Text>
       ) : null}
+      {props.details && props.pendingApproval.display?.actionPreview && props.pendingApproval.display.actionPreview !== props.pendingApproval.reason ? <Text>{props.pendingApproval.display.actionPreview}</Text> : null}
+      </Box>
+      </Box>
       {options.map(function renderApprovalOption(option, index): ReactNode {
         const selected = index === selectedIndex;
-        return <Text key={option.decision} inverse={selected && props.useColor}>{selected ? "›" : " "} {option.label}{selected && props.screenReader ? "（已选择）" : ""}</Text>;
+        return <Text wrap="truncate" key={option.decision} inverse={selected && props.useColor}>{selected ? "›" : " "} {option.label}{selected && props.screenReader ? "（已选择）" : ""}</Text>;
       })}
-      <Text dimColor={props.useColor}>↑/↓ 选择 · Enter 确认</Text>
+      <Text wrap="truncate" dimColor={props.useColor}>↑/↓ 选择 · Enter 确认 · PgUp/PgDn详情</Text>
     </Box>
   );
 }

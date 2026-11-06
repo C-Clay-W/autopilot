@@ -68,4 +68,28 @@ describe("SessionTaskManager", function sessionTaskManagerSuite() {
     manager.removeSession(key);
     expect(manager.getVisitedSessionIds()).toEqual([]);
   });
+
+  it("协作终态事件只清理匹配 Turn 的陈旧执行态", function clearsMatchingStaleTurn() {
+    const manager = createManager("workspace-a", [createSession("a")]);
+    const key = createWorkspaceSessionKey("workspace-a", "a");
+    manager.beginSession(key, "turn-1");
+    manager.applyThreadTurnTerminal("workspace-a", "a", "turn-1");
+    expect(manager.getSessionSnapshot(key)).toMatchObject({ phase: "completed", activeTurnId: undefined });
+  });
+
+  it("旧 Turn 的迟到终态不覆盖新 Turn", function keepsNewerTurnOnLateTerminal() {
+    const manager = createManager("workspace-a", [createSession("a")]);
+    const key = createWorkspaceSessionKey("workspace-a", "a");
+    manager.beginSession(key, "turn-2");
+    manager.applyThreadTurnTerminal("workspace-a", "a", "turn-1");
+    expect(manager.getSessionSnapshot(key)).toMatchObject({ phase: "starting", activeTurnId: "turn-2" });
+  });
+
+  it("等待类阶段不被协作终态事件改写", function keepsWaitingPhase() {
+    const manager = createManager("workspace-a", [createSession("a")]);
+    const key = createWorkspaceSessionKey("workspace-a", "a");
+    manager.updateRuntimeState(key, "waiting_approval", "turn-3");
+    manager.applyThreadTurnTerminal("workspace-a", "a", "turn-3");
+    expect(manager.getSessionSnapshot(key)).toMatchObject({ phase: "waiting_approval", activeTurnId: "turn-3" });
+  });
 });

@@ -1,12 +1,13 @@
 /**
  * 会话图片附件存储：浏览器上传的图片只保存为会话附件，供 Agent 视觉工具按需读取，不进入 RAG。
  */
-import crypto from "node:crypto";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import path from "node:path";
 import { getAgentWorkspaceRoot } from "@/lib/agent-workspace";
+import { createNodeSessionImageStore } from "@autopilot-agent/adapters";
 
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -20,6 +21,11 @@ export interface SessionImageAttachment {
   name: string;
   mimeType: string;
   relativePath: string;
+  sha256?: string;
+  width?: number;
+  height?: number;
+  bytes?: number;
+  gifFirstFrame?: boolean;
 }
 
 interface UploadedImage {
@@ -56,25 +62,26 @@ function getWorkspaceRelativePath(filePath: string): string {
 export async function storeSessionImage(sessionId: string, file: UploadedImage): Promise<SessionImageAttachment> {
   const name = path.basename(file.name);
   const extension = path.extname(name).toLowerCase();
-  const mimeType = IMAGE_MIME_BY_EXTENSION[extension];
-  if (!mimeType || (file.type && file.type !== mimeType)) throw new SessionAttachmentError("WORK_ATTACHMENT_INVALID");
+  const inputMimeType = IMAGE_MIME_BY_EXTENSION[extension];
+  if (!inputMimeType || (file.type && file.type !== inputMimeType)) throw new SessionAttachmentError("WORK_ATTACHMENT_INVALID");
   if (!file.size || file.size > MAX_IMAGE_BYTES) throw new SessionAttachmentError("WORK_ATTACHMENT_INVALID");
-  const directory = getSessionAttachmentDirectory(sessionId);
-  fs.mkdirSync(directory, { recursive: true });
-  const id = crypto.randomUUID();
-  const filePath = path.join(directory, `${id}${extension}`);
-  const attachment: SessionImageAttachment = { id, name, mimeType, relativePath: getWorkspaceRelativePath(filePath) };
-  const temporaryPath = `${filePath}.tmp`;
-  fs.writeFileSync(temporaryPath, Buffer.from(await file.arrayBuffer()));
-  fs.renameSync(temporaryPath, filePath);
-  fs.writeFileSync(path.join(directory, `${id}.json`), JSON.stringify(attachment), "utf8");
-  return attachment;
+  const bytes = Buffer.from(await file.arrayBuffer());
+  if (bytes.length !== file.size || bytes.length > MAX_IMAGE_BYTES) throw new SessionAttachmentError("WORK_ATTACHMENT_INVALID");
+  try {
+    const attachment = await createNodeSessionImageStore(getAgentWorkspaceRoot()).put({ sessionId, name, mimeType: inputMimeType, bytes });
+    if (getWorkspaceRelativePath(path.resolve(getAgentWorkspaceRoot(), attachment.relativePath)) !== attachment.relativePath) throw new Error("图片附件路径越界");
+    return attachment;
+  }
+  catch (error) {
+    if (error instanceof Error && (error.message.startsWith("图片") || error.message === "SESSION_IMAGE_INVALID")) throw new SessionAttachmentError("WORK_ATTACHMENT_INVALID");
+    throw error;
+  }
 }
 
 /** Resolve browser-submitted attachment IDs only from their own session directory. */
 export function resolveSessionImages(sessionId: string, attachmentIds: unknown): SessionImageAttachment[] {
   if (attachmentIds === undefined) return [];
-  if (!Array.isArray(attachmentIds)) throw new SessionAttachmentError("WORK_ATTACHMENT_INVALID");
+  if (!Array.isArray(attachmentIds) || attachmentIds.length > 10 || new Set(attachmentIds).size !== attachmentIds.length) throw new SessionAttachmentError("WORK_ATTACHMENT_INVALID");
   const directory = getSessionAttachmentDirectory(sessionId);
   const resolved: SessionImageAttachment[] = [];
   for (const id of attachmentIds) {
@@ -95,7 +102,9 @@ export function readSessionImage(sessionId: string, attachmentId: string): { att
   const directory = fs.realpathSync(getSessionAttachmentDirectory(sessionId));
   const filePath = fs.realpathSync(path.resolve(getAgentWorkspaceRoot(), attachment.relativePath));
   if (!filePath.startsWith(`${directory}${path.sep}`)) throw new Error("图片附件路径越界");
-  return { attachment, content: new Uint8Array(fs.readFileSync(filePath)) };
+  const content = fs.readFileSync(filePath);
+  if (attachment.sha256 && (attachment.bytes !== content.length || crypto.createHash("sha256").update(content).digest("hex") !== attachment.sha256)) throw new Error("图片附件校验失败");
+  return { attachment, content: new Uint8Array(content) };
 }
 
 /** Remove all image bytes and metadata when their owning conversation is deleted. */

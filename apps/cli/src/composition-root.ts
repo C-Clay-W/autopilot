@@ -5,21 +5,28 @@
  * trust policy 和显式 stateRoot；不负责命令解析、事件投影或 Runtime 状态机。
  */
 
+import { readCliSessionSummary } from "./session-summary.js";
 import { WEB_SEARCH_DATA_FLOW_NOTICE } from "@autopilot-agent/presentation";
 import {
+  AgentRuntimeError,
   createDefaultModelSamplerFactory,
   createRuntimeBootstrapService,
   createSafeBootstrapConfig,
+  createThreadFacade,
   WorkspaceTrustError,
   type AgentRuntime,
   type AgentSkillsCapability,
   type CapabilityLoader,
   type CreateRuntimeBootstrapServiceOptions,
+  type ModelRef,
   type RuntimeBootstrapService,
+  type RuntimePorts,
   type ResolvedAutopilotSettings,
   type SafeBootstrapConfig,
   type SandboxCapabilityReport,
   type SandboxPort,
+  type ThreadFacade,
+  type ThreadsCapability,
   type WorkspaceTrustEntry,
   type WorkspaceTrustPolicy,
   getMcpServerGrantConstraint,
@@ -34,6 +41,8 @@ import {
   createNodeSandboxPort,
   createNodeSettingsLoader,
   createNodeSettingsWriter,
+  createNodeStateRootId,
+  createNodeThreadHandoffWriter,
   ensureUserConfigDirectory,
   createNodeRuntimePorts,
   createNodeTrustPolicy,
@@ -44,6 +53,7 @@ import {
   getNodeStatePaths,
   getNodeStateSchemaDiagnostic,
   initializeNodeStateRoot,
+  LOCAL_HUMAN_PRINCIPAL_ID,
   resolveNodeSettingsPaths,
   resolveNodeStateRoot,
   assertNodeStateSchema,
@@ -52,6 +62,7 @@ import {
   type NodeCapabilityLoader,
   type NodeSettingsLoader,
 } from "@autopilot-agent/adapters";
+import { createCliThreadHost, type CliThreadHost } from "./thread-host.js";
 import fs from "node:fs";
 import path from "node:path";
 import type { AutopilotSettingsScope } from "@autopilot-agent/core";
@@ -89,6 +100,31 @@ export type CliCapabilityLoader = CapabilityLoader
 /** CLI 专用模型行为补充：无结构化 answerer 时以普通正文完成最少必要澄清。 */
 const CLI_TEXT_CLARIFICATION_INSTRUCTIONS = `当前宿主是 CLI，未提供 ask_user_question 或其他结构化用户回答能力。仅在完成任务确实缺少方向性信息、且不能从当前用户输入、会话历史或工作区安全获得时，才在普通助手正文中用最少必要的简短问题向用户澄清；提出问题后正常结束当前 Turn，等待用户下一条 prompt 作为同一 Session 的新 Turn 继续。不要臆造或调用 ask_user_question，不要把澄清伪装成审批，也不要在等待澄清时猜测并执行写入或命令工具。用户下一条 prompt 与任何 Other/custom 文本都不授予 Trust、权限或审批；后续工具调用仍必须遵守既有 Policy 与 Approval 约束。Agent 自身的临时脚本、截图裁剪和中间文件必须写入项目根目录的 .autopilot/tmp，不得写入 node_modules 或随意污染业务目录；用户明确指定的目标路径除外。`;
 
+/**
+ * 子会话可用的工具目录：协作工具用于回报，Work 常用工具用于真正执行任务。
+ * 这是 CLI 宿主策略（与 Web 首版保持同一最小集合），会随组记录冻结并向用户展示。
+ */
+const CLI_THREAD_ALLOWED_TOOLS: readonly string[] = [
+  "create_thread",
+  "list_threads",
+  "read_thread",
+  "send_thread",
+  "wait_threads",
+  "read_shared_state",
+  "update_shared_state",
+  "report_progress",
+  "read_progress",
+  "interrupt_thread",
+  "resume_thread",
+  "read_file",
+  "glob_files",
+  "grep_files",
+  "edit_file",
+  "write_file",
+  "run_command",
+  "todo_write",
+];
+
 /** CLI Composition Root 对外暴露的启动边界。 */
 export interface CliCompositionRoot {
   readonly stateRoot: string;
@@ -123,6 +159,20 @@ export interface CliCompositionRoot {
   sandboxSetup(workspaceRoot: string): Promise<SandboxCapabilityReport>;
   createRuntime(workspaceRoot: string): Promise<AgentRuntime>;
   bootstrap(): Promise<AgentRuntime>;
+  /** 绑定当前 Project 的协作范围；必须在 Project 确认后调用，Turn 装配据此注入协作工具。 */
+  bindThreadsProject(projectId: string): void;
+  /** 创建人类协作入口（薄命令）；未绑定 Project 或缺少 Ports 时明确失败。 */
+  createHumanThreads(): ThreadFacade;
+  /** 创建常驻协作宿主（交互会话）；未装配协作能力时明确失败。 */
+  createThreadHost(runtime: AgentRuntime, onError?: import("@autopilot-agent/adapters").NodeThreadRunnerOptions["onError"]): CliThreadHost;
+  /** 只读取当前宿主Store事件，不调用恢复或执行入口。 */
+  readSessionEvents(sessionId: string): Promise<import("@autopilot-agent/core").AgentEventEnvelope[]>;
+  /** 只读一页历史及其持续跟进游标，不恢复或执行目标。 */
+  readSessionEventPage(sessionId: string, input: { cursor?: string; limit: number }): Promise<import("./tui/session-manager.js").CliSessionEventPage>;
+  /** 普通目录只返回标题和内部UUID；未支持轻量能力时明确失败。 */
+  readSessionDirectoryPage(projectId: string, input: { cursor?: string; limit: number }): Promise<{ items: Array<{ id: string; title?: string }>; nextCursor?: string }>;
+  /** 关联摘要只读取轻量身份/活动事实。 */
+  readSessionSummary(sessionId: string, signal?: AbortSignal): Promise<(import("@autopilot-agent/core").SessionDirectoryEntry & { currentTurnId?: string; executionView?: import("@autopilot-agent/core").TurnExecutionView | null }) | null>;
   getBootstrapService(): RuntimeBootstrapService;
   /** 只向 Controller 暴露可安全显示的已热更新 settings 默认值。 */
   getRuntimeStatusDefaults(): CliRuntimeStatusDefaults;
@@ -225,6 +275,27 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
   let stopSettingsWatch: (() => void) | undefined;
   /** 最近一次 createRuntime 的 canonical workspaceRoot；tempRoot 注入以其为准。 */
   let activeWorkspaceRoot: string | undefined;
+  /** 最近一次 bootstrap 产生的 Ports；协作 Facade 与宿主共用同一份存储。 */
+  let runtimePorts: RuntimePorts | undefined;
+  /** 已确认的 Project；未绑定时不向 Turn 注入协作能力。 */
+  let threadsProjectId: string | undefined;
+  /** 宿主合法模型目录；随 settings 热更新重建。 */
+  let threadsModelCatalog: readonly ModelRef[] = [];
+
+  /** 返回当前可用的协作范围；缺 Project 或工作区时不注入，避免注册不可用工具。 */
+  function currentThreadsCapability(): ThreadsCapability | undefined {
+    if (!threadsProjectId || !activeWorkspaceRoot) return undefined;
+    return {
+      workspaceId: createNodeWorkspaceId(activeWorkspaceRoot),
+      executionHost: "cli-work-v1",
+      stateRootId: createNodeStateRootId(stateRoot),
+      projectId: threadsProjectId,
+      allowedTools: CLI_THREAD_ALLOWED_TOOLS,
+      modelCatalog: threadsModelCatalog,
+      humanPrincipalId: LOCAL_HUMAN_PRINCIPAL_ID,
+      handoff: createNodeThreadHandoffWriter({ workspaceRoot: activeWorkspaceRoot }),
+    };
+  }
   /** 返回当前 settings 选中模型对应的 route；firstParty 使用 CC 主配置。 */
   function getSelectedProviderSettings(settings: ResolvedAutopilotSettings) {
     const selectedRoute = settings.modelRef && settings.modelRef.provider !== "firstParty"
@@ -256,9 +327,16 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
     const loaded = settingsLoader.load(workspaceRoot);
     resolvedSettings = loaded.settings;
     userSettingsPath = loaded.paths.user;
+    // 模型目录只在 settings 变化时重建；协作创建不能由请求追加目录项。
+    threadsModelCatalog = getModelCapabilities().map(function toModelRef(capability) {
+      return { provider: capability.provider, modelId: capability.modelId };
+    });
     stopSettingsWatch?.();
     stopSettingsWatch = settingsLoader.watch(workspaceRoot, function replaceSettings(next: LoadedNodeSettings) {
       resolvedSettings = next.settings;
+      threadsModelCatalog = getModelCapabilities().map(function toModelRef(capability) {
+        return { provider: capability.provider, modelId: capability.modelId };
+      });
     });
   }
   /** 只检查 Agent 主模型最小配置；不读取或显示任何真实 Key。 */
@@ -459,7 +537,7 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
     capabilityLoader,
     createPorts(workspaceRoot: string) {
       initializeNodeStateRoot(stateRoot);
-      return createNodeRuntimePorts({
+      const ports = createNodeRuntimePorts({
         stateRoot,
         trustRoot: options.trustRoot,
         workspaceRoot,
@@ -469,6 +547,9 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
         //（目录由 ensureProjectAutopilotDirectory 创建并验证），不继承 ambient temp。
         sandboxTempRoot: path.join(workspaceRoot, ".autopilot", "tmp"),
       });
+      // 协作 Facade/宿主必须与 Runtime 使用同一份 Ports，不能另建存储。
+      runtimePorts = ports;
+      return ports;
     },
     defaultRunConfig: {
       ...options.defaultRunConfig,
@@ -477,6 +558,7 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
         const selectedProvider = getSelectedProviderSettings(resolvedSettings);
         const visionRef = resolvedSettings.visionModelRef === false ? undefined : resolvedSettings.visionModelRef ?? resolvedSettings.modelRef;
         const visionRoute = visionRef && resolvedSettings.providerRoutes[visionRef.provider];
+        const threads = currentThreadsCapability();
         return {
           ...(resolvedSettings.maxTurns !== undefined ? { maxSteps: resolvedSettings.maxTurns } : {}),
           ...(resolvedSettings.modelRef ? { modelRef: resolvedSettings.modelRef } : {}),
@@ -486,6 +568,8 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
           // tempRoot 固定指向当前 Runtime 工作区内的受控 .autopilot/tmp。
           ...(resolvedSettings.sandbox.mode ? { sandboxMode: resolvedSettings.sandbox.mode } : {}),
           ...(activeWorkspaceRoot ? { sandboxTempRoot: path.join(activeWorkspaceRoot, ".autopilot", "tmp") } : {}),
+          // 协作能力只来自宿主默认值；Turn/Project/Session override 不能注入或替换。
+          ...(threads ? { threads } : {}),
           providerSettings: {
             ...(selectedProvider ? { primary: selectedProvider } : {}),
             routes: resolvedSettings.providerRoutes,
@@ -629,9 +713,52 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
     createRuntime: async function createRuntime(workspaceRoot: string) {
       activateSettings(workspaceRoot);
       activeWorkspaceRoot = workspaceRoot;
+      // 上一次 Runtime 的 Ports 不能沿用；协作 Facade 必须绑定当前 Runtime。
+      runtimePorts = undefined;
       const runtime = await bootstrapService.createRuntime(workspaceRoot);
       workspaceRegistry.register(workspaceRoot);
       return runtime;
+    },
+    readSessionEvents: async function readSessionEvents(sessionId) {
+      if (!runtimePorts) throw new Error("CLI_RUNTIME_NOT_ATTACHED");
+      return runtimePorts.transcriptStore.getEvents(sessionId);
+    },
+    readSessionEventPage: async function readSessionEventPage(sessionId, input) {
+      if (!runtimePorts) throw new Error("CLI_RUNTIME_NOT_ATTACHED");
+      return runtimePorts.transcriptStore.readPage(sessionId, input);
+    },
+    readSessionDirectoryPage: async function readSessionDirectoryPage(projectId, input) {
+      if (!runtimePorts?.sessionStore.listDirectoryPage) throw new Error("CLI_SESSION_DIRECTORY_UNAVAILABLE");
+      return runtimePorts.sessionStore.listDirectoryPage({ ...input, projectId });
+    },
+    readSessionSummary: async function readSessionSummary(sessionId, signal) {
+      if (!runtimePorts?.sessionStore.getDirectoryEntry) throw new Error("CLI_SESSION_DIRECTORY_UNAVAILABLE");
+      return readCliSessionSummary(runtimePorts, sessionId, signal);
+    },
+    bindThreadsProject: function bindThreadsProject(projectId: string) {
+      threadsProjectId = projectId;
+    },
+    createHumanThreads: function createHumanThreads() {
+      const capability = currentThreadsCapability();
+      if (!capability || !runtimePorts || !activeWorkspaceRoot) throw new AgentRuntimeError("THREADS_UNAVAILABLE", "THREADS_UNAVAILABLE");
+      return createThreadFacade(runtimePorts, {
+        ...capability,
+        // 本机人类身份由受信宿主绑定；不来自请求参数、消息正文或模型输出。
+        actor: { kind: "human", principalId: LOCAL_HUMAN_PRINCIPAL_ID },
+        // 交接文档由 Node Adapter 原子写入受信工作区；Core 只接收安全引用。
+        handoff: createNodeThreadHandoffWriter({ workspaceRoot: activeWorkspaceRoot }),
+      });
+    },
+    createThreadHost: function createThreadHost(runtime: AgentRuntime, onError?: import("@autopilot-agent/adapters").NodeThreadRunnerOptions["onError"]) {
+      const capability = currentThreadsCapability();
+      if (!capability || !runtimePorts) throw new AgentRuntimeError("THREADS_UNAVAILABLE", "THREADS_UNAVAILABLE");
+      return createCliThreadHost({
+        workspaceId: capability.workspaceId,
+        stateRootId: capability.stateRootId,
+        runtime,
+        ports: runtimePorts,
+        ...(onError ? { onError } : {}),
+      });
     },
     bootstrap: async function bootstrap() {
       const trusted = await bootstrapService.establishTrust();

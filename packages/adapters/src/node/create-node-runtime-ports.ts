@@ -16,6 +16,7 @@ import { createNodeCredentialStore } from "./stores/node-credential-store";
 import { createNodeEventSink } from "./stores/node-event-sink";
 import { createNodeInputInbox } from "./stores/node-input-inbox";
 import { createNodeProjectStore } from "./stores/node-project-store";
+import { createNodeThreadStore } from "./stores/node-thread-store";
 import { createNodeSessionStore } from "./stores/node-session-store";
 import { createNodeTranscriptStore } from "./stores/node-transcript-store";
 import { createNodeTurnStore } from "./stores/node-turn-store";
@@ -25,6 +26,7 @@ import { createNodeJobStore } from "./stores/node-job-store";
 import { createNodeJobOwnerProbe } from "./job-owner-probe";
 import { createNodeFileMutationStore } from "./stores/node-file-mutation-store";
 import { createNodeSessionResourceStore } from "./stores/node-session-resource-store";
+import { createNodeSessionImageStore } from "./stores/node-session-image-store";
 import { createNodeUserQuestionStore } from "./stores/node-user-question-store";
 import type { NodeWorkspaceAdapterOptions, NodeStoreOptions } from "./types";
 
@@ -59,6 +61,7 @@ export function createNodeRuntimePorts(options: NodeRuntimePortsOptions): Runtim
   function noWorkspace(): never { throw createNodeIdentityError("WORKSPACE_REQUIRED"); }
   return {
     hostMutationProtection: options.productMode === "chat" ? undefined : createNodeHostMutationProtection(options),
+    threadStore: createNodeThreadStore(options.stateRoot),
     sessionStore: createNodeSessionStore({ ...storeOptions, productMode: options.productMode }),
     checkpointStore: createNodeCheckpointStore(storeOptions),
     transcriptStore: createNodeTranscriptStore(storeOptions),
@@ -80,6 +83,7 @@ export function createNodeRuntimePorts(options: NodeRuntimePortsOptions): Runtim
       /** Chat 必须由独立存储入口绑定临时附件清理，缺失装配时禁止假成功。 */
       async deleteBySession() { throw new NodeChatError("CHAT_ATTACHMENT_STORE_REQUIRED"); },
     } : createNodeSessionResourceStore(options.workspaceRoot ?? options.cwd ?? process.cwd()),
+    sessionImageStore: options.productMode === "chat" || !options.workspaceRoot ? undefined : createNodeSessionImageStore(options.workspaceRoot),
     userQuestionStore: createNodeUserQuestionStore(storeOptions),
     /**
      * Stage 2：Work 模式装配真实 SRT adapter（绑定 canonical workspaceRoot；tempRoot

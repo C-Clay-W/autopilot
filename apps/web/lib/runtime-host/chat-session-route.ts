@@ -1,6 +1,6 @@
 /** Chat HTTP 适配：校验封闭 DTO 与持久身份，复用 Core Session/Turn、Web SSE 和历史投影。 */
 import { createChatKnowledgeUploadResponse, toChatKnowledgeError } from "./chat-knowledge-route";
-import { WebRouteError, findHttpFailure, httpErrorResponse, readHttpErrorCode, readRequestObject, readRequestForm } from "./web-http-error";
+import { STATE_HTTP_FAILURES, WebRouteError, findHttpFailure, httpErrorResponse, readHttpErrorCode, readRequestObject, readRequestForm } from "./web-http-error";
 import { createHash } from "node:crypto";
 import type { ChatRetrievalMode, Session } from "@autopilot-agent/core";
 import { NodeChatError } from "@autopilot-agent/adapters";
@@ -36,7 +36,7 @@ const CHAT_HTTP_FAILURES = {
 /** 只输出固定 HTTP 错误；未知异常为 500，明确停用或能力不可用才为 503。 */
 export function toChatErrorResponse(error: unknown): Response {
   const code = readHttpErrorCode(error);
-  const failure = findHttpFailure(CHAT_HTTP_FAILURES, code);
+  const failure = findHttpFailure(CHAT_HTTP_FAILURES, code) ?? findHttpFailure(STATE_HTTP_FAILURES, code);
   return failure ? httpErrorResponse(code!, failure) : httpErrorResponse("CHAT_INTERNAL_ERROR", CHAT_HTTP_FAILURES.CHAT_INTERNAL_ERROR);
 }
 

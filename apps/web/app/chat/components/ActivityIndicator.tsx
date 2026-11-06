@@ -10,11 +10,15 @@ const ACTIVITY_FRAME_MS = 120;
 const TOOL_TRANSITION_MS = 2_000;
 
 interface ActivityIndicatorProps {
+  variant?: "status" | "scan";
   activeOperation?: ActiveOperation;
   toolStartedAt?: string;
   activity?: WebActivityState;
   running: boolean;
   startedAt?: number;
+  elapsedMs?: number;
+  runningSince?: number;
+  resuming?: boolean;
 }
 
 /** 依据共享活动状态选择稳定文案；组件不读取模型原始文本。 */
@@ -30,7 +34,7 @@ function getActivityLabel(activeOperation: ActiveOperation | undefined, toolStar
 }
 
 /** 渲染与 CLI 相同的固定宽度离散活动帧；降低动态偏好时保留静态提示。 */
-export default function ActivityIndicator({ activeOperation, toolStartedAt, activity, running, startedAt }: ActivityIndicatorProps) {
+export default function ActivityIndicator({ variant = "status", activeOperation, toolStartedAt, activity, running, startedAt, elapsedMs, runningSince, resuming }: ActivityIndicatorProps) {
   const [now, setNow] = useState(function getInitialTime() { return Date.now(); });
   const [reducedMotion, setReducedMotion] = useState(false);
 
@@ -55,13 +59,14 @@ export default function ActivityIndicator({ activeOperation, toolStartedAt, acti
   }, [reducedMotion, running]);
 
   if (!running) return null;
+  if (variant === "scan") return <span className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true"><span className="knowledge-ingest-sweep block h-full w-1/4 bg-accent/10" /></span>;
   const view = activity ? resolveWebActivityView({ activity, running, now }) : undefined;
   if (activity && !view) return null;
   const frame = reducedMotion ? "·" : ACTIVITY_FRAMES[Math.floor(now / ACTIVITY_FRAME_MS) % ACTIVITY_FRAMES.length];
-  const label = view?.label ?? getActivityLabel(activeOperation, toolStartedAt);
+  const label = resuming ? "正在恢复" : activeOperation?.kind === "approval" ? "等待授权" : activeOperation?.kind === "question" ? "等待回答" : view?.label ?? getActivityLabel(activeOperation, toolStartedAt);
   const progressTail = activity?.progressTail;
-  const turnStartedAt = startedAt ?? activity?.startedAt;
-  const seconds = turnStartedAt === undefined ? undefined : Math.floor(Math.max(0, now - turnStartedAt) / 1000);
+  const duration = elapsedMs === undefined ? undefined : elapsedMs + (runningSince === undefined || resuming ? 0 : Math.max(0, now - runningSince));
+  const seconds = duration === undefined ? undefined : Math.floor(duration / 1000);
   const elapsed = seconds === undefined ? undefined : seconds < 60 ? `${seconds} 秒` : `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`;
   return <p className="mt-2 flex items-center gap-2 text-xs text-muted" role="status" aria-live="polite"><span className="inline-block w-3 text-center text-accent" aria-hidden="true">{frame}</span><span>{label}{elapsed ? ` · ${elapsed}` : ""}{progressTail ? ` · ${progressTail}` : ""}</span></p>;
 }

@@ -7,6 +7,7 @@
  * Phase 3 新增 projects / sessions 服务；modelSamplerFactory 留给 Step 7 后续接入。
  */
 
+import { createThreadFacade } from "../application/thread-service";
 import { createTurnService } from "../application/turn-service";
 import type { TurnService } from "../application/turn-service";
 import { createProjectService } from "../application/project-service";
@@ -19,6 +20,7 @@ import type { RunConfig } from "../protocol";
 import type { AgentRuntime } from "./agent-runtime";
 import { createJobService } from "../application/job-service";
 import { createUndoService } from "../application/undo-service";
+import { readTurnExecutionView } from "../application/turn/turn-execution-view";
 
 /** 创建 Runtime 所需参数。 */
 export interface CreateAgentRuntimeOptions {
@@ -41,6 +43,7 @@ export function createAgentRuntime(options: CreateAgentRuntimeOptions): AgentRun
     transcriptStore: ports.transcriptStore,
     turnStore: ports.turnStore,
     clock: ports.clock,
+    readExecution: function readExecution(input) { return readTurnExecutionView(ports, input); },
     // Talk-Plan1013 Stage 2：外部权限规则投影；缺省时 allow_workspace 外部授权保持 pending。
     externalRuleProjector: ports.externalPermissionProjector,
   });
@@ -51,7 +54,9 @@ export function createAgentRuntime(options: CreateAgentRuntimeOptions): AgentRun
   const projects = createProjectService(ports.projectStore);
   const sessions = createSessionService(ports, jobs);
   const undo = createUndoService(ports);
+  if (!ports.threadStore) throw new Error("THREADS_UNAVAILABLE");
   return {
+    threads: { bind: function bind(context) { return createThreadFacade(ports, context); } },
     turns,
     projects,
     sessions,

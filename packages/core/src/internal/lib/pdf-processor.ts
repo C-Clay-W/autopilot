@@ -9,6 +9,7 @@ import { execFile } from "node:child_process";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { RagError, toRagError, type RagErrorCode } from "../rag-error";
+import { drawImageCanvas, loadCanvasModule } from "./image-normalization";
 
 /** 单页 PDF 文本。 */
 export interface PdfTextPage {
@@ -227,12 +228,11 @@ export async function cleanupPdfRenderDirectory(outputDir: string): Promise<void
 export async function normalizeKnowledgeImage(bytes: Buffer, signal?: AbortSignal): Promise<Buffer> {
   if (signal?.aborted) throw new PdfProcessingCancelledError();
   if (!bytes.length || bytes.length > 20 * 1024 * 1024) throw new RagError("RAG_INVALID_INPUT");
-  const { loadImage, createCanvas } = await import("@napi-rs/canvas");
+  const { loadImage } = await loadCanvasModule();
   const image = await loadImage(bytes);
   if (!image.width || !image.height || image.width * image.height > 40_000_000) throw new RagError("RAG_INVALID_INPUT");
   const scale = Math.min(1, 2048 / Math.max(image.width, image.height));
-  const canvas = createCanvas(Math.max(1, Math.round(image.width * scale)), Math.max(1, Math.round(image.height * scale)));
-  canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+  const canvas = await drawImageCanvas(image, Math.max(1, Math.round(image.width * scale)), Math.max(1, Math.round(image.height * scale)));
   const result = canvas.toBuffer("image/png");
   if (result.length > 5 * 1024 * 1024) throw new RagError("RAG_INVALID_INPUT");
   if (signal?.aborted) throw new PdfProcessingCancelledError();

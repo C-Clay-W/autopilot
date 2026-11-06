@@ -1,6 +1,7 @@
 /**
  * 工具执行器：固定执行校验、权限、审批、取消与审计顺序，保证每次调用都有终态。
  */
+import { createThreadObservationDisplay } from "./thread-observation-display";
 import { isToolWithinCeiling } from "../../runtime/domain/product-mode";
 import { randomUUID } from "node:crypto";
 import { hashNormalizedToolInput as hashInput } from "./normalized-tool-input";
@@ -110,8 +111,25 @@ function createSafeActionPreview(facts: ToolActionFacts): string | undefined {
   return limited && suffix ? `${limited}${suffix}` : limited || undefined;
 }
 
+/** 协作工具共用的安全展示键：只表达读取/请求语义，不在标题里重复会话 ID 或消息正文。 */
+const THREAD_TOOL_TITLE_KEYS: Record<string, string> = {
+  create_thread: "tool.thread.write.completed",
+  list_threads: "tool.thread.read.completed",
+  read_thread: "tool.thread.read.completed",
+  send_thread: "tool.thread.write.completed",
+  wait_threads: "tool.thread.read.completed",
+  read_shared_state: "tool.thread.read.completed",
+  update_shared_state: "tool.thread.write.completed",
+  report_progress: "tool.thread.write.completed",
+  read_progress: "tool.thread.read.completed",
+  interrupt_thread: "tool.thread.write.completed",
+  resume_thread: "tool.thread.write.completed",
+};
+
 /** 将内置工具名映射为 Presentation 已冻结的展示文案键，未知工具继续使用安全回退。 */
 function getToolDisplayTitleKey(toolName: string): string {
+  const threadKey = THREAD_TOOL_TITLE_KEYS[toolName];
+  if (threadKey) return threadKey;
   if (toolName === "read_file") return "tool.read.completed";
   if (toolName === "glob_files" || toolName === "grep_files") return "tool.search.completed";
   if (toolName === "web_search") return "tool.web_search.completed";
@@ -540,22 +558,43 @@ function createTimeoutResult(request: ToolExecutionRequest, inputHash: string, d
   };
 }
 
-/** 组合 Runtime 取消与 metadata 超时；超时仅中止当前工具，不替代上层 Runtime 的 AbortSignal。 */
+/** 在实际执行入口统一解析已校验请求超时；内部剩余预算只能进一步收紧，不能扩大请求或 metadata 上限。 */
+function resolveTimeoutMs(input: unknown, timeout: { defaultMs?: number; maxMs?: number } | undefined, remainingMs: number | undefined): number | undefined {
+  const requested = timeout?.defaultMs === undefined ? undefined
+    : input && typeof input === "object" && typeof (input as { timeoutMs?: unknown }).timeoutMs === "number"
+      ? (input as { timeoutMs: number }).timeoutMs : timeout.defaultMs;
+  const resolved = requested ?? remainingMs;
+  if (resolved === undefined) return undefined;
+  return Math.min(resolved, remainingMs ?? resolved, timeout?.maxMs ?? resolved);
+}
+
+/** 组合 Runtime 取消与 metadata 超时并固定首个中止来源；取消先到时清除 deadline，等待工具自行收敛。 */
 function createExecutionDeadline(signal: AbortSignal | undefined, timeoutMs: number | undefined): { signal: AbortSignal | undefined; timedOut: () => boolean; cleanup: () => void } {
   if (!timeoutMs) return { signal, timedOut: () => false, cleanup: () => undefined };
   const controller = new AbortController();
   let timedOut = false;
-  const abortFromParent = () => controller.abort();
-  if (signal?.aborted) controller.abort();
-  else signal?.addEventListener("abort", abortFromParent, { once: true });
-  const timeout = setTimeout(() => {
-    timedOut = true;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  /** 父取消只在尚未中止时生效，并阻止后来的 deadline 改写原因。 */
+  function abortFromParent(): void {
+    if (controller.signal.aborted) return;
+    clearTimeout(timeout);
     controller.abort();
-  }, timeoutMs);
+  }
+  if (signal?.aborted) abortFromParent();
+  else {
+    signal?.addEventListener("abort", abortFromParent, { once: true });
+    timeout = setTimeout(function onTimeout() {
+      if (controller.signal.aborted) return;
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+  }
   return {
     signal: controller.signal,
-    timedOut: () => timedOut,
-    cleanup: () => {
+    /** 只读取首个中止是否来自 deadline。 */
+    timedOut: function didTimeOut() { return timedOut; },
+    /** 所有终态都解除父信号监听并清理未触发的 timer。 */
+    cleanup: function cleanupDeadline() {
       clearTimeout(timeout);
       signal?.removeEventListener("abort", abortFromParent);
     },
@@ -600,12 +639,12 @@ export class ToolExecutor {
       }
       if (!isToolWithinCeiling(this.context.capabilityCeiling, request.toolName)) throw createToolError(TOOL_ERROR_CODES.CHAT_TOOL_FORBIDDEN, "产品模式禁止此工具");
       const definition = this.registry.get(request.toolName);
-      timeoutMs ??= definition.metadata.timeout?.defaultMs;
       const parsed = definition.inputSchema.safeParse(request.input);
       if (!parsed.success) {
         emitToolEvent(this.context, { type: "tool_validation_failed", callId: request.callId, toolName: request.toolName, errorCode: TOOL_ERROR_CODES.INVALID_INPUT });
         throw createToolError(TOOL_ERROR_CODES.INVALID_INPUT, "工具参数不符合 Schema");
       }
+      timeoutMs = resolveTimeoutMs(parsed.data, definition.metadata.timeout, options.timeoutMs);
       inputHash = hashInput(parsed.data);
       deadline = createExecutionDeadline(options.signal ?? this.context.signal, timeoutMs);
       const signal = deadline.signal;
@@ -615,15 +654,16 @@ export class ToolExecutor {
         return result;
       }
 
-      const policyContext = { ...this.context, signal };
+      // 策略事实与执行阶段使用同一个调用身份，供受信工具派生精确目标。
+      const policyContext = { ...this.context, signal, toolCallId: request.callId };
       await definition.validateInput?.(parsed.data, policyContext);
       const facts = await definition.createActionFacts(parsed.data, policyContext);
-      display = createToolDisplayFacts(facts);
+      display = { ...createToolDisplayFacts(facts), observation: createThreadObservationDisplay(request.toolName, parsed.data) };
       // Stage 3/4：run_command（前台）与 start_background_job（后台）是仅有的两个进程类
       // 入口。先解析沙箱执行范围：绑定缺失或能力不可执行都得到 undefined，evaluate 时以
       // available:false fail-closed（G3/G7），不转普通审批，更不裸跑。其他工具不注入沙箱
       // 事实，行为与本字段引入前一致。
-      const sandboxEligible = request.toolName === "run_command" || request.toolName === "start_background_job";
+      const sandboxEligible = request.toolName === "run_command" || request.toolName === "start_background_job" || (request.toolName === "open_preview" && facts.operation === "prepare_static_preview");
       // 进程类工具先解析沙箱执行范围。探测只读 status 不启动目标命令，重试安全；
       // 最多 3 次尝试，仍失败按模式分流（CR 20261016 R2 fail-closed）：read-only 与
       // workspace-write 一律 fail-closed deny——沙箱不可用即不存在受控执行通道，无法
@@ -674,13 +714,15 @@ export class ToolExecutor {
       const grantMatched = facts.externalExecutionTarget ? executionAuthorization !== null : this.policyEngine.canUsePersistentGrant(policyContext, facts)
         && await policyContext.resolvePersistentGrant?.({ toolName: request.toolName, inputHash, input: parsed.data, constraint: facts.stableConstraint, risk: facts.risk }) === true;
       const hostExecution = sandboxScope?.execution === "host";
-      const policy = this.policyEngine.evaluate({ context: policyContext, metadata: definition.metadata, facts, grantMatched, ...(sandboxFacts ? { sandbox: sandboxFacts } : {}), ...(hostExecution ? { hostExecution: true } : {}) });
+      let policy = this.policyEngine.evaluate({ context: policyContext, metadata: definition.metadata, facts, grantMatched, ...(sandboxFacts ? { sandbox: sandboxFacts } : {}), ...(hostExecution ? { hostExecution: true } : {}) });
       if (policy.decision === "deny") {
         // R5：诊断已提升为 display.diagnostics 结构化事实；消息保持策略原因本身，不重复拼接。
         const error = { code: policy.errorCode ?? TOOL_ERROR_CODES.COMMAND_FORBIDDEN, message: policy.reason };
         emitToolEvent(this.context, { type: "tool_denied", callId: request.callId, toolName: request.toolName, inputHash, status: "denied", errorCode: error.code });
         return { status: "denied", callId: request.callId, toolName: request.toolName, error, display };
       }
+      // 过期重签不能因权限模式或已有grant变成实际执行；硬拒绝已在上方原路径返回。
+      if (options.approvalOnly) policy = { ...policy, decision: "approval_required", reason: "原审批已失效，执行前需要重新确认", allowedApprovalDecisions: policy.allowedApprovalDecisions ?? ["allow_once", "deny"] };
       if (request.approval?.decision === "deny") {
         const error = { code: TOOL_ERROR_CODES.APPROVAL_REQUIRED, message: "用户拒绝执行本次工具调用" };
         emitToolEvent(this.context, { type: "tool_denied", callId: request.callId, toolName: request.toolName, inputHash, status: "denied", errorCode: error.code });
@@ -693,7 +735,8 @@ export class ToolExecutor {
       if (facts.externalExecutionTarget && request.approval) executionAuthorization = await callExecutionAuthority(async function consumeApprovedExecution() { return externalAuthority!.authorize({ toolName: request.toolName, input: parsed.data, callId: request.callId, inputHash, constraint: facts.stableConstraint!, approval: request.approval }); });
       let consumed = true;
       if (policy.decision === "approval_required") {
-        if (facts.externalExecutionTarget) {
+        if (options.approvalOnly) consumed = false;
+        else if (facts.externalExecutionTarget) {
           // Talk-Plan1022 CR R1：Windows 宿主执行只认本调用新签发的 allow_once。旧 allow_session/
           // allow_workspace 授权会让 ApprovalService 在无 approval 时直接返回真实封印授权，若把它当作
           // 本次批准就会跳过逐次无隔离确认；沙箱平台继续沿用原有持久授权语义。
@@ -725,6 +768,7 @@ export class ToolExecutor {
         ...this.context,
         signal,
         toolCallId: request.callId,
+        reportingAgreement: request.toolName === "send_thread" ? options.reportingAgreement : undefined,
         webFetchRedirectsRemaining: getWebFetchRedirectBudget(request.input),
         ...(sandboxScope ? { sandboxPolicy: sandboxScope } : {}),
         ...(directSandboxBypass || sandboxScope?.execution === "host" ? { sandboxExecutionOverride: "direct" as const } : {}),
@@ -746,7 +790,13 @@ export class ToolExecutor {
         emitToolEvent(this.context, { type: "tool_error", callId: request.callId, toolName: request.toolName, inputHash, status: result.status, durationMs: result.meta.durationMs, errorCode: result.error.code });
         return { ...result, display };
       }
+      if (signal?.aborted) {
+        const result = createCancelledResult(request, inputHash, Date.now() - startedAt, "用户已取消工具调用", "executing", "unknown");
+        emitToolEvent(this.context, { type: "tool_cancelled", callId: request.callId, toolName: request.toolName, inputHash, status: result.status, durationMs: result.meta.durationMs, errorCode: result.error.code });
+        return { ...result, display };
+      }
       const serialized = definition.serializeOutput(output);
+      const images = definition.getImageReferences?.(output);
       const outputBytes = Buffer.byteLength(JSON.stringify(serialized), "utf8");
       const truncated = Boolean(serialized && typeof serialized === "object" && "truncated" in serialized && (serialized as { truncated?: unknown }).truncated);
       const meta = { durationMs: Date.now() - startedAt, inputHash, outputBytes, truncated };
@@ -757,12 +807,13 @@ export class ToolExecutor {
       }
       emitToolEvent(this.context, { type: "tool_result", callId: request.callId, toolName: request.toolName, inputHash, status: "success", durationMs: meta.durationMs, outputBytes, truncated });
       const toolDetail = definition.projectDisplayDetail?.(output);
-      const resultDisplay = createToolDisplayFacts(facts, { durationMs: meta.durationMs, outputBytes, truncated }, serialized, toolDetail);
+      const resultDisplay = { ...createToolDisplayFacts(facts, { durationMs: meta.durationMs, outputBytes, truncated }, serialized, toolDetail), observation: createThreadObservationDisplay(request.toolName, parsed.data, serialized) };
       return {
         status: "success",
         callId: request.callId,
         toolName: request.toolName,
         output: serialized,
+        ...(images?.length ? { images } : {}),
         meta,
         // R5：成功终态同样携带进程类的结构化执行方式（sandboxed/unisolated），展示层不得宣称隔离。
         display: display?.executionMode
@@ -770,6 +821,15 @@ export class ToolExecutor {
           : resultDisplay,
       };
     } catch (error) {
+      // 先发生的中止也约束工具晚抛的异常/重定向；不重开执行，不把未知副作用标为可重试。
+      if (deadline?.signal?.aborted) {
+        const durationMs = Date.now() - startedAt;
+        const result = deadline.timedOut()
+          ? createTimeoutResult(request, inputHash, durationMs, "工具执行超过 metadata 声明的超时限制")
+          : createCancelledResult(request, inputHash, durationMs, "用户已取消工具调用", "executing", "unknown");
+        emitToolEvent(this.context, { type: result.status === "cancelled" ? "tool_cancelled" : "tool_error", callId: request.callId, toolName: request.toolName, inputHash, status: result.status, durationMs, errorCode: result.error.code });
+        return { ...result, display };
+      }
       if (error instanceof WebFetchRedirect && this.context.capabilityCeiling?.productMode === "chat") {
         return { status: "error", callId: request.callId, toolName: request.toolName, error: { code: TOOL_ERROR_CODES.WEB_URL_BLOCKED, message: "Chat 不允许需要额外审批的网页重定向" } };
       }
@@ -788,11 +848,6 @@ export class ToolExecutor {
       }
       const safeError = toToolError(error);
       const durationMs = Date.now() - startedAt;
-      if (deadline?.timedOut()) {
-        const result = createTimeoutResult(request, inputHash, durationMs, "工具执行超过 metadata 声明的超时限制");
-        emitToolEvent(this.context, { type: "tool_error", callId: request.callId, toolName: request.toolName, inputHash, status: result.status, durationMs, errorCode: result.error.code });
-        return { ...result, display };
-      }
       if (safeError.code === TOOL_ERROR_CODES.EXECUTION_CANCELLED) {
         const result = createCancelledResult(request, inputHash, durationMs, safeError.message, "executing", "unknown");
         emitToolEvent(this.context, { type: "tool_cancelled", callId: request.callId, toolName: request.toolName, inputHash, status: result.status, durationMs, errorCode: safeError.code });

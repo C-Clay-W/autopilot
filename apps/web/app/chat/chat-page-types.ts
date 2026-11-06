@@ -2,7 +2,7 @@
 import type { ProcessStep } from "./components/process-step";
 import type { KnowledgeIngestItem } from "./components/KnowledgeIngestCard";
 import type { AgentPresentationState } from "@autopilot-agent/presentation";
-import type { AgentTerminationView, ChatRetrievalMode, ContextUsageView } from "@autopilot-agent/core";
+import type { AgentTerminationView, ChatRetrievalMode, ContextUsageView, TurnUsageSummaryView } from "@autopilot-agent/core";
 import type { WebTurnFailure } from "@/lib/runtime-host/web-turn-failure";
 import type {
   WebSessionDto as SessionMeta,
@@ -44,11 +44,19 @@ export interface Message {
   knowledgeIngestItems?: KnowledgeIngestItem[];
   knowledgeFiles?: Array<{ name: string; size: number }>;
   clientRecordId?: string;
+  /** 受信来源：thread 来源 Prompt 由宿主写入，UI 据此显示固定标签；正文无法伪造。 */
+  origin?: { kind: "thread"; threadId: string };
+  /** 仅由受信交付链生成的交接展示快照。 */
+  handoffDisplay?: { title: string; instruction: string; summary: string };
   createdAt?: number;
   /** 任务达到最大执行步骤时为 true，UI 会渲染“继续执行”按钮 */
   canContinue?: boolean;
+  /** 已保存问题的原请求身份，恢复时不重复提交答案。 */
+  questionRequestId?: string;
   /** 继续请求本身失败的结构化原因；只在当前消息内展示，不隐藏可恢复入口。 */
   recoveryError?: string;
+  /** 停止请求与权威确认分开呈现，待确认保留再次停止入口。 */
+  stopState?: "requesting" | "pending" | "stopped";
   /** 本地实时请求尚未被 History 持久化投影确认。 */
   optimistic?: boolean;
 }
@@ -82,10 +90,16 @@ export interface SelectedSkill {
 }
 
 export interface SessionAgentState {
+  requestId?: string;
+  continuation?: { controlId: string; state: string; failureCode?: string };
   turnId: string;
+  approvalId?: string;
   status: "awaiting_approval" | "awaiting_user_input" | "interrupted_recoverable" | "limit_reached" | "failed";
   recoverable: boolean;
   termination?: AgentTerminationView;
+  execution?: "active" | "inactive" | "unconfirmed" | "lost";
+  interactionState?: "pending" | "decided" | "expired" | "unconfirmed";
+  warning?: "summary_lag";
 }
 
 export interface PendingAgentInput {
@@ -112,6 +126,8 @@ export interface SessionHistoryPayload extends SessionTaskTerminalSnapshot {
   attachments?: ChatAttachmentView[];
   /** Core 最新安全 Context Usage 快照；null/缺失表示当前无可用展示事实。 */
   contextUsage?: ContextUsageView | null;
+  /** Core 最近 Turn 的累计用量汇总（输入/输出/总量与执行段耗时）；null/缺失表示当前无可用展示事实。 */
+  turnUsage?: TurnUsageSummaryView | null;
 }
 
 /** Chat 临时附件只展示安全标识与有效期，不包含存储路径。 */
@@ -137,4 +153,4 @@ export interface InputDeliveryNotice {
 }
 
 /** Session Context Usage 顶栏展示直接消费 Core 安全 DTO；Web 不再定义本地预算形状。 */
-export type { ContextUsageView };
+export type { ContextUsageView, TurnUsageSummaryView };

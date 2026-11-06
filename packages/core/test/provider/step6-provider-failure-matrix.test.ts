@@ -14,6 +14,7 @@ import { AgentSampleError, type AgentSampleErrorCode } from "../../src/internal/
 import type { AgentLoopEvent } from "../../src/internal/agent-runtime";
 import { ToolRegistry } from "../../src/internal/tools/tool-registry";
 import { createOpenAiChatCompletionsSampler } from "../../src/runtime/provider/openai-chat-completions-adapter";
+import { parseRetryAfterMs } from "../../src/runtime/provider/provider-failure-normalization";
 
 const providerConnection = { baseUrl: "https://provider.invalid/v1", apiKey: "fake-test-key" };
 const emptyTools = [];
@@ -62,14 +63,15 @@ function createSuccessfulSample() {
   return { content: "已恢复", toolCalls: [], reasoningSummary: "完成", finishReason: "stop" };
 }
 
-/** 创建最小 Kernel，避免测试依赖工作区工具。 */
-function createKernel(turnId: string, sampler: ModelSampler) {
+/** 创建最小 Kernel，避免测试依赖工作区工具；可选注入取消信号用于验证退避等待中的取消语义。 */
+function createKernel(turnId: string, sampler: ModelSampler, signal?: AbortSignal) {
   return createAgentKernel({
     turnId,
     messages: [{ role: "user", content: [{ type: "text", text: "执行 Provider 故障测试" }] }],
     toolRegistry: new ToolRegistry(),
     permissionContext: { mode: "auto_approve" },
     modelSampler: sampler,
+    ...(signal ? { signal } : {}),
   });
 }
 
@@ -129,6 +131,27 @@ describe("sampleAgentStream Provider 故障分类", function providerFailureClas
     expect(String(error)).not.toContain("fake-test-key");
   });
 
+  it("HTTP 错误携带 Retry-After 秒数时保留毫秒提示", async function keepsRetryAfterSeconds() {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(
+      '{"error":{"message":"raw-provider-secret fake-test-key"}}',
+      { status: 429, headers: { "Retry-After": "3" } },
+    )));
+
+    const error = await sampleProvider().catch(function captureError(value: unknown) { return value; });
+
+    expect(error).toBeInstanceOf(AgentSampleError);
+    expect(error).toMatchObject({ retryAfterMs: 3_000 });
+  });
+
+  it("Retry-After 支持 HTTP-date 且非法值不猜测", function parsesRetryAfterHeader() {
+    const now = Date.parse("2026-10-27T00:00:00Z");
+
+    expect(parseRetryAfterMs("2026-10-27T00:01:00Z", now)).toBe(60_000);
+    expect(parseRetryAfterMs("2.5", now)).toBe(2_500);
+    expect(parseRetryAfterMs("not-a-delay", now)).toBeUndefined();
+    expect(parseRetryAfterMs("", now)).toBeUndefined();
+  });
+
   it("内部请求超时与用户取消使用不同错误语义", async function distinguishesTimeoutFromCancel() {
     vi.useFakeTimers();
     vi.stubGlobal("fetch", vi.fn().mockImplementation(function pendingFetch(_url: string, init?: RequestInit) {
@@ -173,11 +196,14 @@ describe("Kernel Provider 有限恢复与熔断", function providerRecoverySuite
     "PROVIDER_TIMEOUT",
     "PROVIDER_RATE_LIMIT",
     "PROVIDER_SERVER_ERROR",
-  ] as AgentSampleErrorCode[])("%s 只恢复一次并保持同一 Turn 上下文", async function retriesTransientFailureOnce(code) {
+  ] as AgentSampleErrorCode[])("%s 退避后恢复并保持同一 Turn 上下文", async function retriesTransientFailureOnce(code) {
+    vi.useFakeTimers();
     const sampleMock = vi.fn()
       .mockRejectedValueOnce(new AgentSampleError("安全 Provider 错误", code))
       .mockResolvedValueOnce(createSuccessfulSample());
-    const events = await collectEvents(createKernel(`retry-${code}`, { sample: sampleMock }).run());
+    const eventsPromise = collectEvents(createKernel(`retry-${code}`, { sample: sampleMock }).run());
+    await vi.advanceTimersByTimeAsync(11_000);
+    const events = await eventsPromise;
 
     expect(sampleMock).toHaveBeenCalledTimes(2);
     expect(events.filter(function isRecovery(event) { return event.type === "model_recovery"; })).toHaveLength(1);
@@ -186,7 +212,24 @@ describe("Kernel Provider 有限恢复与熔断", function providerRecoverySuite
     expect(sampleMock.mock.calls[1]?.[2]).toEqual(sampleMock.mock.calls[0]?.[2]);
   });
 
-  it("连续瞬时故障在一次恢复后熔断为安全失败", async function opensCircuitAfterOneRecovery() {
+  it("连续瞬时故障在 5 次重试后熔断为安全失败", async function opensCircuitAfterRetryBudget() {
+    vi.useFakeTimers();
+    const sampleMock = vi.fn().mockRejectedValue(
+      new AgentSampleError("raw-provider-secret fake-test-key", "PROVIDER_RATE_LIMIT" as AgentSampleErrorCode),
+    );
+    const eventsPromise = collectEvents(createKernel("provider-budget", { sample: sampleMock }).run());
+    await vi.advanceTimersByTimeAsync(60_000);
+    const events = await eventsPromise;
+    const serialized = JSON.stringify(events);
+
+    expect(sampleMock).toHaveBeenCalledTimes(6);
+    expect(events.filter(function isRecovery(event) { return event.type === "model_recovery"; })).toHaveLength(5);
+    expect(events.at(-1)).toMatchObject({ type: "turn_failed", error: "供应商请求持续被限流，已停止自动恢复" });
+    expect(serialized).not.toContain("raw-provider-secret");
+    expect(serialized).not.toContain("fake-test-key");
+  });
+
+  it("已输出正文后的瞬时故障不再重放并安全失败", async function doesNotReplayStreamedFailure() {
     const sampleMock = vi.fn(async function failWithPartialAnswer(_messages, _tools, _options, onDelta) {
       onDelta?.("partial");
       throw new AgentSampleError(
@@ -194,16 +237,54 @@ describe("Kernel Provider 有限恢复与熔断", function providerRecoverySuite
         "PROVIDER_RATE_LIMIT" as AgentSampleErrorCode,
       );
     });
-    const events = await collectEvents(createKernel("provider-circuit", { sample: sampleMock }).run());
+    const events = await collectEvents(createKernel("provider-streamed-failure", { sample: sampleMock }).run());
     const serialized = JSON.stringify(events);
 
-    expect(sampleMock).toHaveBeenCalledTimes(2);
-    expect(events.filter(function isRecovery(event) { return event.type === "model_recovery"; })).toHaveLength(1);
-    expect(events.some(function resetsPartialAnswer(event) { return event.type === "answer_reset"; })).toBe(true);
+    expect(sampleMock).toHaveBeenCalledTimes(1);
+    expect(events.filter(function isRecovery(event) { return event.type === "model_recovery"; })).toHaveLength(0);
+    expect(events.some(function resetsPartialAnswer(event) { return event.type === "answer_reset"; })).toBe(false);
     expect(events.some(function discardsFinalPartialAnswer(event) { return event.type === "answer_discard"; })).toBe(true);
-    expect(events.at(-1)).toMatchObject({ type: "turn_failed", error: "供应商请求持续被限流，已停止自动恢复" });
+    expect(events.at(-1)).toMatchObject({ type: "turn_failed", error: "供应商在已输出部分正文后失败，已停止自动恢复" });
     expect(serialized).not.toContain("raw-provider-secret");
     expect(serialized).not.toContain("fake-test-key");
+  });
+
+  it("Retry-After 优先于指数退避", async function honorsRetryAfterHeader() {
+    vi.useFakeTimers();
+    const sampleMock = vi.fn()
+      .mockRejectedValueOnce(new AgentSampleError("限流", "PROVIDER_RATE_LIMIT", undefined, 429, undefined, undefined, 3_000))
+      .mockResolvedValueOnce(createSuccessfulSample());
+    const eventsPromise = collectEvents(createKernel("provider-retry-after", { sample: sampleMock }).run());
+    await vi.advanceTimersByTimeAsync(2_999);
+    expect(sampleMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sampleMock).toHaveBeenCalledTimes(2);
+    const events = await eventsPromise;
+
+    expect(events.some(function isCompleted(event) { return event.type === "turn_completed"; })).toBe(true);
+  });
+
+  it("Retry-After 超过单次上限时立即停止重试", async function stopsWhenRetryAfterExceedsCap() {
+    const sampleMock = vi.fn()
+      .mockRejectedValueOnce(new AgentSampleError("限流", "PROVIDER_RATE_LIMIT", undefined, 429, undefined, undefined, 20_000))
+      .mockResolvedValueOnce(createSuccessfulSample());
+    const events = await collectEvents(createKernel("provider-retry-after-cap", { sample: sampleMock }).run());
+
+    expect(sampleMock).toHaveBeenCalledTimes(1);
+    expect(events.at(-1)).toMatchObject({ type: "turn_failed", error: "供应商要求等待时间超过单次退避上限，已停止自动恢复" });
+  });
+
+  it("退避等待期间取消立即落 interrupted 终态", async function cancelsDuringBackoff() {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const sampleMock = vi.fn().mockRejectedValue(new AgentSampleError("限流", "PROVIDER_RATE_LIMIT" as AgentSampleErrorCode));
+    const eventsPromise = collectEvents(createKernel("provider-backoff-cancel", { sample: sampleMock }, controller.signal).run());
+    await vi.advanceTimersByTimeAsync(1);
+    controller.abort();
+    const events = await eventsPromise;
+
+    expect(events.at(-1)?.type).toBe("turn_interrupted");
+    expect(sampleMock).toHaveBeenCalledTimes(1);
   });
 
   it("非瞬时 Provider 4xx 不进入恢复并直接安全失败", async function failsClientRejectionWithoutRetry() {

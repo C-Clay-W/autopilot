@@ -22,7 +22,7 @@ export function restoreWebInputPresentation(state: AgentPresentationState, event
     const turnId = notice && "turnId" in notice ? notice.turnId : input.delivery === "steer" || input.status === "consumed" ? input.turnId : undefined;
     if (!turnId) continue;
     const position = input.delivery === "queue" ? { turnId, items: [], order: order++ } : positions.get(input.inputId) ?? capturePresentationInputPosition(next, turnId, order++);
-    next = reducePresentationInput(next, { kind: "host_event", event: { kind: "input", input: { inputId: input.inputId, turnId, delivery: input.delivery, content: input.content, position, cancelled: input.status === "cancelled", state: input.status === "consumed" ? "consumed" : "queued" } } });
+    next = reducePresentationInput(next, { kind: "host_event", event: { kind: "input", input: { inputId: input.inputId, turnId, delivery: input.delivery, content: input.content, ...(input.origin?.kind === "thread" ? { origin: { kind: "thread", threadId: input.origin.threadId, ...(input.origin.purpose === "reporting_agreement" ? { purpose: "reporting_agreement" as const } : {}) } } : {}), position, cancelled: input.status === "cancelled", state: input.status === "consumed" ? "consumed" : "queued" } } });
   }
   return next;
 }

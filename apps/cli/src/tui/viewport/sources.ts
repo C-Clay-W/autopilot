@@ -3,6 +3,7 @@
 import stringWidth from "string-width";
 import wrapAnsi from "wrap-ansi";
 import { WEB_SEARCH_DATA_FLOW_NOTICE, getPresentationCopy, getToolPresentationProfile, isSandboxUnavailableErrorCode, selectToolCalls, type AgentPresentationState, type TimelineItem } from "@autopilot-agent/presentation";
+import { getCliTuiExecutionMs } from "../types.js";
 import type { TimelineLineSource } from "../../timeline-lines.js";
 import type { CliStatusView, CliTurnStatus } from "../../types.js";
 import { createAutopilotStaticWordRows } from "../brand/pixel.js";
@@ -342,20 +343,14 @@ function createTuiViewportEventSources(itemId: string, events: CliTuiTimelineEve
   }
   let answer = "";
   let answerCount = 0;
-  let lastAnswerSource: { answerIndex: number; thoughtIndex?: number } | undefined;
+  let lastAnswerSource: { answerIndex: number } | undefined;
   let progressSourceIndex: number | undefined;
   /** 将当前连续 answer 分片收束为一个可裁剪 source。 */
   function flushAnswer(): void {
     if (!answer) return;
-    let thoughtIndex: number | undefined;
-    if (answerCount === 0 && timing?.thoughtDurationMs !== undefined) {
-      const text = `Thought for ${formatTuiDuration(timing.thoughtDurationMs)}`;
-      sources.push({ itemId: `${itemId}:thought`, text, spans: createTuiViewportTextSpans(text, "muted") });
-      thoughtIndex = sources.length - 1;
-    }
     const answerText = `• ${TUI_AGENT_LABEL}\n${formatTuiViewportMarkdown(answer, contentWidth)}`;
     sources.push({ itemId: `${itemId}:answer:${String(answerCount++)}`, text: answerText, spans: [{ start: 0, end: `• ${TUI_AGENT_LABEL}`.length, style: "accent" }] });
-    lastAnswerSource = { answerIndex: sources.length - 1, thoughtIndex };
+    lastAnswerSource = { answerIndex: sources.length - 1 };
     answer = "";
   }
   /** 收到 Core reset/discard 后撤销当前采样的暂定回答及其思考计时。 */
@@ -363,7 +358,6 @@ function createTuiViewportEventSources(itemId: string, events: CliTuiTimelineEve
     answer = "";
     if (!lastAnswerSource) return;
     sources.splice(lastAnswerSource.answerIndex, 1);
-    if (lastAnswerSource.thoughtIndex !== undefined) sources.splice(lastAnswerSource.thoughtIndex, 1);
     answerCount = Math.max(0, answerCount - 1);
     lastAnswerSource = undefined;
   }
@@ -444,8 +438,8 @@ export function createTuiViewportSources(snapshot: CliTuiSnapshot, statusView: C
   const liveCompletedAt = snapshot.liveMetrics?.completedAt;
   appendEventGroup(snapshot.liveTurnId ?? "live", snapshot.liveEvents, {
     todoRowLimit,
-    thoughtDurationMs: snapshot.liveMetrics?.firstAnswerAt === undefined ? undefined : Math.max(0, snapshot.liveMetrics?.firstAnswerAt - snapshot.liveMetrics!.startedAt),
-    totalDurationMs: liveCompletedAt === undefined ? undefined : Math.max(0, liveCompletedAt - snapshot.liveMetrics!.startedAt),
+    thoughtDurationMs: snapshot.liveMetrics?.firstAnswerAt === undefined ? undefined : snapshot.liveMetrics?.firstAnswerDurationMs ?? 0,
+    totalDurationMs: liveCompletedAt === undefined ? undefined : getCliTuiExecutionMs(snapshot.liveMetrics!, liveCompletedAt),
     presentation: snapshot.livePresentation,
     turnId: snapshot.liveTurnId,
     status: snapshot.status,
@@ -549,8 +543,8 @@ export function createTuiViewportSourceCache(): TuiViewportSourceCache {
     const liveCompletedAt = metrics?.completedAt;
     const timing: TuiViewportEventTiming = {
           todoRowLimit,
-          thoughtDurationMs: metrics?.firstAnswerAt === undefined ? undefined : Math.max(0, metrics?.firstAnswerAt - metrics!.startedAt),
-          totalDurationMs: liveCompletedAt === undefined ? undefined : Math.max(0, liveCompletedAt - metrics!.startedAt),
+          thoughtDurationMs: metrics?.firstAnswerAt === undefined ? undefined : metrics?.firstAnswerDurationMs ?? 0,
+          totalDurationMs: liveCompletedAt === undefined ? undefined : getCliTuiExecutionMs(metrics!, liveCompletedAt),
           presentation: snapshot.livePresentation,
           turnId: liveTurnId,
           status: snapshot.status,

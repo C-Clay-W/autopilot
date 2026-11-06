@@ -22,8 +22,23 @@ export function TuiPromptLine(props: { content: string; useColor: boolean; colum
   );
 }
 
-/** 渲染已经完成的 prompt、notice 或完整 Turn。 */
+/** 历史item生命周期内最多保留四个尺寸/颜色/读屏变体，跨重挂载复用稳定元素。 */
+const transcriptRenderCache = new WeakMap<CliTuiTranscriptItem, Map<string, ReactNode>>();
+
+/** 按不可变历史item引用复用元素；不冻结当前Turn或改变输出。 */
 export function TuiTranscriptItem(props: { item: CliTuiTranscriptItem; useColor: boolean; columns: number; screenReader?: boolean }): ReactNode {
+  const key = `${props.columns}:${props.useColor}:${props.screenReader ?? false}`;
+  let variants = transcriptRenderCache.get(props.item);
+  if (variants?.has(key)) return variants.get(key);
+  const rendered = renderTranscriptItem(props);
+  if (!variants) { variants = new Map(); transcriptRenderCache.set(props.item, variants); }
+  if (variants.size >= 4) variants.delete(variants.keys().next().value!);
+  variants.set(key, rendered);
+  return rendered;
+}
+
+/** 渲染已经完成的 prompt、notice 或完整 Turn。 */
+function renderTranscriptItem(props: { item: CliTuiTranscriptItem; useColor: boolean; columns: number; screenReader?: boolean }): ReactNode {
   const item = props.item;
   if (item.kind === "prompt") {
     return <TuiPromptLine key={item.key} content={item.content} useColor={props.useColor} columns={props.columns} keyValue={item.key} />;

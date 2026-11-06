@@ -58,7 +58,15 @@ export interface CliTuiInputPosition {
 export interface CliTuiTurnMetrics {
   startedAt: number;
   firstAnswerAt?: number;
+  firstAnswerDurationMs?: number;
+  elapsedMs?: number;
+  runningSince?: number;
   completedAt?: number;
+}
+
+/** 复用共享 Presentation 执行段；旧宿主缺少时钟事实时不擅自把等待计为执行。 */
+export function getCliTuiExecutionMs(metrics: CliTuiTurnMetrics, now = Date.now()): number {
+  return (metrics.elapsedMs ?? 0) + (metrics.runningSince === undefined ? 0 : Math.max(0, now - metrics.runningSince));
 }
 
 /** 当前 Turn 的用户输入；动态区保留它，避免历史区固化时机导致 prompt 消失。 */
@@ -83,6 +91,7 @@ export interface CliTuiSnapshot {
   status: CliTurnStatus;
   recoverable: boolean;
   pendingApproval?: CliProjection["pendingApproval"];
+  threadWait?: CliProjection["threadWait"];
   activeSkills: Array<{ skillId: string; contentHash: string }>;
   /** 最近一次 context_usage 的安全 DTO；只驱动状态栏刷新，不进入时间线。 */
   contextUsage?: ContextUsageView | null;
@@ -114,6 +123,8 @@ export type CliTuiInitialOperation =
 /** Ink TUI 的运行参数。 */
 export interface RunCliTuiOptions {
   controller: CliController;
+  /** Project级固定会话目录；选择只变视图，不恢复执行。 */
+  sessionManager?: import("./session-manager.js").CliSessionManager;
   /** 主机已知的只读会话标识；仅用于备用屏退出后的安全摘要。 */
   sessionId?: string;
   /** canonical 工作区根；仅用于 @ 文件候选索引预热。 */

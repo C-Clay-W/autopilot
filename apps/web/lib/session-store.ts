@@ -3,7 +3,7 @@
  */
 import crypto from "node:crypto";
 import type { WebTurnFailure } from "./runtime-host/web-turn-failure";
-import type { AgentRuntime, Session as CoreSession } from "@autopilot-agent/core";
+import type { AgentRuntime, Session as CoreSession, ToolPermissionMode } from "@autopilot-agent/core";
 
 export interface SessionPinnedSkill {
   skillRef: string;
@@ -61,6 +61,10 @@ export interface SessionMessage {
   knowledgeFiles?: SessionKnowledgeFileRecord[];
   knowledgeIngestItems?: SessionKnowledgeIngestItem[];
   clientRecordId?: string;
+  /** 受信来源：只有宿主在真实投递链上写入的 thread 来源 Prompt 才带此字段。 */
+  origin?: { kind: "thread"; threadId: string };
+  /** 仅由受信交付链生成的交接展示快照。 */
+  handoffDisplay?: { title: string; instruction: string; summary: string };
   createdAt: number;
 }
 
@@ -165,6 +169,13 @@ export async function updatePinnedSkills(runtime: AgentRuntime, sessionId: strin
   session.presentation = presentation;
   await runtime.sessions.save(session);
   return toSessionMeta(session);
+}
+
+/** 更新会话级工具权限模式；写入 Session.defaultRunConfig，作为后续新 Turn（含排队输入）的默认值。 */
+export async function updateSessionPermissionMode(runtime: AgentRuntime, sessionId: string, permissionMode: ToolPermissionMode): Promise<void> {
+  const session = await requireSession(runtime, sessionId);
+  session.defaultRunConfig = { ...session.defaultRunConfig, permissionMode };
+  await runtime.sessions.save(session);
 }
 
 /** 读取最近一次成功 compact 的 Core Session 展示投影。 */

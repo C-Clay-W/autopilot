@@ -2,6 +2,7 @@
  * CLI 性能诊断事件：只缓冲渲染与输入时刻、耗时和事件类型，退出时一次性写入显式文件。
  */
 
+import { NodeStateError } from "@autopilot-agent/adapters";
 import fs from "node:fs";
 import path from "node:path";
 import { classifyCliError, type CliErrorCategory } from "../error-diagnostics.js";
@@ -17,6 +18,7 @@ interface TuiPerformanceDiagnosticRecord {
   durationMs?: number;
   errorCategory?: CliErrorCategory;
   errorCode?: string;
+  storage?: ReturnType<NodeStateError["getStorageDiagnostic"]>;
 }
 
 /** 返回与 Core 诊断点共享的进程内缓冲。 */
@@ -65,5 +67,6 @@ export function recordTuiRuntimeErrorDiagnostic(error: unknown): void {
     monotonicMs: Number(performance.now().toFixed(3)),
     errorCategory: classification.category,
     errorCode: classification.code,
+    ...(error instanceof NodeStateError ? { storage: error.getStorageDiagnostic() } : {}),
   });
 }

@@ -3,11 +3,13 @@
 
 import { useCallback, useMemo, useState, useRef, useEffect, type ReactNode } from "react";
 import PermissionPanel from "./components/PermissionPanel";
+import ThreadCollaborationPanel from "./components/ThreadCollaborationPanel";
 import StorageQuotaPanel from "./components/StorageQuotaPanel";
 import SkillPicker from "./components/SkillPicker";
 import ChatPageHeader from "./components/ChatPageHeader";
 import ChatMessageList from "./components/ChatMessageList";
 import ChatComposer from "./components/ChatComposer";
+import ChildTaskStrip from "./components/ChildTaskStrip";
 import ChatImagePreview from "./components/ChatImagePreview";
 import DiffSidebar from "./components/DiffSidebar";
 import DiffSidebarDivider from "./components/DiffSidebarDivider";
@@ -46,6 +48,9 @@ import type { ApprovalItem, UserQuestionItem } from "@autopilot-agent/presentati
 import { CHAT_SCOPE, sessionApiUrl } from "./conversation-target";
 import type { ChatRetrievalMode, ContextUsageView } from "@autopilot-agent/core";
 import type { WorkspaceSummary } from "./session-task-context";
+import { useSessionTaskContext, useSessionTaskList } from "./session-task-context";
+import { useThreadTasks } from "./hooks/useThreadTasks";
+import { useThreadGroups } from "./hooks/useThreadGroups";
 import { createWorkspaceSessionKey } from "./session-task-store";
 import { isDisplayableSource } from "./chat-page-helpers";
 import type { ComposerInputActions, SourceItem } from "./chat-page-types";
@@ -69,8 +74,11 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
   const isChat = workspaceId === CHAT_SCOPE;
   const hasWorkspace = isChat || Boolean(workspaceId && workspace?.available && workspace.trustStatus === "trusted");
   const [permissionPanelOpen, setPermissionPanelOpen] = useState(false);
+  const [threadsPanelOpen, setThreadsPanelOpen] = useState(false);
   const [storageQuotaPanelOpen, setStorageQuotaPanelOpen] = useState(false);
   const [skillPickerOpen, setSkillPickerOpen] = useState(false);
+  // 专用协作入口保留给未来Subagent；普通会话与侧栏观察继续独立工作。
+  const showThreadCollaborationUi = false;
   /** Diff 侧边栏开关：记录"打开时所在的 sessionId"，派生开关值随会话切换自动关闭（第七节契约，且避免 effect 内 setState）。 */
   const [diffSidebarOpenSessionId, setDiffSidebarOpenSessionId] = useState<string | null>(null);
   const diffSidebarOpen = diffSidebarOpenSessionId !== null && diffSidebarOpenSessionId === sessionId;
@@ -169,6 +177,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     showSources, setShowSources,
     showProcess, setShowProcess,
     databaseEnabled, setDatabaseEnabled,
+    permissionMode, setPermissionMode,
     databaseSyncing,
     databaseSyncMessage,
     databaseSyncElapsedSeconds,
@@ -199,6 +208,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     inputDeliveryNotice, setInputDeliveryNotice,
     resumePendingSessionId, setResumePendingSessionId,
     contextUsage, setContextUsage,
+    turnUsage,
     currentSessionIdRef,
     currentWorkspaceIdRef,
     requestAbortRef,
@@ -214,14 +224,21 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     awaitingApprovalRef,
     awaitingUserInputRef,
     executionEpochRef,
-    queueExecutionRequestedRef,
+    executionFactRef,
+    queuedFollowUpTurnIdRef,
     getSessionController,
     setTransportState,
     markAwaitingUserInput,
     clearActiveTurn,
     loadHistory,
     consumeAgentStream,
-  } = useSessionConversation({ workspaceId, sessionId, isChat, notifyNewProgress, setSelectedSkills, setPinnedSkills });
+  } = useSessionConversation({ workspaceId, sessionId, isChat, active, notifyNewProgress, setSelectedSkills, setPinnedSkills });
+
+  const { threadGroupRevision, threadDirectoryRevisions } = useSessionTaskContext();
+  const sessionItems = useSessionTaskList();
+  // 仅可见的 Work 会话读取协作归属；隐藏的已访问页面不重复发请求（P19 A/B 轮已由 Sidebar 按工作区读取）。
+  const { groups } = useThreadGroups({ workspaceId, enabled: showThreadCollaborationUi && !isChat && active && Boolean(workspaceId), refreshKey: `${threadGroupRevision}:${threadDirectoryRevisions?.[workspaceId] ?? 0}` });
+  const { items: childTasks, error: threadTasksError } = useThreadTasks({ workspaceId, sessionId, groups, active: !isChat && active && Boolean(workspaceId), refreshKey: `${threadGroupRevision}:${sessionItems.map(function status(item) { return `${item.session.id}:${item.phase}`; }).join("|")}` });
 
   const canWrite = hasWorkspace && historyReady && !readOnlyReason;
   canWriteRef.current = canWrite;
@@ -235,7 +252,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     handleUserQuestion,
     cancelPendingInput,
     refreshTransport,
-    requestNextQueuedTurn,
+    requestFollowQueuedTurn,
   } = useTurnRecoveryActions({
     isChat,
     workspaceId,
@@ -254,7 +271,6 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     setStreamingMessageId,
     setActiveTurnId,
     setPendingInputs,
-    setInputDeliveryNotice,
     setResumePendingSessionId,
     loadHistory,
     consumeAgentStream,
@@ -271,11 +287,10 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     awaitingApprovalRef,
     awaitingUserInputRef,
     executionEpochRef,
+    executionFactRef,
     pendingInputsRef,
-    joinedInputIdsRef,
     currentSessionIdRef,
     currentWorkspaceIdRef,
-    queueExecutionRequestedRef,
   });
 
   const {
@@ -284,6 +299,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     submissionActivity,
     inputDelivery, setInputDelivery,
     handleSend,
+    uiContinuation,
     handleFileSelect,
     handleDragEnter,
     handleDragOver,
@@ -291,6 +307,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     handleDrop,
   } = useConversationSubmission({
     isChat,
+    active,
     workspaceId,
     sessionId,
     hasWorkspace,
@@ -305,6 +322,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     currentWorkspaceIdRef,
     cancelledTurnIdsRef,
     databaseEnabled,
+    permissionMode,
     selectedSkills,
     setSelectedSkills,
     setPinnedSkills,
@@ -315,7 +333,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     onSessionStarting,
     onSessionCreated,
     handleContinueTurn,
-    requestNextQueuedTurn,
+    requestFollowQueuedTurn,
     setMessages,
     setLoading,
     setSessionMeta,
@@ -339,7 +357,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
     historyInputIdsRef,
     activeTurnRef,
     pendingInputsRef,
-    queueExecutionRequestedRef,
+    queuedFollowUpTurnIdRef,
     awaitingApprovalRef,
     awaitingUserInputRef,
     executionEpochRef,
@@ -591,6 +609,14 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
   // eslint-disable-next-line react-hooks/exhaustive-deps -- 依赖数组与原 page.tsx 一致：仅在工作区切换时清空引用，setter 为稳定引用无需列入。
   }, [workspaceId]);
 
+  const previousDraftSessionRef = useRef(sessionId);
+  /** 切换会话时不把未发送的文件带入其他会话；首次创建保留同一草稿槽。 */
+  useEffect(function clearSessionScopedFiles() {
+    const createdFromDraft = !previousDraftSessionRef.current && Boolean(sessionId) && locallyCreatedSessionRef.current === sessionId;
+    previousDraftSessionRef.current = sessionId;
+    if (!isChat && !createdFromDraft) setSelectedFiles([]);
+  }, [isChat, sessionId]);
+
   /** 会话/任务切换或实例失活：取消在途导航、清除待执行定时器并关闭面板；结果与比例保留，回来不补打开（判定 7/AC-5）。 */
   useEffect(function closePreviewOnSessionChange() {
     if (!active) clearPreviewTimers();
@@ -769,6 +795,8 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
         compactConfirmOpen={compactConfirmOpen}
         setCompactConfirmOpen={setCompactConfirmOpen}
         contextUsage={contextUsage}
+        turnUsage={turnUsage}
+        executionClock={turnUsage ? presentation.executionByTurn?.[turnUsage.turnId] : undefined}
         showSources={showSources}
         setShowSources={setShowSources}
         showProcess={showProcess}
@@ -779,6 +807,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
         databaseSyncing={databaseSyncing}
         hasWorkspace={hasWorkspace}
         setPermissionPanelOpen={setPermissionPanelOpen}
+        onOpenThreads={showThreadCollaborationUi ? () => setThreadsPanelOpen(true) : undefined}
         storageQuota={storageQuota}
         setStorageQuotaPanelOpen={setStorageQuotaPanelOpen}
         activeTurnId={activeTurnId}
@@ -796,6 +825,10 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
           {historyError.manualRetry && <button type="button" onClick={function retryHistory() { void loadHistory(sessionId); }} className="border-2 border-ink px-2 py-0.5 text-ink hover:bg-ink hover:text-ink-on-dark">重新加载</button>}
         </div>
       )}
+
+      {/* 父会话顶部的子任务活动条只显示状态与入口，不回显子会话输出。 */}
+      {showThreadCollaborationUi && !isChat && threadTasksError && <p className="px-4 py-1 text-xs text-muted" role="status">协作任务状态暂不可读</p>}
+      {showThreadCollaborationUi && !isChat && <ChildTaskStrip workspaceId={workspaceId} items={childTasks} />}
 
       {/* 消息列表与输入区：md+ 与 Diff/预览右侧面板并排；预览打开时按会话比例分配双栏 */}
       <div ref={diffRowRef} className="flex min-h-0 flex-1 flex-row">
@@ -819,6 +852,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
           ) : null}
         >
       <ChatMessageList
+        uiContinuation={uiContinuation}
         isChat={isChat}
         messages={messages}
         sessionId={sessionId}
@@ -898,6 +932,8 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
         setShowProcess={setShowProcess}
         databaseEnabled={databaseEnabled}
         setDatabaseEnabled={setDatabaseEnabled}
+        permissionMode={permissionMode}
+        setPermissionMode={setPermissionMode}
         onRetrievalChange={onRetrievalChange}
         hasWorkspace={hasWorkspace}
         fileInputRef={fileInputRef}
@@ -925,6 +961,7 @@ export default function ChatPageContent({ workspaceId, workspace, sessionId, act
         {!isChat && <DiffSidebar open={diffSidebarOpen} onClose={closeDiffSidebar} width={diffSidebarWidth} items={presentation.items} activeTurnId={activeTurnId} />}
       </div>
       {!isChat && <PermissionPanel workspaceId={workspaceId} sessionId={sessionId} open={permissionPanelOpen} onClose={() => setPermissionPanelOpen(false)} />}
+      {showThreadCollaborationUi && !isChat && <ThreadCollaborationPanel workspaceId={workspaceId} sessionId={sessionId} open={threadsPanelOpen} onClose={() => setThreadsPanelOpen(false)} />}
       {!isChat && <SkillPicker open={skillPickerOpen} skills={skillCatalog} selectedSkillRefs={selectedSkills.map((skill) => skill.skillRef)} pinnedSkillRefs={pinnedSkills.map((skill) => skill.skillRef)} onSelect={toggleSelectedSkill} onTogglePin={togglePinnedSkill} onClose={function closeSkillPicker() { setSkillPickerOpen(false); }} />}
       {storageQuotaPanelOpen && storageQuota && <StorageQuotaPanel open quota={storageQuota} onClose={() => setStorageQuotaPanelOpen(false)} onUpdated={updateStorageQuota} />}
       <ChatImagePreview selectedImage={selectedImage} setSelectedImage={setSelectedImage} />

@@ -170,7 +170,7 @@ describe("Talk-Plan0805 Step1", function step1Suite() {
     expect(resolveCliActivityView({ activity, status: "running", now: 3_000 + CLI_ACTIVITY_TRANSITION_MS })?.phase).toBe("thinking");
     const stalled = resolveCliActivityView({ activity, status: "running", now: 3_000 + CLI_ACTIVITY_STALLED_AFTER_MS });
     expect(stalled?.phase).toBe("stalled");
-    expect(stalled?.label).toContain("no new event for 20s");
+    expect(stalled?.label).toBe("Still working");
 
     activity = reduceCliActivityState(activity, { type: "approval_required" }, 7_000);
     expect(resolveCliActivityView({ activity, status: "waiting_approval", now: 70_000, waitingForApproval: true })).toMatchObject({ phase: "waiting", label: "Waiting for approval" });

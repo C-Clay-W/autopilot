@@ -19,10 +19,14 @@ import { resolveFileTarget } from "./permissions/path-access-policy";
 import { createToolError, TOOL_ERROR_CODES } from "./tool-error";
 import type { AgentToolDefinition, SandboxExecutionBinding, SandboxExecutionScope, ToolActionFacts, ToolExecutionContext, ToolPermissionMode } from "./types";
 import { PolicyEngine } from "./policy-engine";
+import { prepareMcpImages } from "./mcp-images";
+import type { AgentImageReference } from "../types/agent-message";
+import type { SessionImageStore } from "../../runtime/ports/session-image-store";
 
 const MCP_CALL_TIMEOUT_MS = 30_000;
 const MCP_RESPONSE_LIMIT_BYTES = 60_000;
-const MCP_LINE_LIMIT_BYTES = 60_000;
+// 允许一个 20 MiB 原图批次的 Base64 和有界协议开销，模型正文仍独立限制为 60 KB。
+const MCP_LINE_LIMIT_BYTES = 28 * 1024 * 1024;
 
 /** 按平台环境变量命名规则写入单个子进程变量；Windows 同名不同大小写时由后写值覆盖。 */
 function setEnvironmentEntry(env: NodeJS.ProcessEnv, key: string, value: string | undefined, caseInsensitive: boolean): void {
@@ -46,6 +50,8 @@ export interface McpRuntimeDiagnostic {
 /** 为 Runtime 注入 MCP 所需的受控能力；CredentialStore 只在 spawn 前按需解析。 */
 export interface McpRuntimeOptions {
   capability: McpCapability;
+  sessionId?: string;
+  sessionImageStore?: SessionImageStore;
   workspaceRoot?: string;
   workspaceTrusted?: boolean;
   resolvePersistentGrant?: ToolExecutionContext["resolvePersistentGrant"];
@@ -63,6 +69,7 @@ interface McpToolDescriptor {
 }
 
 interface PendingRequest {
+  method: string;
   resolve(value: unknown): void;
   reject(error: Error): void;
 }
@@ -74,7 +81,8 @@ interface ManagedServer {
   /** 已 prepare 的沙箱执行资源；与 server 进程同生共死，真实终态（崩溃/关闭/启动失败）时释放。 */
   executionId?: string;
   pending: Map<number, PendingRequest>;
-  buffer: Buffer;
+  buffer: Buffer[];
+  bufferBytes: number;
 }
 
 /** 将 JSON 文本裁剪到 UTF-8 字节上限，绝不以 UTF-16 code unit 截断。 */
@@ -94,7 +102,8 @@ function serializeMcpOutput(output: unknown): unknown {
   const serialized = JSON.stringify(output) ?? "null";
   if (Buffer.byteLength(serialized, "utf8") <= MCP_RESPONSE_LIMIT_BYTES) return output;
   const wrapperBytes = Buffer.byteLength(JSON.stringify({ content: "", truncated: true }), "utf8");
-  return { content: truncateUtf8(serialized, MCP_RESPONSE_LIMIT_BYTES - wrapperBytes), truncated: true };
+  // 包装为 JSON 字符串时引号与反斜杠会再转义，预留最坏两倍膨胀。
+  return { content: truncateUtf8(serialized, Math.floor((MCP_RESPONSE_LIMIT_BYTES - wrapperBytes) / 2)), truncated: true };
 }
 
 /** MCP server 启动的本地事实；与 run_command 共用命令风险与 hard deny 底座。 */
@@ -132,6 +141,7 @@ function terminateProcessTree(child: ChildProcess): void {
 
 /** 创建单个受控 MCP stdio runtime；initialize 必须在模型第一次采样前完成。 */
 export class McpStdioRuntime {
+  private readonly imageReferences = new WeakMap<object, AgentImageReference[]>();
   private readonly policyEngine = new PolicyEngine();
   private readonly servers = new Map<string, ManagedServer>();
   private readonly tools: AgentToolDefinition<unknown, unknown>[] = [];
@@ -140,7 +150,7 @@ export class McpStdioRuntime {
 
   constructor(private readonly options: McpRuntimeOptions) {
     for (const config of options.capability.servers.filter((server) => server.enabled !== false)) {
-      this.servers.set(config.name, { config, state: "configured", pending: new Map(), buffer: Buffer.alloc(0) });
+      this.servers.set(config.name, { config, state: "configured", pending: new Map(), buffer: [], bufferBytes: 0 });
     }
   }
 
@@ -312,11 +322,19 @@ export class McpStdioRuntime {
         if (server.state !== "ready") throw createToolError(TOOL_ERROR_CODES.TOOL_EXECUTION_FAILED, "MCP server 当前不可用");
         const onAbort = () => { if (server.child) terminateProcessTree(server.child); };
         context.signal?.addEventListener("abort", onAbort, { once: true });
-        try { return await runtime.request(server, "tools/call", { name: descriptor.name, arguments: input }, MCP_CALL_TIMEOUT_MS); }
+        try {
+          const raw = await runtime.request(server, "tools/call", { name: descriptor.name, arguments: input }, MCP_CALL_TIMEOUT_MS);
+          const prepared = await prepareMcpImages(raw, runtime.options.sessionImageStore, runtime.options.sessionId, context.signal);
+          if (prepared.output && typeof prepared.output === "object") runtime.imageReferences.set(prepared.output, prepared.images);
+          return prepared.output;
+        }
         finally { context.signal?.removeEventListener("abort", onAbort); }
       },
       serializeOutput(output) {
         return serializeMcpOutput(output);
+      },
+      getImageReferences(output) {
+        return output && typeof output === "object" ? runtime.imageReferences.get(output) ?? [] : [];
       },
     };
   }
@@ -355,7 +373,7 @@ export class McpStdioRuntime {
     const id = this.nextRequestId++;
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => { server.pending.delete(id); reject(new Error("MCP_REQUEST_TIMEOUT")); }, timeoutMs);
-      server.pending.set(id, { resolve(value) { clearTimeout(timeout); resolve(value); }, reject(error) { clearTimeout(timeout); reject(error); } });
+      server.pending.set(id, { method, resolve(value) { clearTimeout(timeout); resolve(value); }, reject(error) { clearTimeout(timeout); reject(error); } });
       server.child!.stdin!.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
   }
@@ -375,24 +393,37 @@ export class McpStdioRuntime {
         return;
       }
       const fragment = chunk.subarray(offset, newline);
-      if (server.buffer.length + fragment.length > MCP_LINE_LIMIT_BYTES) {
+      if (server.bufferBytes + fragment.length > MCP_LINE_LIMIT_BYTES) {
         this.failServer(server);
         return;
       }
-      const line = Buffer.concat([server.buffer, fragment]);
-      server.buffer = Buffer.alloc(0);
+      this.appendOutputFragment(server, fragment);
+      const line = Buffer.concat(server.buffer, server.bufferBytes);
+      server.buffer = [];
+      server.bufferBytes = 0;
       this.handleLine(server, line);
+      if (server.state === "failed") return;
       offset = newline + 1;
     }
   }
 
   /** 追加尚未换行的响应分片，超过预算立即关闭 server，避免无限缓冲。 */
   private appendOutputFragment(server: ManagedServer, fragment: Buffer): void {
-    if (server.buffer.length + fragment.length > MCP_LINE_LIMIT_BYTES) {
+    if (server.bufferBytes + fragment.length > MCP_LINE_LIMIT_BYTES) {
       this.failServer(server);
       return;
     }
-    server.buffer = Buffer.concat([server.buffer, fragment]);
+    // 固定大小分块也限制极小分片的对象开销，不逐片复制整条大响应。
+    let offset = 0;
+    const blockSize = 64 * 1024;
+    while (offset < fragment.length) {
+      const used = server.bufferBytes % blockSize;
+      if (used === 0) server.buffer.push(Buffer.allocUnsafe(blockSize));
+      const count = Math.min(fragment.length - offset, blockSize - used);
+      fragment.copy(server.buffer[server.buffer.length - 1], used, offset, offset + count);
+      server.bufferBytes += count;
+      offset += count;
+    }
   }
 
   /** 解析一条已经受限的 JSON-RPC 行；无关噪声不会进入模型、日志或诊断。 */
@@ -402,6 +433,7 @@ export class McpStdioRuntime {
       if (typeof message.id !== "number") return;
       const pending = server.pending.get(message.id);
       if (!pending) return;
+      if (line.length > MCP_RESPONSE_LIMIT_BYTES && pending.method !== "tools/call") { this.failServer(server); return; }
       server.pending.delete(message.id);
       if (message.error) pending.reject(new Error("MCP_REMOTE_ERROR")); else pending.resolve(message.result);
     } catch { /* server 噪声严格丢弃。 */ }
@@ -411,6 +443,7 @@ export class McpStdioRuntime {
   private failServer(server: Pick<ManagedServer, "state" | "child" | "pending" | "executionId">): void {
     if (server.state === "stopped") return;
     server.state = "failed";
+    if ("buffer" in server) { (server as ManagedServer).buffer = []; (server as ManagedServer).bufferBytes = 0; }
     for (const pending of server.pending.values()) pending.reject(new Error("MCP_SERVER_FAILED"));
     server.pending.clear();
     if (server.child) terminateProcessTree(server.child);

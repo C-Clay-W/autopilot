@@ -20,6 +20,8 @@ import type { SandboxMode } from "./sandbox-policy";
  * 所有字段在冻结时已解析为最终值，不再有"缺省"语义。
  */
 export interface FrozenRunConfig {
+  /** 开始 Turn 时是否装配协作工具；恢复缺失或禁用时不能追加能力。 */
+  threadsEnabled?: boolean;
   /** 由 Core 新 Turn 签发的 Work 上下文边界版本；旧记录缺失时仅允许查看历史。 */
   workContextVersion?: 1;
   /** Session 派生的工具上限；旧 Work Turn 可缺省，Chat 缺省必须拒绝恢复。 */

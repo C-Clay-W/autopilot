@@ -10,6 +10,8 @@ export const NODE_CHAT_KNOWLEDGE_SPACE_ID = "chat-knowledge-v1";
 /** 只注入受信只读解析/视觉与检索端口，模型无法提供这些对象。 */
 export interface NodeChatCapabilityLoaderOptions {
   storage: NodeChatStorage;
+  /** 受信宿主显式开启 Chat none/web 可见的交互 UI 工具；默认关闭。 */
+  interactiveUi?: boolean;
   visionAnalyzer?: VisionAnalyzer;
   loadKnowledge?: (input: ChatCapabilityBinding & { knowledgeRoot: string; knowledgeSpaceId: string }) => Promise<Pick<ChatCapability, "knowledge" | "authorizeRef" | "readImage">>;
 }
@@ -33,6 +35,7 @@ export function createNodeChatCapabilityLoader(options: NodeChatCapabilityLoader
       }
       const attachments = await storage.attachments.list(binding.sessionId);
       return {
+        ...((binding.retrievalMode === "none" || binding.retrievalMode === "web") && options.interactiveUi === true ? { interactiveUi: true as const } : {}),
         /** 目录只含授权字段，实际引用仍由 Core 的冻结交集和 Store 复查约束。 */
         attachments: attachments.map(function grant(item) { return { ref: item.ref, displayName: item.displayName, sessionId: item.sessionId, kind: item.kind, expiresAt: item.expiresAt }; }),
         visionAnalyzer: options.visionAnalyzer,

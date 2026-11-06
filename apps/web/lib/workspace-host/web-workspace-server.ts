@@ -5,6 +5,7 @@
  */
 
 import { findWorkSessionErrorResponse } from "./work-session-error";
+import { STATE_HTTP_FAILURES, findHttpFailure, httpErrorResponse, readHttpErrorCode } from "../runtime-host/web-http-error";
 import { NextResponse } from "next/server";
 import { createWebWorkspaceHost, WebWorkspaceHostError, type WebWorkspaceHost } from "./web-workspace-host";
 
@@ -65,6 +66,9 @@ function readWorkspaceHostErrorCode(error: unknown): WorkspaceHostErrorCode | un
 
 /** 将 Host 与归属错误收敛为稳定、不含路径的 HTTP DTO。 */
 export function toWorkspaceErrorResponse(error: unknown): Response {
+  const code = readHttpErrorCode(error);
+  const stateFailure = findHttpFailure(STATE_HTTP_FAILURES, code);
+  if (stateFailure) return httpErrorResponse(code!, stateFailure);
   const hostErrorCode = readWorkspaceHostErrorCode(error);
   if (hostErrorCode) {
     const status = hostErrorCode === "WORKSPACE_NOT_TRUSTED" ? 403

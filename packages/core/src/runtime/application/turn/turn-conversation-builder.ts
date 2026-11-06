@@ -128,10 +128,5 @@ function normalizeConversationMessages(messages: AgentMessage[]): AgentMessage[]
     .filter(function dropPreviousTodoReminder(message) {
       return message.role !== "system" || !getAgentMessageText(message).startsWith("【Todo 快照】");
     })
-    .map(function stripPrivateMessageData(message) {
-      return {
-        role: message.role,
-        content: message.content.filter(function dropReasoning(block) { return block.type !== "reasoning"; }),
-      };
-    });
+;
 }

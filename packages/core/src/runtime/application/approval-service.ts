@@ -17,6 +17,9 @@ import type { ExternalExecutionAuthority } from "../../internal/tools/types";
 import { hashNormalizedToolInput } from "../../internal/tools/normalized-tool-input";
 import { runCommandSchema } from "../../internal/tools/builtins/run-command-tool";
 import { startBackgroundJobSchema } from "../../internal/tools/builtins/start-background-job-tool";
+import { createWriteFileTool } from "../../internal/tools/builtins/write-file-tool";
+import { createEditFileTool } from "../../internal/tools/builtins/edit-file-tool";
+import type { TurnExecutionView } from "./turn/turn-execution-view";
 
 /** ApprovalService 所需的 Runtime-owned 状态端口；宿主不参与冻结凭证解析。 */
 export interface ApprovalServiceDependencies {
@@ -25,6 +28,8 @@ export interface ApprovalServiceDependencies {
   transcriptStore: TranscriptStore;
   turnStore: TurnStore;
   clock: Clock;
+  /** Runtime装配的统一事实查询，禁止旧代/已取消请求沿摘要门提交。 */
+  readExecution?(input: { sessionId: string; turnId: string }): Promise<TurnExecutionView | null>;
   /** Talk-Plan1013 Stage 2：外部规则投影；缺省时 allow_workspace 外部授权保持 pending 不自动放行。 */
   externalRuleProjector?: ExternalPermissionProjector;
 }
@@ -118,6 +123,17 @@ export function createApprovalService(dependencies: ApprovalServiceDependencies)
     }
 
     const approval = approvalEvent.result.approval;
+    if (dependencies.readExecution) {
+      const fact = await dependencies.readExecution(input);
+      if (fact?.interaction?.state !== "pending" || fact.interaction.approval?.event.type !== "approval_required" || fact.interaction.approval.event.result.approval.approvalId !== input.approvalId) throw new AgentRuntimeError("APPROVAL_NOT_FOUND", "审批不属于当前有效执行段");
+      const pending = checkpoint.pendingCalls?.find(function sameCall(call) { return call.id === approval.callId && call.name === approval.toolName; });
+      if (!pending) throw new AgentRuntimeError("APPROVAL_MISMATCH", "审批与冻结待执行调用不一致");
+      const schema = pending.name === "write_file" ? createWriteFileTool().inputSchema : pending.name === "edit_file" ? createEditFileTool().inputSchema : pending.name === "run_command" ? runCommandSchema : pending.name === "start_background_job" ? startBackgroundJobSchema : undefined;
+      if (schema) {
+        const parsed = schema.safeParse(pending.input);
+        if (!parsed.success || hashNormalizedToolInput(parsed.data) !== approval.normalizedInputHash) throw new AgentRuntimeError("APPROVAL_MISMATCH", "审批冻结参数已改变");
+      }
+    }
     const execution = isExternalExecutionConstraint(approval.constraint) ? await dependencies.approvalStore.getExecutionApproval?.({ sessionId: input.sessionId, turnId: input.turnId, approvalId: input.approvalId }) : undefined;
     if (isExternalExecutionConstraint(approval.constraint) && (!execution || execution.constraint !== approval.constraint || execution.callId !== approval.callId || execution.toolName !== approval.toolName || execution.normalizedInputHash !== approval.normalizedInputHash || execution.expiresAt !== approval.expiresAt || !matchesExternalExecutionTarget(approval.toolName, approval.constraint!, execution.target))) throw new AgentRuntimeError("APPROVAL_MISMATCH", "缺少匹配的私有外部执行冻结事实");
     if (approval.callId !== approvalEvent.callId || approval.toolName !== approvalEvent.toolName) {

@@ -9,6 +9,9 @@ import type { AgentModelToolDefinition, AgentSampleResult } from "../lib/llm";
 import { AgentSampleError } from "../lib/llm";
 import { createDefaultModelBehaviorProfile, type ModelBehaviorProfile } from "../../runtime/provider/model-behavior-profile";
 
+/** 仅采样期存在的已校验图片，不进入 checkpoint。 */
+export type ModelImageData = Record<string, { mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif"; data: string }>;
+
 /**
  * 模型采样器端口。
  * 实现者负责完成一次完整的模型采样，并在采样过程中通过 onDelta 回调流式输出正文增量。
@@ -30,7 +33,7 @@ export interface ModelSampler {
   sample(
     messages: AgentMessage[],
     tools: AgentModelToolDefinition[],
-    options: { signal?: AbortSignal; maxTokens?: number } & ModelSampleOptions,
+    options: { signal?: AbortSignal; maxTokens?: number; imageData?: ModelImageData } & ModelSampleOptions,
     onDelta?: (delta: string) => void,
   ): Promise<AgentSampleResult>;
 }

@@ -40,6 +40,24 @@ function createRuntimeDouble(calls: { cancelled: boolean; continued: unknown[] }
 }
 
 describe("CLI Controller", function controllerSuite() {
+  /** 取消开始后切换会话不改变已捕获的目标，恢复读取也沿原精确身份。 */
+  it("C1 取消等待期间切目标不串 Session 或 Turn", async function capturesCancelTarget() {
+    let finishCancel!: () => void;
+    const gate = new Promise<void>(function deferred(resolve) { finishCancel = resolve; });
+    const calls: unknown[] = [];
+    const runtime = { turns: {
+      cancel: async function cancel(input: unknown) { calls.push(input); await gate; },
+      getRecoverableState: async function recover(input: unknown) { calls.push(input); return null; },
+    } } as unknown as CliRuntime;
+    const controller = createCliController({ runtime, renderer: createPlainRenderer("text"), sessionId: "session-a" });
+    await controller.consume(eventStream([asEvent({ type: "turn_started", turnId: "turn-a", stepCount: 0 })]));
+    const cancellation = controller.dispatch({ type: "cancel_turn" });
+    controller.setSession("session-b");
+    finishCancel();
+    await cancellation;
+    expect(calls).toEqual([{ sessionId: "session-a", turnId: "turn-a" }, { sessionId: "session-a", turnId: "turn-a" }]);
+  });
+
   it("无 React 时委托 start 并输出安全 text 事件", async function delegatesStartWithoutReact() {
     const calls = { cancelled: false, continued: [] as unknown[] };
     const controller = createCliController({ runtime: createRuntimeDouble(calls), renderer: createPlainRenderer("text"), sessionId: "session-1" });

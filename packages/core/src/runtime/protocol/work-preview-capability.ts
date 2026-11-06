@@ -43,5 +43,7 @@ export interface WorkPreviewPrepareResult {
 
 /** Work 预览能力端口：只准备导航交付，绝不返回页面内容或"已验证"结论。 */
 export interface WorkPreviewCapability {
+  /** 纯参数预校验；必须复用宿主执行时目标规则，不探测网络或启动命令。旧宿主可省略。 */
+  validatePreviewTarget?(url: string): void;
   preparePreview(request: WorkPreviewPrepareRequest): Promise<WorkPreviewPrepareResult>;
 }

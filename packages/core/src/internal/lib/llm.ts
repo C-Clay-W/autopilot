@@ -10,6 +10,8 @@
  *   LLM_MODEL      — 模型名（默认 deepseek-v4-flash）
  */
 
+import type { AgentProviderFailureReason } from "../../runtime/provider/provider-failure-guidance";
+
 const LLM_BASE_URL = process.env.LLM_BASE_URL || "https://api.deepseek.com";
 const LLM_API_KEY = process.env.LLM_API_KEY || "";
 const LLM_MODEL = process.env.LLM_MODEL || "deepseek-v4-flash";
@@ -84,6 +86,14 @@ export class AgentSampleError extends Error {
     public readonly code: AgentSampleErrorCode,
     /** 参数累计字节数（脱敏后仅保留数值） */
     public readonly argBytes?: number,
+    /** Provider 返回的安全 HTTP 状态码；只用于受控失败诊断，不包含响应正文。 */
+    public readonly providerHttpStatus?: number,
+    /** 由受信入口确认的中立失败原因，不直接使用上游文案。 */
+    public readonly providerFailureReason?: AgentProviderFailureReason,
+    /** 受限协议标识，仅供诊断展示，不影响恢复。 */
+    public readonly providerFailureDetail?: string,
+    /** 供应商 Retry-After 折算的毫秒提示；仅参与 Kernel 退避等待，不进入公开事件。 */
+    public readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = "AgentSampleError";

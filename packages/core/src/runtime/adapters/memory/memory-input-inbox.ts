@@ -14,6 +14,7 @@ import type {
   ListInboxInput,
   PostInboxInput,
 } from "../../domain/input-inbox";
+import { inboxOriginKey } from "../../domain/input-inbox";
 
 export class MemoryInputInbox implements InputInbox {
   private inputs = new Map<string, InboxInput>();
@@ -21,7 +22,11 @@ export class MemoryInputInbox implements InputInbox {
   async post(input: PostInboxInput): Promise<InboxInput> {
     if (input.clientMessageId) {
       const existing = [...this.inputs.values()].find((candidate) => candidate.sessionId === input.sessionId && candidate.clientMessageId === input.clientMessageId);
-      if (existing) return existing;
+      if (existing) {
+        // 同键不同正文或来源不可静默复用，避免其他调用方覆盖已投递内容。
+        if (existing.content !== input.content || inboxOriginKey(existing.origin) !== inboxOriginKey(input.origin)) throw new Error("INBOX_INPUT_CONFLICT");
+        return existing;
+      }
     }
     const now = new Date().toISOString();
     const inboxInput: InboxInput = {
@@ -34,6 +39,7 @@ export class MemoryInputInbox implements InputInbox {
       clientMessageId: input.clientMessageId,
       attachments: input.attachments ?? [],
       selectedSkills: input.selectedSkills ?? [],
+      origin: input.origin,
       createdAt: now,
     };
     this.inputs.set(inboxInput.inputId, inboxInput);

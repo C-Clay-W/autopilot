@@ -24,6 +24,7 @@ export { MemoryUserQuestionStore } from "./memory-user-question-store";
 import type { RuntimePorts } from "../../ports";
 import { createUnavailableSandboxPort } from "../../ports/sandbox-port";
 import { MemorySessionStore } from "./memory-session-store";
+import { MemoryThreadStore } from "./memory-thread-store";
 import { MemoryCheckpointStore } from "./memory-checkpoint-store";
 import { MemoryTranscriptStore } from "./memory-transcript-store";
 import { MemoryCredentialStore } from "./memory-credential-store";
@@ -44,6 +45,7 @@ import { MemoryUserQuestionStore } from "./memory-user-question-store";
 export function createMemoryPorts(workspaceRoot = "/tmp/test-workspace"): RuntimePorts {
   return {
     sessionStore: new MemorySessionStore(),
+    threadStore: new MemoryThreadStore(),
     checkpointStore: new MemoryCheckpointStore(),
     transcriptStore: new MemoryTranscriptStore(),
     credentialStore: new MemoryCredentialStore(),

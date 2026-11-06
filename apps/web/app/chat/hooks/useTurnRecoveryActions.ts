@@ -1,9 +1,8 @@
 /** useTurnRecoveryActions.ts — cancel/queue/continue/approval/question 与 transport refresh 的连续逻辑；自原 page.tsx 原样迁入，不含新的业务判断。 */
 "use client";
 
-import { useRef, useState, useEffect, useCallback } from "react";
-import { reducePresentationInput, resolvePresentationApproval, restorePresentationApproval, type ApprovalItem, type UserQuestionItem } from "@autopilot-agent/presentation";
-import { sessionApiUrl } from "../conversation-target";
+import { useRef, useState, useEffect, useCallback, useSyncExternalStore } from "react";
+import { resolvePresentationApproval, type ApprovalItem, type UserQuestionItem } from "@autopilot-agent/presentation";import { sessionApiUrl } from "../conversation-target";
 import { useSessionTaskContext } from "../session-task-context";
 import { createWorkspaceSessionKey } from "../session-task-store";
 import { isTransportFailure } from "../chat-page-helpers";
@@ -29,9 +28,8 @@ interface UseTurnRecoveryActionsOptions {
   setStreamingMessageId: (streamingMessageId: string) => void;
   setActiveTurnId: (activeTurnId: string) => void;
   setPendingInputs: React.Dispatch<React.SetStateAction<PendingAgentInput[]>>;
-  setInputDeliveryNotice: React.Dispatch<React.SetStateAction<import("../chat-page-types").InputDeliveryNotice | null>>;
   setResumePendingSessionId: (sessionId: string | null) => void;
-  loadHistory: (sid: string, prefetchedData?: import("../chat-page-types").SessionHistoryPayload) => Promise<boolean>;
+  loadHistory: (sid: string, prefetchedData?: import("../chat-page-types").SessionHistoryPayload, observation?: boolean, signal?: AbortSignal) => Promise<boolean>;
   consumeAgentStream: (response: Response, messageId: string, sid: string) => Promise<import("../session-task-controller").SessionTaskStreamOutcome>;
   getSessionController: (sid: string) => import("../session-task-controller").SessionTaskController;
   setTransportState: (transport: import("@autopilot-agent/presentation").TransportState) => void;
@@ -46,18 +44,32 @@ interface UseTurnRecoveryActionsOptions {
   awaitingApprovalRef: React.MutableRefObject<boolean>;
   awaitingUserInputRef: React.MutableRefObject<boolean>;
   executionEpochRef: React.MutableRefObject<number>;
+  executionFactRef?: React.MutableRefObject<{ epoch: number; turnId: string } | null>;
   pendingInputsRef: React.MutableRefObject<PendingAgentInput[]>;
-  joinedInputIdsRef: React.MutableRefObject<Set<string>>;
   currentSessionIdRef: React.MutableRefObject<string>;
   currentWorkspaceIdRef: React.MutableRefObject<string>;
-  queueExecutionRequestedRef: React.MutableRefObject<boolean>;
 }
 
 /** 共用传输地址解析；Chat 作用域永远不发送到 Work API。 */
 const getWorkspaceSessionUrl = sessionApiUrl;
 
-/** 取消请求的前端等待上限；超时按“未确认停止”处理并重新同步权威状态（H2）。 */
+/** 取消确认的提示阈值；只报告未确认，不能中止尚未送达的取消命令。 */
 const CANCEL_REQUEST_TIMEOUT_MS = 10_000;
+/** 停止后的History补齐独立限时，超时取消本次读取并保留精确Turn复查结果。 */
+const CANCEL_HISTORY_TIMEOUT_MS = 3_000;
+
+/** 排队 Turn 的只读发现预算：宿主在上一轮收尾后立即领取，这里只覆盖领取与启动的短窗口。 */
+const QUEUE_DISCOVERY_ATTEMPTS = 10;
+const QUEUE_DISCOVERY_INTERVAL_MS = 400;
+
+/** 仍需接观察流的持久 Turn 状态；其余状态视为已收尾，页面只补历史。 */
+const QUEUE_LIVE_TURN_STATUSES = new Set(["running", "waiting_approval", "waiting_user_input"]);
+
+/** 打开 Work Turn 的只读观察流；POST 被宿主接受后，页面只负责观察持久事件。 */
+async function openTurnStream(workspaceId: string, sid: string, turnId: string, signal?: AbortSignal): Promise<Response> {
+  const url = getWorkspaceSessionUrl(workspaceId, sid, `/stream?turnId=${encodeURIComponent(turnId)}`);
+  return fetch(url!, { cache: "no-store", signal });
+}
 
 /** 承接原 ChatPageContent 的 Turn 恢复与排队启动逻辑；语句顺序、请求体与依赖数组保持不变。 */
 export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
@@ -79,7 +91,6 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     setStreamingMessageId,
     setActiveTurnId,
     setPendingInputs,
-    setInputDeliveryNotice,
     setResumePendingSessionId,
     loadHistory,
     consumeAgentStream,
@@ -97,9 +108,7 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     awaitingUserInputRef,
     executionEpochRef,
     pendingInputsRef,
-    joinedInputIdsRef,
     currentSessionIdRef,
-    queueExecutionRequestedRef,
   } = options;
   const { manager, refreshSessions } = useSessionTaskContext();
   const notice = useNotice();
@@ -107,8 +116,15 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
   const [stopping, setStopping] = useState(false);
   /** 继续请求单次锁：继续在途时忽略重复触发，避免双击或并发 /continue（P17 问题2）。 */
   const continueInFlightRef = useRef(false);
-  const queueStartInFlightRef = useRef<Promise<void> | null>(null);
-  const startNextQueuedTurnRef = useRef<(() => Promise<void>) | null>(null);
+  /** 排队发现单次锁：同一页面只允许一个发现流程在途。 */
+  const queueFollowInFlightRef = useRef<Promise<void> | null>(null);
+  /** 当前工作区的侧栏快照；用于发现协作投递在页面之外启动的新 Turn。 */
+  const sessionItems = useSyncExternalStore(manager.subscribeList, manager.getListSnapshot, manager.getListSnapshot);
+  /** 已交给只读观察流程的外部 Turn；同一会话同一 Turn 只接管一次。 */
+  const externallyObservedTurnRef = useRef<{ sessionId: string; turnId: string } | null>(null);
+  const externalStreamAbortRef = useRef<AbortController | null>(null);
+  /** 目录持久版本按精确目标去重；本地执行忙时不消费新版本，待执行段结束后补校准。 */
+  const observedDirectoryRevisionRef = useRef<{ key: string; revision: string } | null>(null);
 
   /** 先请求服务端取消并等待 durable 收口，再断开本地 SSE；本地 UI 在点击时立即停止更新。 */
   const cancelCurrentTurn = useCallback(async function cancelCurrentTurn(): Promise<void> {
@@ -126,10 +142,18 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
       return;
     }
     cancelledTurnIdsRef.current.add(activeTurn.turnId);
-    setPresentation(function cancelInputs(current) { return { ...current, items: current.items.map(function cancel(item) { return item.kind === "input_notice" && item.turnId === activeTurn.turnId && item.state === "queued" ? { ...item, cancelled: true } : item; }) }; });
+    /** 用户已请求停止时收起本轮旧审批；最终恢复资格仍由权威History决定。 */
+    function withdrawCancelledApprovals(): void {
+      setPresentation(function cancelInputs(current) { return { ...current, items: current.items.map(function cancel(item) {
+        if (item.kind === "input_notice" && item.turnId === activeTurn!.turnId && item.state === "queued") return { ...item, cancelled: true };
+        if (item.kind === "approval" && item.turnId === activeTurn!.turnId && item.state === "required") return { ...item, state: "resolved" as const };
+        return item;
+      }) }; });
+    }
+    withdrawCancelledApprovals();
     setMessages((previous) => previous.map((message) => (
       message.id === streamingMessageId || message.turnId === activeTurn?.turnId
-        ? { ...message, content: "用户已取消", activity: undefined, processSteps: undefined, sources: undefined, canContinue: true }
+        ? { ...message, activity: undefined, canContinue: false, recoveryError: undefined, stopState: "requesting" as const }
         : message
     )));
     setActivity(undefined);
@@ -138,40 +162,63 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     // loading 只代表当前页面是否可继续交互；服务端收口由独立的 cancel Promise 负责。
     setLoading(false);
     setStopping(true);
-    // 取消请求独立计时：前端不再无限等待，超时后按“未确认停止”重新同步权威状态。
-    const cancelAbortController = new AbortController();
-    const cancelTimeoutId = window.setTimeout(function abortCancelRequest() { cancelAbortController.abort(); }, CANCEL_REQUEST_TIMEOUT_MS);
+    /** 当前停止结果只更新发起Session，切换页面后的迟到响应不污染新目标。 */
+    function currentTarget(): boolean {
+      return currentSessionIdRef.current === activeTurn!.sessionId && options.currentWorkspaceIdRef.current === workspaceId;
+    }
+    /** 请求超时只进入待确认；保留原请求继续送达，不撤销已经发出的停止意图。 */
+    const request = fetch(getWorkspaceSessionUrl(workspaceId, activeTurn.sessionId, "/cancel")!, {
+      method: "POST", headers: { "Content-Type": "application/json" }, keepalive: true,
+      body: JSON.stringify({ turnId: activeTurn.turnId }),
+    }).then(function responseArrived(response) { console.log(response); return response; }).catch(function unavailable() { return undefined; });
     const cancelPromise = (async function requestServerCancellation(): Promise<void> {
-      /** 权威状态不可得时撤销乐观的可继续资格，只保留可解释的错误说明。 */
-      function revokeUnconfirmedContinue(turnId: string): void {
-        setMessages((previous) => previous.map((message) => (
-          message.turnId === turnId || message.id === streamingMessageId
-            ? { ...message, canContinue: false, recoveryError: "停止请求未收到确认，任务可能仍在运行；请刷新状态后再操作。" }
-            : message
-        )));
-      }
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
       try {
-        const response = await fetch(getWorkspaceSessionUrl(workspaceId, activeTurn.sessionId, "/cancel")!, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: cancelAbortController.signal,
-          body: JSON.stringify({ turnId: activeTurn.turnId }),
-        });
-        console.log(response);
-        if (!response.ok) {
-          const payload = await response.json().catch(function emptyBody() { return {}; }) as { error?: string };
-          notice.warning(payload.error || "任务尚未确认停止，已重新同步实际状态");
+        await Promise.race([request, new Promise<void>(function hint(resolve) {
+          timeoutId = setTimeout(resolve, CANCEL_REQUEST_TIMEOUT_MS);
+        })]);
+        if (timeoutId) clearTimeout(timeoutId);
+        let confirmed = false;
+        // 失败响应与提示阈值都不覆盖权威终态；每次复查有独立超时，总次数有界。
+        for (const delay of [0, 300, 900, 1800]) {
+          if (!currentTarget()) return;
+          if (delay) await new Promise<void>(function wait(resolve) { setTimeout(resolve, delay); });
+          try {
+            const response = await fetch(getWorkspaceSessionUrl(workspaceId, activeTurn.sessionId, `/turn-state?turnId=${encodeURIComponent(activeTurn.turnId)}`)!, { cache: "no-store", signal: AbortSignal.timeout(3000) });
+            console.log(response);
+            const state = response.ok ? await response.json() as { turnId?: string; cancellation?: string } : undefined;
+            if (state?.turnId === activeTurn.turnId && state.cancellation === "confirmed") { confirmed = true; break; }
+          } catch { /* 本次复查不可得，仍保留待确认并在预算内重试。 */ }
         }
-        // 成功与失败都以 durable 状态重建；未确认停止且同步也失败时不得保留可继续承诺。
-        const synced = await loadHistory(activeTurn.sessionId);
-        if (!response.ok && !synced) revokeUnconfirmedContinue(activeTurn.turnId);
-      } catch {
-        // 超时或网络失败：本地已停止展示，必须重新获取权威状态，不能继续假装可恢复。
-        notice.error("停止请求未收到确认，已重新同步任务状态");
-        const synced = await loadHistory(activeTurn.sessionId);
-        if (!synced) revokeUnconfirmedContinue(activeTurn.turnId);
+        if (!currentTarget()) return;
+        // 原观察连接已可关闭，避免它的在途标志阻止这次权威History补齐。
+        requestAbortController?.abort();
+        if (requestAbortRef.current === requestAbortController) requestAbortRef.current = null;
+        const historyController = new AbortController();
+        let historyTimeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            loadHistory(activeTurn.sessionId, undefined, true, historyController.signal).catch(function unavailable() { return false; }),
+            new Promise<void>(function historyBudget(resolve) {
+              historyTimeout = setTimeout(function expired() { historyController.abort(); resolve(); }, CANCEL_HISTORY_TIMEOUT_MS);
+            }),
+          ]);
+        } finally { if (historyTimeout) clearTimeout(historyTimeout); }
+        if (!currentTarget()) return;
+        setMessages(function cancellationStatus(previous) { return previous.map(function update(message) {
+          return message.turnId === activeTurn.turnId || message.id === streamingMessageId
+            ? { ...message, activity: undefined, recoveryError: undefined, stopState: confirmed ? "stopped" as const : "pending" as const, ...(!confirmed ? { canContinue: false } : {}) }
+            : message;
+        }); });
+        if (confirmed) clearActiveTurn();
+        else {
+          withdrawCancelledApprovals();
+          activeTurnRef.current = activeTurn;
+          setActiveTurnId(activeTurn.turnId);
+        }
+        setLoading(false);
       } finally {
-        window.clearTimeout(cancelTimeoutId);
+        if (timeoutId) clearTimeout(timeoutId);
         void refreshSessions(workspaceId);
         requestAbortController?.abort();
         if (requestAbortRef.current === requestAbortController) requestAbortRef.current = null;
@@ -196,90 +243,156 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
   // eslint-disable-next-line react-hooks/exhaustive-deps -- 依赖数组与原 page.tsx 一致；refs 为稳定引用不参与重建。
   }, [cancelCurrentTurn]);
 
-  /** 当前 turn 成功结束后领取一条 durable queue 输入，并沿用同一 Messages Route 的 Agent SSE。 */
-  async function startNextQueuedTurnOnce(): Promise<void> {
-    if (isChat || !canWrite) return;
-    const sid = sessionId;
-    /** 请求和所有收尾回调都必须仍归属原页面目标。 */
-    function isCurrentQueueTarget(): boolean { return currentSessionIdRef.current === sid && options.currentWorkspaceIdRef.current === workspaceId; }
-    if (!sid || !isCurrentQueueTarget() || activeTurnRef.current) return;
-    let claimedTurnId: string | null = null;
-    /** 旧 queue 只能结束自己的活动轮，不能清理同会话后来开始的另一轮。 */
-    function ownsQueueLifecycle(): boolean { return isCurrentQueueTarget() && (!activeTurnRef.current || activeTurnRef.current.turnId === claimedTurnId); }
-    setLoading(true);
-    const assistantId = `queued-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    setMessages((current) => [...current,
-      { id: assistantId, role: "assistant", content: "", activity: "answer", processSteps: [{ stage: "prepare", message: "正在开始排队任务" }] },
-    ]);
+  /** 目标仍归属当前页面会话与工作区；切换后到达的旧响应一律丢弃。 */
+  function isCurrentQueueTarget(sid: string): boolean {
+    return Boolean(sid) && currentSessionIdRef.current === sid && options.currentWorkspaceIdRef.current === workspaceId;
+  }
+
+  /** 读取当前 Session 的最新 Turn 身份与状态；只读入口，不领取输入也不启动 Turn。 */
+  async function readLatestTurnState(sid: string, signal: AbortSignal): Promise<{ turnId: string | null; status: string | null } | null> {
+    const url = getWorkspaceSessionUrl(workspaceId, sid, "/turn-state");
+    if (!url) return null;
     try {
-      const response = await fetch(getWorkspaceSessionUrl(workspaceId, sid, "/messages")!, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ operation: "start_next" }),
-      });
+      const response = await fetch(url, { cache: "no-store", signal });
       console.log(response);
-      if (!isCurrentQueueTarget()) return;
-      if (response.status === 204) {
-        setMessages((current) => current.filter((message) => message.id !== assistantId));
-        return;
-      }
-      if (!response.ok || !response.body) throw new Error((await response.json().catch(() => ({ error: "排队任务启动失败" }))).error || "排队任务启动失败");
-      manager.beginSession(createWorkspaceSessionKey(workspaceId, sid));
-      const claimedInputId = response.headers.get("X-Agent-Input-Id");
-      claimedTurnId = response.headers.get("X-Agent-Turn-Id");
-      if (claimedInputId) joinedInputIdsRef.current.add(claimedInputId);
-      const nextInput = pendingInputsRef.current.find(function claimed(input) { return input.inputId === claimedInputId; });
-      if (claimedInputId && claimedTurnId) setPresentation(function claimed(current) {
-        if (!isCurrentQueueTarget()) return current;
-        return reducePresentationInput(current, { kind: "host_event", event: { kind: "input", input: { inputId: claimedInputId, turnId: claimedTurnId!, delivery: nextInput?.delivery ?? "queue", content: nextInput?.content, state: "consumed", position: { turnId: claimedTurnId!, items: [], order: -1 } } } });
-      });
-      if (nextInput) pendingInputsRef.current = pendingInputsRef.current.filter((input) => input.inputId !== nextInput.inputId);
-      if (nextInput) {
-        const notice = { delivery: nextInput.delivery, content: nextInput.content, status: "started" as const };
-        setInputDeliveryNotice(notice);
-        window.setTimeout(function expireOwnNotice() { setInputDeliveryNotice(function expire(current) { return current === notice ? null : current; }); }, 6000);
-      }
-      setPendingInputs((current) => current.filter((input) => input.inputId !== claimedInputId));
+      if (!response.ok) return null;
+      return await response.json() as { turnId: string | null; status: string | null };
+    } catch {
+      // 网络失败与目标切换都只结束本次发现；队列执行本身不受页面影响。
+      return null;
+    }
+  }
+
+  /** 接管宿主已启动的 Turn：复用既有观察流，只读事件，不启动也不取消。 */
+  async function observeHostStartedTurn(sid: string, turnId: string): Promise<void> {
+    const observer = new AbortController();
+    externalStreamAbortRef.current?.abort();
+    externalStreamAbortRef.current = observer;
+    await loadHistory(sid, undefined, true);
+    if (!isCurrentQueueTarget(sid) || observer.signal.aborted) return;
+    const assistantId = `agent-turn-${turnId}`;
+    setMessages((current) => current.some(function same(message) { return message.role === "assistant" && message.turnId === turnId; })
+      ? current
+      : [...current, { id: assistantId, role: "assistant", content: "", createdAt: current.find(function prompt(message) { return message.role === "user" && message.turnId === turnId; })?.createdAt, turnId, activity: "answer" }]);
+    if (awaitingApprovalRef.current || awaitingUserInputRef.current) { setLoading(false); return; }
+    manager.beginSession(createWorkspaceSessionKey(workspaceId, sid), turnId);
+    activeTurnRef.current = { sessionId: sid, turnId };
+    setActiveTurnId(turnId);
+    setLoading(true);
+    try {
+      const response = await openTurnStream(workspaceId, sid, turnId, observer.signal);
+      console.log(response);
+      if (!isCurrentQueueTarget(sid) || observer.signal.aborted) return;
       const streamOutcome = await consumeAgentStream(response, assistantId, sid);
-      // 排队 Turn 终态明确或已校准时本地投影完整；只有流结束无终态才需要 History fallback。
-      if (streamOutcome === "ended_without_terminal" && ownsQueueLifecycle()) void loadHistory(sid);
+      // 流结束仍无终态时用持久历史校准；只补齐展示，不改执行。
+      if (streamOutcome === "ended_without_terminal" && isCurrentQueueTarget(sid) && !observer.signal.aborted) void loadHistory(sid, undefined, true);
     } catch (error) {
-      if (!isCurrentQueueTarget()) return;
-      const disconnected = isTransportFailure(error);
-      if (disconnected && ownsQueueLifecycle()) setTransportState("disconnected");
-      setMessages((current) => current.map((message) => message.id === assistantId ? disconnected ? { ...message, activity: undefined } : { ...message, content: `排队任务失败：${error instanceof Error ? error.message : "未知错误"}`, activity: undefined } : message));
+      if (!observer.signal.aborted && isTransportFailure(error)) setTransportState("disconnected");
     } finally {
-      if (ownsQueueLifecycle()) {
+      if (isCurrentQueueTarget(sid) && !observer.signal.aborted && activeTurnRef.current?.turnId === turnId) {
         setLoading(false);
         if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
+      }
+      // 仍有排队输入时继续只读跟随下一轮；单次锁在当前 promise 收尾后释放，故延后一拍。
+      if (!observer.signal.aborted && pendingInputsRef.current.length && isCurrentQueueTarget(sid)) {
+        window.setTimeout(function followNextQueuedTurn() { void requestFollowQueuedTurn(turnId); }, 0);
       }
     }
   }
 
-  /** 同一页面只允许一个排队 Turn 启动请求，重复触发只复用在途 Promise。 */
-  function requestNextQueuedTurn(): Promise<void> {
-    const inFlight = queueStartInFlightRef.current;
-    if (inFlight) return inFlight;
-    const run = startNextQueuedTurnOnce();
-    queueStartInFlightRef.current = run;
-    void run.then(function clearQueueStartLock(): void {
-      if (queueStartInFlightRef.current !== run) return;
-      queueStartInFlightRef.current = null;
-      if (queueExecutionRequestedRef.current) {
-        queueExecutionRequestedRef.current = false;
-        window.setTimeout(() => { void requestNextQueuedTurn(); }, 0);
-      }
-    }, function clearQueueStartLockAfterFailure(): void {
-      if (queueStartInFlightRef.current !== run) return;
-      queueStartInFlightRef.current = null;
+  /**
+   * 协作投递会在页面之外启动新 Turn：从 manager 快照拿到新 Turn 身份后交给既有只读观察流程，
+   * 不调用 start/continue；同一活动Turn只接管一次，已结束的短Turn按目录版本只读补历史。
+   */
+  useEffect(function attachExternallyStartedTurn() {
+    if (isChat || !canWrite || !sessionId) return;
+    const item = sessionItems.find(function matchCurrentSession(entry) {
+      return entry.workspaceId === workspaceId && entry.session.id === sessionId;
     });
-    return run;
+    if (!item) return;
+    // Session元数据优先；仅从同workspace/session快照读取合法的活动Turn回退。
+    const turnId = item.session.activeTurnId ?? manager.getSessionSnapshot(createWorkspaceSessionKey(workspaceId, sessionId))?.activeTurnId;
+    const key = createWorkspaceSessionKey(workspaceId, sessionId);
+    const revision = JSON.stringify([item.session.updatedAt, item.session.runtimeStatus, turnId ?? null]);
+    const previous = observedDirectoryRevisionRef.current;
+    if (!previous || previous.key !== key) observedDirectoryRevisionRef.current = { key, revision };
+    if (requestAbortRef.current) return;
+    if (!turnId) {
+      // ThreadStore的短run可能从未出现在running快照，也不在Inbox pending中；终态版本变化不能漏读。
+      if (previous?.key === key && previous.revision !== revision && item.phase !== "running" && item.phase !== "starting") {
+        observedDirectoryRevisionRef.current = { key, revision };
+        externalStreamAbortRef.current?.abort();
+        void loadHistory(sessionId, undefined, true);
+      }
+      return;
+    }
+    observedDirectoryRevisionRef.current = { key, revision };
+    if (externallyObservedTurnRef.current?.sessionId === sessionId && externallyObservedTurnRef.current.turnId === turnId) return;
+    if (activeTurnRef.current && activeTurnRef.current.turnId !== turnId && requestAbortRef.current) return;
+    const isLive = item.phase === "running" || item.phase === "starting";
+    const isWaiting = item.phase === "waiting_approval" || item.phase === "waiting_user_input";
+    if (!isLive && !isWaiting) return;
+    externallyObservedTurnRef.current = { sessionId, turnId };
+    // 等待审批/回答只补权威历史；运行中的 Turn 才续接既有只读观察流。
+    if (isWaiting) {
+      externalStreamAbortRef.current?.abort();
+      void loadHistory(sessionId, undefined, true);
+      return;
+    }
+    void observeHostStartedTurn(sessionId, turnId);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- 依赖只取触发身份；观察函数每次渲染重建，不参与依赖数组。
+  }, [sessionItems, isChat, canWrite, sessionId, workspaceId, activeTurnId, loading]);
+
+  /** 隐藏保活不卸载观察；真正更换固定Session身份或卸载时只关闭本页只读连接。 */
+  useEffect(function disposeExternalObservation() {
+    return function closeExternalStream() { externalStreamAbortRef.current?.abort(); };
+  }, [sessionId, workspaceId]);
+
+  /** 上一轮结束后有界只读发现宿主自动启动的排队 Turn；已收尾的短任务只补历史。 */
+  async function followQueuedTurn(previousTurnId: string | null): Promise<void> {
+    if (isChat || !canWrite) return;
+    const sid = sessionId;
+    if (!isCurrentQueueTarget(sid) || activeTurnRef.current) return;
+    const controller = getSessionController(sid).createAbortController();
+    let seenTurnId = previousTurnId;
+    try {
+      for (let attempt = 0; attempt < QUEUE_DISCOVERY_ATTEMPTS; attempt += 1) {
+        if (!isCurrentQueueTarget(sid) || controller.signal.aborted) return;
+        const state = await readLatestTurnState(sid, controller.signal);
+        if (!isCurrentQueueTarget(sid)) return;
+        if (state?.turnId && state.turnId !== seenTurnId) {
+          seenTurnId = state.turnId;
+          if (QUEUE_LIVE_TURN_STATUSES.has(state.status ?? "")) {
+            await observeHostStartedTurn(sid, state.turnId);
+            return;
+          }
+          // 两次轮询之间已启动并收尾：补齐 Prompt、结果与终态，再继续看是否还有下一条排队输入。
+          await loadHistory(sid);
+        }
+        await new Promise<void>(function waitNextPoll(resolve) { window.setTimeout(resolve, QUEUE_DISCOVERY_INTERVAL_MS); });
+      }
+    } finally {
+      controller.abort();
+    }
   }
 
-  startNextQueuedTurnRef.current = requestNextQueuedTurn;
+  /** 同一页面只允许一个排队发现流程，重复触发只复用在途 Promise。 */
+  function requestFollowQueuedTurn(previousTurnId: string | null): Promise<void> {
+    const inFlight = queueFollowInFlightRef.current;
+    if (inFlight) return inFlight;
+    const run = followQueuedTurn(previousTurnId);
+    queueFollowInFlightRef.current = run;
+    void run.then(clearQueueFollowLock, clearQueueFollowLock);
+    return run;
 
-  /** 页面恢复后继续处理未消费输入，避免完成事件已发生时遗留 steer/queue 永久停留。 */
-  useEffect(function resumePendingAgentInputs() {
+    /** 发现流程结束后释放单次锁；旧流程不得清理后来接替的流程。 */
+    function clearQueueFollowLock(): void {
+      if (queueFollowInFlightRef.current === run) queueFollowInFlightRef.current = null;
+    }
+  }
+
+  /** 页面恢复后重新校准：只读发现宿主已启动的排队 Turn，不再由页面领取或启动。 */
+  useEffect(function resumeQueuedTurnObservation() {
     if (!resumePendingSessionId) return;
     if (resumePendingSessionId !== sessionId) {
       setResumePendingSessionId(null);
@@ -287,7 +400,7 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     }
     if (loading || activeTurnId) return;
     setResumePendingSessionId(null);
-    void startNextQueuedTurnRef.current?.();
+    void requestFollowQueuedTurn(null);
   // eslint-disable-next-line react-hooks/exhaustive-deps -- 依赖数组与原 page.tsx 一致；setResumePendingSessionId 为稳定 setter。
   }, [resumePendingSessionId, sessionId, loading, activeTurnId]);
 
@@ -296,6 +409,7 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     if (isChat || !canWrite) return;
     const message = messages.find((item) => item.id === messageId);
     if (!sessionId || !message?.turnId) return;
+    if (message.stopState === "pending" || message.stopState === "requesting") { notice.warning("停止尚未确认，请先刷新状态或重试停止"); return; }
     if (cancelInFlightRef.current) {
       // 取消在途时不得抢跑，也不能静默丢弃用户动作（H2）。
       notice.warning("任务正在停止，请等待服务端确认后再继续");
@@ -307,6 +421,7 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     executionEpochRef.current = executionEpoch;
     continueInFlightRef.current = true;
     cancelledTurnIdsRef.current.delete(turnId);
+    requestAbortRef.current?.abort();
     const abortController = getSessionController(sessionId).createAbortController();
     requestAbortRef.current = abortController;
     cancelRequestedRef.current = false;
@@ -314,21 +429,30 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     setActiveTurnId(turnId);
     setLoading(true);
     // 点击即进入恢复中投影：隐藏旧继续入口与旧停止提示；重新显示只能来自权威 History 或新可恢复终态（P17 问题2）。
-    setMessages((current) => current.map((item) => item.id === messageId ? { ...item, activity: "answer", canContinue: false, termination: undefined, recoveryError: undefined } : item));
+    setMessages((current) => current.map((item) => item.id === messageId ? { ...item, activity: "answer", canContinue: false, termination: undefined, recoveryError: undefined, stopState: undefined } : item));
+    let observing = false;
     try {
       const response = await fetch(getWorkspaceSessionUrl(workspaceId, sessionId, "/continue")!, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: abortController.signal,
-        body: JSON.stringify({ turnId }),
+        body: JSON.stringify({ turnId, ...(message.questionRequestId ? { requestId: message.questionRequestId } : {}) }),
       });
       console.log(response);
-      if (!response.ok || !response.body) throw new Error((await response.json().catch(() => ({ error: "恢复失败" }))).error || "恢复失败");
-      manager.beginSession(createWorkspaceSessionKey(workspaceId, sessionId), turnId);
-      const streamOutcome = await consumeAgentStream(response, messageId, sessionId);
-      // Continue 的实时输出不依赖 History 请求；终态明确或已校准时直接收口。
-      if (streamOutcome === "ended_without_terminal") void loadHistory(sessionId);
+      if (!response.ok) throw new Error((await response.json().catch(() => ({ error: "恢复失败" }))).error || "恢复失败");
+      if (!currentInteraction(executionEpoch, turnId, abortController)) return;
+      const accepted = await response.json().catch(function unavailable() { return {}; }) as { controlId?: string };
+      if (!currentInteraction(executionEpoch, turnId, abortController)) return;
+      awaitingApprovalRef.current = false;
+      awaitingUserInputRef.current = false;
+      if (accepted.controlId && !(options.executionFactRef?.current?.epoch === executionEpoch && options.executionFactRef.current.turnId === turnId)) {
+        setLoading(false);
+        setMessages(function waiting(current) { return current.map(function target(item) { return item.id === messageId ? { ...item, activity: undefined, canContinue: true, recoveryError: "决定或答案已保存，等待兼容宿主接手" } : item; }); });
+      }
+      observing = true;
+      observeInteraction(messageId, turnId, executionEpoch, abortController);
     } catch (error) {
+      if (executionEpochRef.current !== executionEpoch || currentSessionIdRef.current !== sessionId || options.currentWorkspaceIdRef.current !== workspaceId) return;
       const cancelled = cancelRequestedRef.current || abortController.signal.aborted;
       const disconnected = isTransportFailure(error);
       if (disconnected && !cancelled) setTransportState("disconnected");
@@ -341,13 +465,18 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
       // 恢复失败不乐观恢复可继续资格：由权威 History 确认仍可恢复才重新显示；读不到时只保留解释（P17 问题2）。
       if (!cancelled) {
         const synced = await loadHistory(sessionId);
-        if (!synced) setMessages((current) => current.map((item) => item.id === messageId ? { ...item, canContinue: false, recoveryError: "无法确认任务当前状态，请刷新后重试" } : item));
+        if (!currentInteraction(executionEpoch, turnId, abortController)) return;
+        // History会替换消息容器；校准后再保留固定失败提示，不能让400/409解释随快照消失。
+        setMessages(function showContinueFailure(current) {
+          const target = current.find(function sameId(item) { return item.id === messageId; }) ?? current.find(function sameTurn(item) { return item.role === "assistant" && item.turnId === turnId; });
+          return current.map(function explain(item) { return item.id === target?.id ? { ...item, ...(!synced ? { canContinue: false } : {}), recoveryError: synced ? "恢复请求未成功，已同步当前状态；请处理有效审批或稍后重试。" : "无法确认任务当前状态，请刷新后重试" } : item; });
+        });
       }
     } finally {
-      if (requestAbortRef.current === abortController) requestAbortRef.current = null;
+      if (!observing && requestAbortRef.current === abortController) requestAbortRef.current = null;
       continueInFlightRef.current = false;
       // 旧继续请求的收尾只能清理自己认领的执行段，不覆盖后来续接的 loading/active（H2）。
-      if (executionEpochRef.current === executionEpoch) {
+      if (!observing && currentInteraction(executionEpoch, turnId, abortController)) {
         cancelRequestedRef.current = false;
         setLoading(false);
         if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
@@ -355,10 +484,53 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     }
   }
 
+  const interactionInFlightRef = useRef<string | null>(null);
+  const savedQuestionRef = useRef<string | null>(null);
+
+  /** 精确代次与目标仍有效时才提交界面更新，旧观察不会清理后续问题。 */
+  function currentInteraction(epoch: number, turnId: string, controller?: AbortController): boolean {
+    return currentSessionIdRef.current === sessionId && options.currentWorkspaceIdRef.current === workspaceId && executionEpochRef.current === epoch && !cancelledTurnIdsRef.current.has(turnId) && !controller?.signal.aborted;
+  }
+
+  /** 继续已接受后交给既有Session流消费者，提交Promise不等待运行段结束。 */
+  function observeInteraction(messageId: string, turnId: string, epoch: number, controller: AbortController): void {
+    async function observe(): Promise<void> {
+      try {
+        const response = await openTurnStream(workspaceId, sessionId, turnId, controller.signal);
+        console.log(response);
+        if (!currentInteraction(epoch, turnId, controller)) return;
+        if (!response.ok) throw new Error("INTERACTION_OBSERVATION_FAILED");
+        const outcome = await consumeAgentStream(response, messageId, sessionId);
+        if (outcome === "ended_without_terminal" && currentInteraction(epoch, turnId, controller)) await loadHistory(sessionId, undefined, true);
+      } catch (error) {
+        if (!currentInteraction(epoch, turnId, controller)) return;
+        if (isTransportFailure(error)) setTransportState("disconnected");
+        setMessages(function failed(current) { return current.map(function target(item) { return item.id === messageId ? { ...item, activity: undefined, canContinue: true, recoveryError: "决定或答案已保存，观察连接中断，请刷新原任务后重试" } : item; }); });
+      } finally {
+        if (requestAbortRef.current === controller) requestAbortRef.current = null;
+        if (currentInteraction(epoch, turnId, controller)) {
+          setLoading(false);
+          if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
+        }
+      }
+    }
+    observe().catch(function reportUnexpectedObservationFailure() {
+      if (currentInteraction(epoch, turnId, controller)) {
+        setTransportState("disconnected");
+        setLoading(false);
+        setMessages(function failed(current) { return current.map(function target(item) { return item.id === messageId ? { ...item, activity: undefined, canContinue: true, recoveryError: "无法确认观察结果，请刷新原任务" } : item; }); });
+      }
+    });
+  }
+
   /** 提交冻结审批决定后用新 SSE 恢复同一 turn，浏览器从不重传工具参数。 */
   async function handleApproval(messageId: string, approval: ApprovalItem, decision: "allow_once" | "allow_session" | "allow_workspace" | "deny") {
-    if (isChat || !canWrite) return;
-    if (!sessionId) return;
+    if (isChat || !canWrite || interactionInFlightRef.current || cancelledTurnIdsRef.current.has(approval.turnId) || currentSessionIdRef.current !== sessionId || options.currentWorkspaceIdRef.current !== workspaceId) return;
+    if (cancelInFlightRef.current) { notice.warning("任务正在停止，请等待服务端确认后再审批"); return; }
+    if (!sessionId || !awaitingApprovalRef.current || activeTurnRef.current?.sessionId !== sessionId || activeTurnRef.current?.turnId !== approval.turnId) return;
+    const interactionKey = JSON.stringify([sessionId, approval.turnId, approval.approvalId]);
+    interactionInFlightRef.current = interactionKey;
+    externalStreamAbortRef.current?.abort();
     const executionEpoch = executionEpochRef.current + 1;
     executionEpochRef.current = executionEpoch;
     setPresentation((current) => resolvePresentationApproval(current, approval.approvalId));
@@ -366,37 +538,52 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     activeTurnRef.current = { sessionId, turnId: approval.turnId };
     setActiveTurnId(approval.turnId);
     let approvalSubmitted = false;
+    let observing = false;
+    const abortController = getSessionController(sessionId).createAbortController();
+    requestAbortRef.current = abortController;
     try {
       const approvalResponse = await fetch(getWorkspaceSessionUrl(workspaceId, sessionId, "/approvals")!, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: abortController.signal,
         body: JSON.stringify({ turnId: approval.turnId, approvalId: approval.approvalId, decision }),
       });
+      console.log(approvalResponse);
       if (!approvalResponse.ok) throw new Error((await approvalResponse.json()).error || "提交审批失败");
       approvalSubmitted = true;
       const continueResponse = await fetch(getWorkspaceSessionUrl(workspaceId, sessionId, "/continue")!, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: abortController.signal,
         body: JSON.stringify({ turnId: approval.turnId, approvalId: approval.approvalId }),
       });
-      if (!continueResponse.ok || !continueResponse.body) throw new Error((await continueResponse.json().catch(() => ({ error: "恢复失败" }))).error || "恢复失败");
+      console.log(continueResponse);
+      if (!continueResponse.ok) throw new Error((await continueResponse.json().catch(() => ({ error: "恢复失败" }))).error || "恢复失败");
+      if (!currentInteraction(executionEpoch, approval.turnId, abortController)) return;
+      const accepted = await continueResponse.json().catch(function unavailable() { return {}; }) as { controlId?: string };
+      if (!currentInteraction(executionEpoch, approval.turnId, abortController)) return;
       awaitingApprovalRef.current = false;
-      manager.beginSession(createWorkspaceSessionKey(workspaceId, sessionId), approval.turnId);
-      const streamOutcome = await consumeAgentStream(continueResponse, messageId, sessionId);
-      // 审批恢复先完成实时收尾；终态明确或已校准时不再额外请求完整 History。
-      if (streamOutcome === "ended_without_terminal") void loadHistory(sessionId);
+      if (accepted.controlId && !(options.executionFactRef?.current?.epoch === executionEpoch && options.executionFactRef.current.turnId === approval.turnId)) {
+        setLoading(false);
+        setMessages(function waiting(current) { return current.map(function target(item) { return item.id === messageId ? { ...item, activity: undefined, canContinue: true, recoveryError: "审批决定已保存，等待兼容宿主接手" } : item; }); });
+      }
+      observing = true;
+      observeInteraction(messageId, approval.turnId, executionEpoch, abortController);
     } catch (error) {
+      if (!currentInteraction(executionEpoch, approval.turnId, abortController)) return;
       const disconnected = isTransportFailure(error);
       if (disconnected) setTransportState("disconnected");
       if (!approvalSubmitted && currentSessionIdRef.current === sessionId) {
-        setPresentation((current) => restorePresentationApproval(current, approval.approvalId));
-        awaitingApprovalRef.current = true;
-        activeTurnRef.current = { sessionId, turnId: approval.turnId };
-        setActiveTurnId(approval.turnId);
+        // 失败/过期审批只从权威 History 校准；读失败时也不复活旧卡。
+        awaitingApprovalRef.current = false;
+        await loadHistory(sessionId);
+        if (!currentInteraction(executionEpoch, approval.turnId, abortController)) return;
       }
-      setMessages((prev) => prev.map((message) => message.id === messageId ? disconnected ? { ...message, activity: undefined } : { ...message, content: `审批恢复失败：${error instanceof Error ? error.message : "未知错误"}` } : message));
+      setMessages((prev) => prev.map((message) => message.id === messageId ? { ...message, activity: undefined, canContinue: approvalSubmitted, recoveryError: approvalSubmitted ? "审批决定已保存，继续失败，请重试原决定" : `审批提交失败：${error instanceof Error ? error.message : "未知错误"}` } : message));
     } finally {
-      if (executionEpochRef.current === executionEpoch) {
+      if (interactionInFlightRef.current === interactionKey) interactionInFlightRef.current = null;
+      if (!observing && requestAbortRef.current === abortController) requestAbortRef.current = null;
+      if (!observing && currentInteraction(executionEpoch, approval.turnId, abortController)) {
         setLoading(false);
         if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
       }
@@ -404,10 +591,12 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     }
   }
 
-  /** 先持久化结构化答案，再只携带 requestId 从同一 Turn 的可信 Store 恢复 SSE。 */
+  /** 答案保存后结束编辑，继续接受后独立观察；原请求重试只继续已存答案。 */
   async function handleUserQuestion(messageId: string, question: UserQuestionItem, answers: UserQuestionAnswerDraft[]): Promise<void> {
     if (isChat || !canWrite) return;
-    if (!sessionId || cancelInFlightRef.current) throw new Error("当前任务不可提交答案");
+    if (!sessionId || cancelInFlightRef.current || interactionInFlightRef.current || cancelledTurnIdsRef.current.has(question.turnId) || currentSessionIdRef.current !== sessionId || options.currentWorkspaceIdRef.current !== workspaceId) throw new Error("当前任务不可提交答案");
+    const interactionKey = JSON.stringify([workspaceId, sessionId, question.turnId, question.requestId]);
+    interactionInFlightRef.current = interactionKey;
     const executionEpoch = executionEpochRef.current + 1;
     executionEpochRef.current = executionEpoch;
     const abortController = getSessionController(sessionId).createAbortController();
@@ -416,40 +605,54 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     activeTurnRef.current = { sessionId, turnId: question.turnId };
     setActiveTurnId(question.turnId);
     setLoading(true);
+    let saved = savedQuestionRef.current === interactionKey || question.state === "answered";
+    let observing = false;
     try {
-      const questionResponse = await fetch(getWorkspaceSessionUrl(workspaceId, sessionId, "/questions")!, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: abortController.signal,
-        body: JSON.stringify({ turnId: question.turnId, requestId: question.requestId, answers }),
-      });
-      console.log(questionResponse);
-      if (!questionResponse.ok) throw new Error((await questionResponse.json().catch(() => ({ error: "提交回答失败" }))).error || "提交回答失败");
+      if (!saved) {
+        const questionResponse = await fetch(getWorkspaceSessionUrl(workspaceId, sessionId, "/questions")!, {
+          method: "POST", headers: { "Content-Type": "application/json" }, signal: abortController.signal,
+          body: JSON.stringify({ turnId: question.turnId, requestId: question.requestId, answers }),
+        });
+        console.log(questionResponse);
+        if (!questionResponse.ok) throw new Error((await questionResponse.json().catch(() => ({ error: "提交回答失败" }))).error || "提交回答失败");
+        saved = true;
+        savedQuestionRef.current = interactionKey;
+      }
+      if (currentInteraction(executionEpoch, question.turnId, abortController)) {
+        setPresentation(function savedQuestion(current) { return { ...current, items: current.items.map(function exact(item) { return item.kind === "user_question" && item.turnId === question.turnId && item.requestId === question.requestId ? { ...item, state: "answered" as const } : item; }) }; });
+        setMessages(function savedQuestion(current) { return current.map(function exact(item) { return item.id === messageId ? { ...item, questionRequestId: question.requestId, recoveryError: undefined } : item; }); });
+      }
+      if (executionEpochRef.current !== executionEpoch || cancelledTurnIdsRef.current.has(question.turnId) || abortController.signal.aborted) return;
       const continueResponse = await fetch(getWorkspaceSessionUrl(workspaceId, sessionId, "/continue")!, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: abortController.signal,
+        method: "POST", headers: { "Content-Type": "application/json" }, signal: abortController.signal,
         body: JSON.stringify({ turnId: question.turnId, requestId: question.requestId }),
       });
       console.log(continueResponse);
-      if (!continueResponse.ok || !continueResponse.body) throw new Error((await continueResponse.json().catch(() => ({ error: "恢复失败" }))).error || "恢复失败");
+      if (!continueResponse.ok) throw new Error((await continueResponse.json().catch(() => ({ error: "恢复失败" }))).error || "恢复失败");
+      if (!currentInteraction(executionEpoch, question.turnId, abortController)) return;
+      const accepted = await continueResponse.json().catch(function unavailable() { return {}; }) as { controlId?: string };
+      if (!currentInteraction(executionEpoch, question.turnId, abortController)) return;
       awaitingUserInputRef.current = false;
-      manager.beginSession(createWorkspaceSessionKey(workspaceId, sessionId), question.turnId);
-      const streamOutcome = await consumeAgentStream(continueResponse, messageId, sessionId);
-      // 结构化回答恢复先释放运行态；终态明确或已校准时不再额外请求完整 History。
-      if (streamOutcome === "ended_without_terminal") void loadHistory(sessionId);
+      if (accepted.controlId && !(options.executionFactRef?.current?.epoch === executionEpoch && options.executionFactRef.current.turnId === question.turnId)) {
+        setLoading(false);
+        setMessages(function waiting(current) { return current.map(function target(item) { return item.id === messageId ? { ...item, activity: undefined, canContinue: true, recoveryError: "答案已保存，等待兼容宿主接手" } : item; }); });
+      }
+      observing = true;
+      observeInteraction(messageId, question.turnId, executionEpoch, abortController);
     } catch (error) {
-      const cancelled = cancelRequestedRef.current || abortController.signal.aborted;
-      const disconnected = isTransportFailure(error);
-      if (disconnected && !cancelled) setTransportState("disconnected");
-      if (!cancelled && currentSessionIdRef.current === sessionId) markAwaitingUserInput(sessionId, question.turnId);
-      throw new Error(error instanceof Error ? error.message : "提交回答失败，请重试");
+      if (currentInteraction(executionEpoch, question.turnId, abortController)) {
+        if (isTransportFailure(error)) setTransportState("disconnected");
+        markAwaitingUserInput(sessionId, question.turnId);
+        if (saved) setMessages(function savedFailure(current) { return current.map(function exact(item) { return item.id === messageId ? { ...item, activity: undefined, questionRequestId: question.requestId, canContinue: true, recoveryError: "答案已保存，继续请求失败，请重试原请求" } : item; }); });
+        else await loadHistory(sessionId, undefined, true);
+      }
+      if (currentInteraction(executionEpoch, question.turnId, abortController)) throw new Error(saved ? "答案已保存，继续失败，请重试原请求" : error instanceof Error ? error.message : "提交回答失败，请重试");
     } finally {
-      if (requestAbortRef.current === abortController) requestAbortRef.current = null;
-      if (executionEpochRef.current === executionEpoch) {
+      if (interactionInFlightRef.current === interactionKey) interactionInFlightRef.current = null;
+      if (!observing && requestAbortRef.current === abortController) requestAbortRef.current = null;
+      if (!observing && currentInteraction(executionEpoch, question.turnId, abortController)) {
         cancelRequestedRef.current = false;
         setLoading(false);
-        if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
       }
     }
   }
@@ -487,7 +690,6 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     handleUserQuestion,
     cancelPendingInput,
     refreshTransport,
-    startNextQueuedTurnRef,
-    requestNextQueuedTurn,
+    requestFollowQueuedTurn,
   };
 }

@@ -16,6 +16,8 @@ export type SessionTaskStreamOutcome = "terminal_seen" | "reconciled" | "ended_w
 /** SSE 空闲时用于核对当前 Turn 是否已在服务端进入终态。 */
 export interface SessionTaskConsumeOptions {
   idleTimeoutMs?: number;
+  /** 由宿主执行代次阻止迟到旧流回写。 */
+  shouldApplyEvent?(): boolean;
   getTerminalSnapshot?(turnId: string): Promise<SessionTaskTerminalSnapshot | null>;
   applyTerminalSnapshot?(turnId: string, snapshot: SessionTaskTerminalSnapshot): Promise<boolean>;
 }
@@ -98,6 +100,7 @@ export function createSessionTaskController(sessionId: string, onEvent: SessionT
         recordWebPerformanceDiagnostic("browser_sse_parse", typeof data.type === "string" ? data.type : "unknown", performance.now() - parseStartedAt);
         lastEventAt = Date.now();
         if (typeof data.turnId === "string") observedTurnId = data.turnId;
+        if (options?.shouldApplyEvent && !options.shouldApplyEvent()) return true;
         onEvent(messageId, data);
         sawTerminal = data.type === "turn_completed" || data.type === "turn_failed" || data.type === "turn_interrupted" || data.type === "turn_limit_reached";
         return sawTerminal;

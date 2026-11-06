@@ -4,6 +4,7 @@ import { render } from "ink";
 import { createTuiInputRouter, type TuiSgrMouseEvent } from "../tui-input-router.js";
 import type { CliControllerResult } from "../controller.js";
 import type { CliEventListener, CliExitCode } from "../types.js";
+import { CliSessionWorkspace } from "./session-workspace.js";
 import { CliTuiApp } from "./app.js";
 import { getTuiStatusLabel, isActiveTuiStatus, isTerminalStatus, readTuiTerminalSize } from "./format.js";
 import { createRoutedTuiStdin, createTuiMouseInputSink, createTuiRenderStdout, createTuiTerminalLifecycle } from "./lifecycle.js";
@@ -22,7 +23,7 @@ export function formatCliTuiRecap(recap: CliTuiRecap): string {
 /** 启动 Ink，统一处理信号、退出码和动态渲染生命周期。 */
 export async function runCliTui(options: RunCliTuiOptions): Promise<RunCliTuiResult> {
   const env = options.env ?? process.env;
-  const store = createCliTuiStore();
+  const store = options.sessionManager?.selected().store ?? createCliTuiStore();
   const noColor = resolveNoColor(env);
   const screenReader = resolveScreenReader(env);
   const renderMode = resolveTuiRenderMode(env);
@@ -40,7 +41,18 @@ export async function runCliTui(options: RunCliTuiOptions): Promise<RunCliTuiRes
   let requestedExitCode: CliExitCode | undefined;
   let lastResult: CliControllerResult | undefined;
   let instance: ReturnType<typeof render> | undefined;
-  let lastInterruptAt = 0;
+  let pendingRenderSize: { columns: number; rows: number } | undefined;
+  /** 先让Ink用旧尺寸完成新短帧，再提交真实新尺寸，避免旧帧高度触发Static全量重放。 */
+  function requestRenderSize(size: { columns: number; rows: number }): void { pendingRenderSize = size; }
+  /** onRender回调发生在同步输出之前，微任务确保高度记账已更新；尺寸不伪造。 */
+  function commitRenderedSize(): void {
+    queueMicrotask(function commit() {
+      const size = pendingRenderSize;
+      pendingRenderSize = undefined;
+      if (size) renderStdout.setSize(size);
+    });
+  }
+
   let pendingWheelNotches = 0;
   let pendingWheelEvent: TuiSgrMouseEvent | undefined;
   let mouseFlushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -97,13 +109,13 @@ export async function runCliTui(options: RunCliTuiOptions): Promise<RunCliTuiRes
   /** 在 TUI 终端恢复后尽力输出统一安全摘要；输出失败不能掩盖原本的退出或异常。 */
   function writeTuiRecap(): void {
     if (!options.sessionId) return;
-    const snapshot = store.getSnapshot();
+    const snapshot = (options.sessionManager?.selected().store ?? store).getSnapshot();
     const completedTurnCount = snapshot.transcript.filter(function countCompletedTurn(item): boolean {
       return item.kind === "turn" && item.status === "completed";
     }).length;
     try {
       options.streams.stdout.write(`\n${formatCliTuiRecap({
-        sessionId: options.sessionId,
+        sessionId: options.sessionManager?.selected().sessionId ?? options.sessionId,
         completedTurnCount,
         finalStatus: snapshot.status,
         recoverable: snapshot.recoverable,
@@ -138,54 +150,22 @@ export async function runCliTui(options: RunCliTuiOptions): Promise<RunCliTuiRes
     });
   }
 
-  /** 处理 TUI 内 Ctrl+C：首次取消当前 Turn，取消收口前第二次强制退出。 */
-  function requestInterrupt(): void {
-    const now = Date.now();
-    const current = store.getSnapshot();
-    if (isActiveTuiStatus(current.status)) {
-      if (current.cancellationRequested) {
-        if (now - lastInterruptAt < 100) return;
-        options.streams.stderr.write("forced exit before cancellation completed; recovery status unknown\n");
-        finish(130);
-        terminalLifecycle.restore();
-        options.forceExit?.(130);
-        return;
-      }
-      lastInterruptAt = now;
-      requestCancellation();
-      return;
-    }
-    finish(130);
-  }
+  /** Ctrl+C退出整个宿主；具体owner收尾交Main，不沿创建来源取消。 */
+  function requestInterrupt(): void { finish(130); }
 
-  /** 处理 Esc：只取消活动 Turn，不把 Esc 解释为退出进程。 */
+  /** Esc只取消提交时选中目标，列表/picker优先消费；不退出宿主。 */
   function requestCancel(): void {
-    requestCancellation();
+    if (!options.sessionManager) { requestCancellation(); return; }
+    const entry = options.sessionManager.selected();
+    const current = entry.store.getSnapshot();
+    if (!isActiveTuiStatus(current.status) || current.cancellationRequested) return;
+    entry.store.setCancellationRequested(true);
+    void entry.controller.dispatch({ type: "cancel_turn" }).then(function completed(result) { options.sessionManager!.handleResult(entry, result); }).catch(function failed() { entry.store.setCancellationRequested(false); entry.store.addNotice("turn cancellation failed"); });
   }
 
-  /** 处理宿主 SIGINT/SIGTERM：取消后以相应进程退出码收口。 */
-  function requestSignalStop(code: 130 | 143): void {
-    requestedExitCode = requestedExitCode ?? code;
-    store.requestExit(code);
-    if (isActiveTuiStatus(store.getSnapshot().status)) {
-      requestCancellation();
-      return;
-    }
-    finish(code);
-  }
-
-  function handleEof(): void {
-    requestedExitCode = requestedExitCode ?? 0;
-    store.requestExit(0);
-    const current = store.getSnapshot();
-    if (current.status === "running" || current.status === "waiting_approval") {
-      void options.controller.dispatch({ type: "cancel_turn" }).then(handleResult).catch(function ignoreEofCancelFailure() {
-        finish(0);
-      });
-      return;
-    }
-    finish(0);
-  }
+  /** SIGTERM与EOF都退出整个宿主，不把等待审批伪装为完成。 */
+  function requestSignalStop(code: 130 | 143): void { finish(code); }
+  function handleEof(): void { finish(0); }
 
   function handleSigint(): void { requestInterrupt(); }
   function handleSigterm(): void { requestSignalStop(143); }
@@ -196,12 +176,14 @@ export async function runCliTui(options: RunCliTuiOptions): Promise<RunCliTuiRes
     store.acceptEvent(event, projection);
     if (event.type === "status" && isTerminalStatus(event.status) && requestedExitCode !== undefined) finish(requestedExitCode);
   };
-  options.controller.setEventListener?.(listener);
-  options.controller.setQueuedInputListener?.(function receiveQueuedInputStarted(input): void {
+  if (!options.sessionManager) options.controller.setEventListener?.(listener);
+  if (!options.sessionManager) options.controller.setQueuedInputListener?.(function receiveQueuedInputStarted(input): void {
     store.markQueuedInputStarted(input);
   });
+  const App = options.sessionManager ? CliSessionWorkspace : CliTuiApp;
   const node = (
-    <CliTuiApp
+    <App
+      manager={options.sessionManager!}
       store={store}
       controller={options.controller}
       initial={options.initial}
@@ -212,13 +194,13 @@ export async function runCliTui(options: RunCliTuiOptions): Promise<RunCliTuiRes
       renderMode={renderMode}
       reducedMotion={reducedMotion}
       mouseInput={mouseInput}
-      onResult={handleResult}
+      onResult={options.sessionManager ? function rememberResult(result) { lastResult = result; } : handleResult}
       onRequestInterrupt={requestInterrupt}
       onRequestCancel={requestCancel}
       onEof={handleEof}
       onAppExit={finish}
       terminalSizeSource={terminalSizeSource}
-      onTerminalSizeChange={renderStdout.setSize}
+      onTerminalSizeChange={requestRenderSize}
     />
   );
   try {
@@ -232,6 +214,7 @@ export async function runCliTui(options: RunCliTuiOptions): Promise<RunCliTuiRes
       // 输入框和动态时间线会改变行高；Windows Terminal 下增量渲染会残留旧帧，
       // 表现为逐字符重复或内容重叠。使用完整帧保证当前交互区域正确。
       incrementalRendering: false,
+      onRender: commitRenderedSize,
       isScreenReaderEnabled: screenReader,
       kittyKeyboard: { mode: kittyKeyboardMode },
     });

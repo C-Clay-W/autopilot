@@ -5,7 +5,7 @@
  * Runtime 的领域类型，也不携带审批冻结凭证或完整 checkpoint。
  */
 
-import type { AgentEvent, AgentRuntime, AgentTerminationView, ApprovalDisplayFacts, ContextUsageView, JobListView, JobReadView, JobView, RecoverableTurnView, TodoCounts, TodoItem, ToolDisplayFacts } from "@autopilot-agent/core";
+import type { AgentEvent, AgentRuntime, AgentTerminationView, ApprovalDisplayFacts, ContextUsageView, JobListView, JobReadView, JobView, RecoverableTurnView, TodoCounts, TodoItem, ToolDisplayFacts, TurnUsageSummaryView } from "@autopilot-agent/core";
 import type { AgentPresentationState } from "@autopilot-agent/presentation";
 
 /** CLI 当前支持的 Session 工具权限模式；与 Core 的公共枚举保持同值域。 */
@@ -13,6 +13,32 @@ export type CliPermissionMode = "ask" | "auto_approve" | "full_access";
 
 /** CLI 输出模式；interactive 在 Step 5.4 才接入 Ink。 */
 export type CliOutputFormat = "interactive" | "text" | "jsonl";
+
+/** 协作投递模式；与 Core 冻结的三种模式同值域，必须显式声明。 */
+export type CliThreadMode = "notify" | "run" | "steer";
+
+/**
+ * 协作命令语法树。
+ *
+ * 只保存不透明身份、模式与正文来源；正文、交接文档和共享板值在宿主边界读取，
+ * 组归属、幂等、容量和交付事实都由 Core 判定。
+ */
+export type CliThreadCommand =
+  | { type: "bind_host"; groupId: string; threadId: string; expectedRevision: number; executionHost: "cli-work-v1" | "web-work-v1" }
+  | { type: "group_of"; threadId: string }
+  | { type: "group_enable"; requestId: string; rootThreadId: string }
+  | { type: "group_disable"; requestId: string; groupId: string }
+  | { type: "create"; requestId: string; groupId: string; parentThreadId: string; title?: string; roleLabel?: string; modelRef?: { provider: string; modelId: string }; reasoningEffort?: "none" | "low" | "medium" | "high" | "max" }
+  | { type: "associate"; groupId: string; threadId: string; requestId: string }
+  | { type: "list"; groupId: string; cursor?: string; limit?: number }
+  | { type: "read"; groupId: string; threadId: string; cursor?: string; limit?: number }
+  | { type: "send"; requestId: string; groupId: string; threadId: string; mode: CliThreadMode; contentSource: { kind: "file"; path: string } | { kind: "stdin" }; replyTo?: string; expectedTurnId?: string; handoff?: { title: string; markdownFile: string } }
+  | { type: "wait"; groupId: string; targets: Array<{ threadId: string; taskId?: string; cursor?: string }>; timeoutMs: number }
+  | { type: "state_read"; groupId: string }
+  | { type: "state_set"; requestId: string; groupId: string; expectedRevision: number; key: string; value: { kind: "inline"; json: string } | { kind: "file"; path: string } }
+  | { type: "state_remove"; requestId: string; groupId: string; expectedRevision: number; key: string }
+  | { type: "interrupt"; requestId: string; groupId: string; threadId: string; expectedTurnId: string }
+  | { type: "watch"; groupId: string; cursor?: string; limit?: number };
 
 /** CLI 命令语法树；命令本身不包含宿主状态根或 Runtime 实例。 */
 export type CliCommand =
@@ -39,14 +65,15 @@ export type CliCommand =
   | { type: "doctor"; connectivity: boolean }
   | { type: "sandbox_status" }
   | { type: "sandbox_setup"; yes: boolean }
+  | { type: "thread"; command: CliThreadCommand }
   | { type: "chat"; prompt?: string; sessionId?: string; output: CliOutputFormat }
   | { type: "resume"; sessionId?: string; output: CliOutputFormat };
 
 /** CLI Action；审批 Action 只携带宿主决定，不携带冻结调用字段。 */
 export type CliAction =
   /** delivery 只在已有活动 Turn 时生效；省略时与 Web 一致，默认 steer。 */
-  | { type: "submit_prompt"; content: string; delivery?: "steer" | "queue" }
-  | { type: "approve"; decision: "allow_once" | "allow_session" | "allow_workspace" | "deny" }
+  | { type: "submit_prompt"; content: string; delivery?: "steer" | "queue"; images?: Array<{ name: string; mimeType: string; bytes: Uint8Array }> }
+  | { type: "approve"; expected?: { sessionId: string; turnId: string; approvalId: string }; decision: "allow_once" | "allow_session" | "allow_workspace" | "deny" }
   | { type: "compact" }
   | { type: "show_context"; all: boolean }
   | { type: "select_skill"; skill: string }
@@ -66,6 +93,7 @@ export type CliAction =
   | { type: "show_job"; jobId: string }
   | { type: "read_job_output"; jobId: string }
   | { type: "stop_job"; jobId: string }
+  | { type: "resume" }
   | { type: "cancel_turn" }
   | { type: "undo_preview" }
   | { type: "undo_confirm" }
@@ -115,7 +143,7 @@ export interface CliEventEnvelope {
 }
 
 /** Controller 使用的最小 Core Runtime 依赖；不包含 Web 或 Core private 类型。inbox 用于 Turn 终态后领取遗留排队输入。 */
-export type CliRuntime = Pick<AgentRuntime, "turns" | "projects" | "sessions" | "approvals" | "inbox" | "jobs" | "undo">;
+export type CliRuntime = Pick<AgentRuntime, "turns" | "projects" | "sessions" | "approvals" | "inbox" | "jobs" | "undo"> & Partial<Pick<AgentRuntime, "questions">>;
 
 /** TUI/Plain 共用的当前 Session Job 安全视图；不携带命令、路径、PID 或 owner。 */
 export type CliJobView =
@@ -169,6 +197,8 @@ export interface CliStatusView {
   nextEffort?: string;
   /** 当前 Session 的上下文用量安全 DTO；null 表示无数据（unknown），省略表示无法查询（无 Runtime/Session）。 */
   contextUsage?: ContextUsageView | null;
+  /** 最近 Turn 的累计用量安全 DTO（输入/输出/总量与执行段耗时）；null 表示无数据（unknown），省略表示无法查询。 */
+  turnUsage?: TurnUsageSummaryView | null;
 }
 
 /** Composition Root 提供给 Controller 的热更新安全默认值；不携带 Provider 部署或凭据字段。 */
@@ -211,6 +241,7 @@ export interface CliRenderer {
 
 /** Renderer 可见的安全事件联合类型。 */
 export type CliPublicEvent =
+  | { type: "thread_wait"; seq: number; turnId: string; phase: "waiting" | "processing" | "none"; pending: number; running: number; approvals: number }
   | { type: "turn_started"; seq: number; turnId: string; stepCount: number }
   | { type: "reasoning_summary"; seq: number; turnId: string; summary: string }
   | { type: "reasoning_hidden"; seq: number; turnId: string }
@@ -264,6 +295,9 @@ export type CliPublicEvent =
       status: "running" | "waiting_approval" | "waiting_user_input" | "interrupted" | "interrupted_recoverable" | "completed" | "failed" | "limit_reached";
       code?: string;
       reason?: string;
+      feedbackId?: string;
+      providerHttpStatus?: number;
+      providerFailureDetail?: string;
       termination?: AgentTerminationView;
     };
 
@@ -273,7 +307,10 @@ export type CliTurnStatus = "idle" | "running" | "waiting_approval" | "waiting_u
 /** 投影器的状态；seenKeys 仅供本地去重，不会交给 Renderer。 */
 export interface CliProjection {
   turnId?: string;
+  /** 当前历史问题的受信请求身份，输入在异步校验前冻结此值。 */
+  questionRequestId?: string;
   status: CliTurnStatus;
+  threadWait?: { phase: "waiting" | "processing"; pending: number; running: number; approvals: number };
   /** 只复制 Core RecoverableTurnView/终态投影确认的恢复布尔值。 */
   recoverable: boolean;
   answer: string;

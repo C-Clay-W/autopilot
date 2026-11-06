@@ -3,11 +3,12 @@
 
 import Link from "next/link";
 import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from "react";
-import type { ContextUsageView } from "@autopilot-agent/core";
+import type { ContextUsageView, TurnUsageSummaryView } from "@autopilot-agent/core";
 import WorkJobs from "./WorkJobs";
 import Popconfirm from "./Popconfirm";
-import ContextUsageDetails from "./ContextUsageDetails";
+import ContextUsageDetails, { formatTokens } from "./ContextUsageDetails";
 import { DiffStatsLabel } from "./ToolCard";
+import { formatDuration } from "./TurnPresentation";
 import { WEB_SEARCH_DATA_FLOW_NOTICE } from "@autopilot-agent/presentation";
 import { conversationUrl } from "../conversation-target";
 import { showDevelopmentDatabaseSync } from "../chat-page-helpers";
@@ -21,6 +22,26 @@ function buildContextTitle(usage: ContextUsageView | undefined): string {
 /** 生成 Context 条旁的整个窗口整数剩余百分比。 */
 function buildContextStatusLabel(usage: ContextUsageView | undefined): string {
   return usage ? `${Math.round(Math.max(0, 1 - usage.usageRatio) * 100)}%` : "—";
+}
+
+/**
+ * 紧凑 token 计数：517 / 12.2K / 517K / 1.2M。
+ * 只服务顶栏一格的空间约束；精确千分位值与输入/输出分项保留在 title 提示中。
+ */
+function formatCompactTokens(value: number): string {
+  const scaled = (candidate: number): string => candidate >= 100 ? String(Math.round(candidate)) : String(Math.round(candidate * 10) / 10);
+  if (value < 1_000) return String(value);
+  if (value < 1_000_000) return `${scaled(value / 1_000)}K`;
+  return `${scaled(value / 1_000_000)}M`;
+}
+
+/** 生成累计用量一格的提示文本；优先输入/输出分项，缺分项时降级为总量，数字只由 Core DTO 提供。 */
+function buildTurnUsageTitle(usage: TurnUsageSummaryView): string {
+  const duration = formatDuration(usage.elapsedMs) ?? "0 秒";
+  if (usage.inputTokens !== undefined && usage.outputTokens !== undefined) {
+    return `最近一轮累计用量：输入 ${formatTokens(usage.inputTokens)} tokens · 输出 ${formatTokens(usage.outputTokens)} tokens · 执行耗时 ${duration}`;
+  }
+  return `最近一轮累计用量：${formatTokens(usage.totalTokens)} tokens · 执行耗时 ${duration}`;
 }
 
 /** Escape 关闭 Context 面板后恢复键盘焦点；由窄 helper 保留可单测的关闭契约。 */
@@ -51,6 +72,9 @@ interface ChatPageHeaderProps {
   setCompactConfirmOpen: Dispatch<SetStateAction<boolean>>;
   /** Core 最新安全 Context Usage 快照；undefined 表示未知，不表现为 0%。 */
   contextUsage: ContextUsageView | undefined;
+  /** Core 最近一轮累计用量汇总（输入/输出/总量与执行段耗时）；undefined 或无 token 活动时不渲染该格。 */
+  turnUsage: TurnUsageSummaryView | undefined;
+  executionClock?: { elapsedMs: number; runningSince?: number };
   showSources: boolean;
   setShowSources: Dispatch<SetStateAction<boolean>>;
   showProcess: boolean;
@@ -70,10 +94,20 @@ interface ChatPageHeaderProps {
   diffSidebarOpen?: boolean;
   diffEntryStats?: { added: number; removed: number };
   onDiffSidebarToggle?: () => void;
+  /** Work 会话的协作面板入口；Chat 不提供。 */
+  onOpenThreads?: () => void;
 }
 
 /** 渲染顶部栏与 Work 隐私提示条；条件分支与 DOM 结构保持原页面形态。 */
-export default function ChatPageHeader({ isChat, displayTitle, handleSidebarToggle, workspaceId, sessionId, active, loading, requestedJobId, setRequestedJobId, canWrite, compacting, compactContext, compactConfirmOpen, setCompactConfirmOpen, contextUsage, showSources, setShowSources, showProcess, setShowProcess, databaseEnabled, setDatabaseEnabled, syncDatabase, databaseSyncing, hasWorkspace, setPermissionPanelOpen, storageQuota, setStorageQuotaPanelOpen, activeTurnId, readOnlyReason, cancelCurrentTurn, diffSidebarOpen, diffEntryStats, onDiffSidebarToggle }: ChatPageHeaderProps) {
+export default function ChatPageHeader({ isChat, displayTitle, handleSidebarToggle, workspaceId, sessionId, active, loading, requestedJobId, setRequestedJobId, canWrite, compacting, compactContext, compactConfirmOpen, setCompactConfirmOpen, contextUsage, turnUsage: runtimeTurnUsage, executionClock, showSources, setShowSources, showProcess, setShowProcess, databaseEnabled, setDatabaseEnabled, syncDatabase, databaseSyncing, hasWorkspace, setPermissionPanelOpen, storageQuota, setStorageQuotaPanelOpen, activeTurnId, readOnlyReason, cancelCurrentTurn, diffSidebarOpen, diffEntryStats, onDiffSidebarToggle, onOpenThreads }: ChatPageHeaderProps) {
+  const [executionNow, setExecutionNow] = useState(function initialTime() { return Date.now(); });
+  /** 顶栏与活动行共用执行段，只在权威 runningSince 存在时刷新。 */
+  useEffect(function observeExecutionClock() {
+    if (executionClock?.runningSince === undefined) return;
+    const timer = window.setInterval(function tick() { setExecutionNow(Date.now()); }, 1000);
+    return function stopClock() { window.clearInterval(timer); };
+  }, [executionClock?.runningSince]);
+  const turnUsage = runtimeTurnUsage && executionClock ? { ...runtimeTurnUsage, elapsedMs: executionClock.elapsedMs + (executionClock.runningSince === undefined ? 0 : Math.max(0, executionNow - executionClock.runningSince)) } : runtimeTurnUsage;
   /** 分类明细面板开关；纯 UI 状态，打开/关闭不请求 Provider、不重算 tokens。 */
   const [contextPanelOpen, setContextPanelOpen] = useState(false);
   const contextControlRef = useRef<HTMLDivElement>(null);
@@ -161,6 +195,12 @@ export default function ChatPageHeader({ isChat, displayTitle, handleSidebarTogg
               onCancel={() => setCompactConfirmOpen(false)}
             />
           </div>
+          {/* 最近一轮累计用量一格：只读 Core DTO；零 token 活动不渲染，精确值与分项保留在 title 提示。 */}
+          {turnUsage && turnUsage.totalTokens > 0 && (
+            <span className="whitespace-nowrap text-[10px] text-muted tabular-nums" title={buildTurnUsageTitle(turnUsage)}>
+              {formatCompactTokens(turnUsage.totalTokens)} tokens · {formatDuration(turnUsage.elapsedMs) ?? "0 秒"}
+            </span>
+          )}
           <button
             type="button"
             onClick={() => setShowSources((current) => !current)}
@@ -218,6 +258,16 @@ export default function ChatPageHeader({ isChat, displayTitle, handleSidebarTogg
           >
             授权
           </button>
+          {!isChat && sessionId && onOpenThreads && (
+            <button
+              type="button"
+              onClick={onOpenThreads}
+              className="border-2 border-ink px-2 py-1 text-[10px] font-semibold hover:bg-ink hover:text-ink-on-dark"
+              title="查看会话协作成员、消息交付与共享板"
+            >
+              协作
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setStorageQuotaPanelOpen(true)}

@@ -20,7 +20,7 @@ export interface ModelBehaviorProfile {
 export function createDefaultModelBehaviorProfile(): ModelBehaviorProfile {
   return {
     id: "autopilot-default",
-    instructions: "你是 Autopilot 的执行模型。只把真实完成的工作报告为完成；需要工作区副作用时必须调用 canonical 工具，不能凭文字假设已经修改。先理解目标，再选择最小必要工具；工具返回错误时停止猜测并依据错误修正。已有文件优先使用 edit_file，新文件使用 write_file；每次 write_file 或 edit_file 成功后，立即对每个修改路径调用 read_file 验证，验证完成前不得输出完成结论。只读任务不调用写入工具。最终答复只总结已由工具结果证实的事实。",
+    instructions: "你是 Autopilot 的执行模型。只把真实完成的工作报告为完成；需要工作区副作用时必须调用 canonical 工具，不能凭文字假设已经修改。先理解目标，再选择最小必要工具；工具返回错误时停止猜测并依据错误修正。已有文件优先使用 edit_file，新文件使用 write_file；可靠写入的宿主落盘字节校验不替代业务验证；按任务复杂度审阅差异、按需读回目标范围并执行必要定向检查。只读任务不调用写入工具。最终答复只总结已由工具结果证实的事实。",
     completionPolicy: createMutationCompletionPolicy(),
   };
 }

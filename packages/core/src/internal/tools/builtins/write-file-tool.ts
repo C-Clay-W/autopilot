@@ -46,7 +46,12 @@ async function applyWithMutation(
   apply: () => Promise<void>,
 ): Promise<void> {
   const binding = context.fileMutations;
-  if (!binding || !context.toolCallId) return apply();
+  if (!binding || !context.toolCallId) {
+    await apply();
+    const actual = await readFile(input.targetPath);
+    if (sha256(actual) !== sha256(input.after)) throw createToolError(TOOL_ERROR_CODES.FILE_STALE, "文件替换后校验失败，已停止后续操作");
+    return;
+  }
   const mutation = await binding.store.prepare({ sessionId: binding.sessionId, turnId: binding.turnId, toolCallId: context.toolCallId, path: input.path, operation: input.operation, before: input.before, after: input.after, createdAt: Date.now() });
   try {
     await apply();
@@ -119,7 +124,7 @@ export function createWriteFileTool(): AgentToolDefinition<z.infer<typeof writeF
           await applyWithMutation(context, { path: mutationPath, operation: "overwrite", before: current, after: next, targetPath: target.absolutePath }, async function replaceExisting() { await atomicWrite(target.absolutePath, input.content); });
           const updated = await stat(target.absolutePath);
           context.fileReadStates?.set(getReadStateKey(target), { sha256: sha256(next), mtimeMs: updated.mtimeMs, observedRanges: [{ startLine: 1, endLine: input.content.split("\n").length }] });
-          return { path: target.isExternal ? target.canonicalTarget : target.relativePath!, changeType: "update", bytes: next.byteLength, sha256: sha256(next) };
+          return { path: target.isExternal ? target.canonicalTarget : target.relativePath!, diskVerified: true, changeType: "update", bytes: next.byteLength, sha256: sha256(next) };
         }
         if (input.expectedSha256) throw createToolError(TOOL_ERROR_CODES.FILE_STALE, "目标不存在，不能使用覆写前置条件创建文件");
         // 创建目标父目录发生在已批准的执行段内；审批（facts）阶段不产生任何磁盘变化。
@@ -129,7 +134,7 @@ export function createWriteFileTool(): AgentToolDefinition<z.infer<typeof writeF
         await applyWithMutation(context, { path: mutationPath, operation: "create", before: null, after: next, targetPath: target.absolutePath }, async function createNewFile() { await atomicWrite(target.absolutePath, input.content); });
         const created = await stat(target.absolutePath);
         context.fileReadStates?.set(getReadStateKey(target), { sha256: sha256(next), mtimeMs: created.mtimeMs, observedRanges: [{ startLine: 1, endLine: input.content.split("\n").length }] });
-        return { path: target.isExternal ? target.canonicalTarget : target.relativePath!, changeType: "create", bytes: next.byteLength, sha256: sha256(next) };
+        return { path: target.isExternal ? target.canonicalTarget : target.relativePath!, diskVerified: true, changeType: "create", bytes: next.byteLength, sha256: sha256(next) };
       };
       if (!context.fileMutations || !context.workspaceRoot) return executeLocked();
       return context.fileMutations.store.withWorkspaceLock(context.workspaceRoot, executeLocked, [lockedTarget.canonicalTarget]);

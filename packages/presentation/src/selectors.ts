@@ -2,6 +2,17 @@
 import { groupToolCalls, type TimelineItem } from "./grouping.js";
 import type { AgentPresentationItem, AgentPresentationState, ApprovalItem, AssistantAnswerItem, InputNoticeItem, PresentationInputPosition, TodoSnapshotItem, ToolCallItem, UserQuestionItem } from "./model.js";
 
+/** 累计真实执行段；等待期间没有 runningSince，读取时钟不会引入暂停墙钟。 */
+export function selectTurnExecutionMs(state: AgentPresentationState, turnId: string, now = Date.now()): number | undefined {
+  const clock = state.executionByTurn?.[turnId];
+  return clock ? clock.elapsedMs + (clock.runningSince === undefined ? 0 : Math.max(0, now - clock.runningSince)) : undefined;
+}
+
+/** 返回指定实例所属的不可变 UI 文档；时间线与分组仍由既有 selector 统一处理。 */
+export function selectUiDocuments(state: AgentPresentationState, turnId: string): import("./model.js").UiDocumentItem[] {
+  return state.items.filter(function document(item): item is import("./model.js").UiDocumentItem { return item.kind === "ui_document" && item.turnId === turnId; });
+}
+
 /** 行动文案只按注册工具名白名单生成，不从命令、参数、路径或日志猜测目的。 */
 function getToolAction(toolName: string): string {
   const actions: Record<string, string> = {

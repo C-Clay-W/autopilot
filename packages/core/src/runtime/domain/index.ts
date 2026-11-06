@@ -48,6 +48,7 @@ export type {
   InboxDelivery,
   InboxStatus,
   InboxBoundary,
+  InboxOrigin,
   InboxAttachmentRef,
   InboxSkillRef,
   PostInboxInput,
@@ -74,6 +75,12 @@ export interface Session {
   /** 仅新建 Work 会话由 Core 写入，旧记录不能由 save 升级来源。 */
   readonly workContextVersion?: 1;
   id: string;
+  /** 协作创建意图的稳定身份，创建后不可修改。 */
+  readonly collaborationCreationId?: string;
+  /** 可信创建来源只用于追溯，不授予能力、控制权或任务归属。 */
+  readonly creationSource?: { actor: import("./thread-collaboration").ThreadActor; requestId: string };
+  /** 旧字段仅保留类型以便拒绝身份改写；普通 Turn 不据此裁剪工具。 */
+  readonly collaborationAllowedTools?: readonly string[];
   /** 新建会话必写；仅旧持久化记录允许缺省并按 Work 读取。 */
   readonly productMode?: import("./product-mode").ProductMode;
   /** Chat 创建即冻结；空白草稿不是已持久化 Session。 */

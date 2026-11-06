@@ -3,6 +3,9 @@
 import { NodeChatError, NodeStateError } from "@autopilot-agent/adapters";
 import { AgentRuntimeError, WorkspaceTrustError } from "@autopilot-agent/core";
 
+/** 旧缺省归属的人类恢复说明，复用只读发现与精确CAS命令。 */
+export const CLI_THREAD_RECOVERY_HINT = "执行归属待确认。用 ap session list 取得会话id，再用 ap thread group of --thread <id> 读取groupId/revision，ap thread list --group <groupId> 查看目标。对无执行事实或已确认completed的旧目标，用 ap thread bind-host --group <groupId> --thread <id> --expected-revision <revision> --execution-host <cli-work-v1|web-work-v1> 选择后开始新任务；等待/中断/结果未确认的原任务应在兼容宿主处理";
+
 export type CliErrorCategory = "config_directory" | "workspace_trust" | "agent_runtime" | "node_state" | "node_chat" | "unknown";
 
 export interface CliErrorClassification {
@@ -22,7 +25,7 @@ const agentErrorCodes = new Set<string>([
   "JOB_NOT_FOUND", "JOB_INPUT_INVALID", "JOB_CURSOR_INVALID", "JOB_OWNER_UNAVAILABLE", "JOB_OWNER_UNKNOWN",
   "JOB_STATE_CONFLICT", "JOB_STOP_TIMEOUT", "JOB_STOP_FAILED", "JOB_STORAGE_FAILED", "JOB_SPAWN_FAILED",
   "JOB_STORE_CAPABILITY_UNSUPPORTED", "SESSION_HAS_ACTIVE_JOBS", "INTERACTIVE_TOOL_CONFLICT", "INBOX_INPUT_NOT_FOUND",
-  "INVALID_INPUT",
+  "INVALID_INPUT", "THREAD_RECOVERY_REQUIRED",
 ]);
 
 const nodeStateErrorCodes = new Set<string>([

@@ -19,7 +19,7 @@ export { resolveFirstPartyModelSampleOptions, resolveModelSampleOptions } from "
 export { listModelCapabilities, getModelCapability } from "./model-capability-catalog";
 export { createVisionAnalyzer } from "./vision-analyzer";
 export type { FrozenProviderConfig } from "./frozen-provider-config";
-export type { ModelCapability } from "./model-capability-catalog";
+export type { ModelCapability, PromptCacheMode } from "./model-capability-catalog";
 export type { VisionAnalyzer } from "./vision-analyzer";
 export type { FirstPartyEffortSource, ResolvedFirstPartyModelSample } from "./model-sample-resolver";
 export { createDefaultModelBehaviorProfile } from "./model-behavior-profile";

@@ -55,7 +55,12 @@ async function applyWithMutation(
   apply: () => Promise<void>,
 ): Promise<void> {
   const binding = context.fileMutations;
-  if (!binding || !context.toolCallId) return apply();
+  if (!binding || !context.toolCallId) {
+    await apply();
+    const actual = await readFile(input.targetPath);
+    if (sha256(actual) !== sha256(input.after)) throw createToolError(TOOL_ERROR_CODES.FILE_STALE, "文件替换后校验失败，已停止后续操作");
+    return;
+  }
   const mutation = await binding.store.prepare({ sessionId: binding.sessionId, turnId: binding.turnId, toolCallId: context.toolCallId, path: input.path, operation: "edit", before: input.before, after: input.after, createdAt: Date.now() });
   try {
     await apply();
@@ -309,7 +314,7 @@ export function createEditFileTool(): AgentToolDefinition<z.infer<typeof editFil
         const newStats = await stat(prepared.absolutePath);
         const newHash = sha256(nextBytes);
         context.fileReadStates?.set(getReadStateKey(prepared), { sha256: newHash, mtimeMs: newStats.mtimeMs, observedRanges: prepared.nextObservedRanges });
-        return { path: prepared.targetLabel, changeType: "edit", replacements: prepared.replacements, diff: prepared.diff.diff, diffTruncated: prepared.diff.truncated, sha256: newHash, encoding: prepared.encoding, lineEnding: prepared.lineEnding };
+        return { path: prepared.targetLabel, diskVerified: true, changeType: "edit", replacements: prepared.replacements, diff: prepared.diff.diff, diffTruncated: prepared.diff.truncated, sha256: newHash, encoding: prepared.encoding, lineEnding: prepared.lineEnding };
       };
       if (!context.fileMutations || !context.workspaceRoot) return executeLocked();
       return context.fileMutations.store.withWorkspaceLock(context.workspaceRoot, executeLocked, [lockedTarget.canonicalTarget]);

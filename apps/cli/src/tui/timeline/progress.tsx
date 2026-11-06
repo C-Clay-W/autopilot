@@ -2,6 +2,7 @@
 
 import { useEffect, useState, type ReactNode } from "react";
 import { Text } from "ink";
+import { getCliTuiExecutionMs } from "../types.js";
 import type { CliTurnStatus } from "../../types.js";
 import { formatTuiDuration } from "../format.js";
 import type { CliTuiTimelineEvent, CliTuiTurnMetrics } from "../types.js";
@@ -19,7 +20,7 @@ export function TuiLiveProgressSummary(props: { events: CliTuiTimelineEvent[]; s
   if (!active || !props.metrics) return null;
   // Todo 的 activeForm 是模型声明的稳定活动文案，优先于宿主猜测的工具动词短语。
   if (props.activeTodoForm) {
-    return <Text dimColor={props.useColor}>{props.activeTodoForm} · {formatTuiDuration(Math.max(0, now - props.metrics.startedAt))}…</Text>;
+    return <Text dimColor={props.useColor}>{props.activeTodoForm} · {formatTuiDuration(getCliTuiExecutionMs(props.metrics, now))}…</Text>;
   }
   const counts = new Map<string, number>();
   for (const event of props.events) {
@@ -38,6 +39,6 @@ export function TuiLiveProgressSummary(props: { events: CliTuiTimelineEvent[]; s
   phrase("run_command", "running", "shell command");
   phrase("write_file", "writing", "file");
   phrase("edit_file", "editing", "file");
-  const thinking = `Thinking for ${formatTuiDuration(Math.max(0, now - props.metrics.startedAt))}`;
+  const thinking = `Thinking for ${formatTuiDuration(getCliTuiExecutionMs(props.metrics, now))}`;
   return <Text dimColor={props.useColor}>{thinking}{phrases.length > 0 ? `, ${phrases.join(", ")}` : ""}…</Text>;
 }

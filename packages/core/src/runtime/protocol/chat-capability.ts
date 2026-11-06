@@ -51,6 +51,8 @@ export interface ChatKnowledgeCapability {
 
 /** 进程内能力集合；无文件、入库、数据库、命令或 Web 旁路。 */
 export interface ChatCapability {
+  /** 受信宿主允许在 Chat none/web 中交付白名单交互文档；不携带 renderer、函数或外部资源。 */
+  readonly interactiveUi?: true;
   readonly attachments?: readonly ChatAttachmentGrant[];
   /** 在读取前校验当前 Session 的附件或当前批次的视觉引用，撤销/过期返回 false。 */
   authorizeRef?(input: ChatCapabilityBinding & { ref: string; kind: "document" | "image"; batchId?: string; signal?: AbortSignal }): Promise<boolean>;

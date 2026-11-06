@@ -43,9 +43,9 @@ function inputHarness() {
     setStreamingMessageId: vi.fn(), setActiveTurnId: vi.fn(), setPendingInputs: pending.set, setInputDeliveryNotice: vi.fn(), setResumePendingSessionId: vi.fn(),
     loadHistory: vi.fn(async function load() { return true; }), consumeAgentStream: vi.fn(async function stream() { return "terminal" as const; }), getSessionController: vi.fn(), setTransportState: vi.fn(), clearActiveTurn: vi.fn(), markAwaitingUserInput: vi.fn(),
     activeTurnRef: { current: null as { sessionId: string; turnId: string } | null }, cancelRequestedRef: { current: false }, cancelledTurnIdsRef: { current: new Set<string>() }, cancelInFlightRef: { current: null }, requestAbortRef: { current: null }, transportDisconnectedRef: { current: false }, awaitingApprovalRef: { current: false }, awaitingUserInputRef: { current: false }, executionEpochRef: { current: 0 },
-    pendingInputsRef: { current: [] as PendingAgentInput[] }, currentSessionIdRef: { current: "session" }, currentWorkspaceIdRef: { current: "workspace" }, queueExecutionRequestedRef: { current: false }, joinedInputIdsRef: { current: new Set<string>() }, historyInputIdsRef: { current: new Set<string>() },
+    pendingInputsRef: { current: [] as PendingAgentInput[] }, currentSessionIdRef: { current: "session" }, currentWorkspaceIdRef: { current: "workspace" }, queuedFollowUpTurnIdRef: { current: null }, joinedInputIdsRef: { current: new Set<string>() }, historyInputIdsRef: { current: new Set<string>() },
   };
-  const submission = { ...common, presentation: state.value, hasWorkspace: true, currentRetrieval: "none", databaseEnabled: false, selectedSkills: [], setSelectedSkills: vi.fn(), setPinnedSkills: vi.fn(), inputRef: { current: "用户原文\n@docs/a.md" }, inputActionsRef: { current: null }, onOpenWorkspacePicker: vi.fn(), onSessionStarting: vi.fn(), onSessionCreated: vi.fn(), handleContinueTurn: vi.fn(), requestNextQueuedTurn: vi.fn(), setSessionMeta: vi.fn(), setHistoryReady: vi.fn(), setReadOnlyReason: vi.fn(), setChatAttachments: vi.fn(), locallyCreatedSessionRef: { current: null } } as unknown as Parameters<typeof useConversationSubmission>[0];
+  const submission = { ...common, presentation: state.value, hasWorkspace: true, currentRetrieval: "none", databaseEnabled: false, selectedSkills: [], setSelectedSkills: vi.fn(), setPinnedSkills: vi.fn(), inputRef: { current: "用户原文\n@docs/a.md" }, inputActionsRef: { current: null }, onOpenWorkspacePicker: vi.fn(), onSessionStarting: vi.fn(), onSessionCreated: vi.fn(), handleContinueTurn: vi.fn(), requestFollowQueuedTurn: vi.fn(), setSessionMeta: vi.fn(), setHistoryReady: vi.fn(), setReadOnlyReason: vi.fn(), setChatAttachments: vi.fn(), locallyCreatedSessionRef: { current: null } } as unknown as Parameters<typeof useConversationSubmission>[0];
   const recovery = { ...common, streamingMessageId: "assistant", resumePendingSessionId: null } as unknown as Parameters<typeof useTurnRecoveryActions>[0];
   return { state, pending, messages, common, submission, recovery };
 }
@@ -145,36 +145,17 @@ describe("P16 session input Hooks", function suite() {
     } finally { hook.unmount(); }
   });
 
-  it("queue 实际领取headers先于确认时两Hook按同一inputId补正文且不重建等待", async function queuedBeforeConfirmation() {
-    const h = inputHarness();
-    const confirmation = deferred<Response>();
-    vi.stubGlobal("fetch", vi.fn().mockReturnValueOnce(confirmation.promise).mockResolvedValueOnce(new Response("data: end\n\n", { headers: { "X-Agent-Input-Id": "queue", "X-Agent-Turn-Id": "B" } })));
-    const submit = mountHook(useConversationSubmission, h.submission);
-    const recovery = mountHook(useTurnRecoveryActions, h.recovery);
-    try {
-      submit.current.setInputDelivery("queue");
-      await frame();
-      const sending = submit.current.handleSend();
-      await recovery.current.requestNextQueuedTurn();
-      confirmation.resolve(Response.json({ inputId: "queue", delivery: "queue", status: "consumed", turnId: "A" }, { status: 202 }));
-      await sending;
-      const inputs = h.state.value.items.filter(function input(item) { return item.kind === "input_notice"; });
-      expect(inputs).toHaveLength(1);
-      expect(inputs[0]).toMatchObject({ turnId: "B", content: "用户原文\n@docs/a.md", state: "consumed" });
-      expect(h.pending.value).toEqual([]);
-    } finally { submit.unmount(); recovery.unmount(); }
-  });
-
-  it("queue 返回时已经切会话，finally不会清理新轮", async function ignoresOldQueue() {
+  it("queue 发现时已经切会话，迟到的 Turn 身份不写新目标", async function ignoresOldQueue() {
     const h = inputHarness();
     const response = deferred<Response>();
+    h.common.getSessionController.mockReturnValue({ createAbortController: function create() { return new AbortController(); } });
     vi.stubGlobal("fetch", vi.fn(function wait() { return response.promise; }));
     const recovery = mountHook(useTurnRecoveryActions, h.recovery);
     try {
-      const started = recovery.current.requestNextQueuedTurn();
+      const started = recovery.current.requestFollowQueuedTurn("A");
       h.common.currentSessionIdRef.current = "other-session";
       h.common.setLoading.mockClear();
-      response.resolve(new Response("data: end\n\n", { headers: { "X-Agent-Input-Id": "queue", "X-Agent-Turn-Id": "B" } }));
+      response.resolve(Response.json({ turnId: "B", status: "running" }));
       await started;
       expect(h.common.setLoading).not.toHaveBeenCalled();
       expect(h.common.clearActiveTurn).not.toHaveBeenCalled();
@@ -229,14 +210,75 @@ describe("P16 session input Hooks", function suite() {
     } finally { hook.unmount(); }
   });
 
-  it("同会话queue旧流结束时不清新Turn", async function sameSessionQueueFinalization() {
+  it("Work 202 终态收尾释放加载并跟随排队 Turn", async function workAcceptedFinalizes() {
+    vi.stubGlobal("window", { location: { search: "?mode=work&workspaceId=workspace&sessionId=session" }, setTimeout, clearTimeout, addEventListener: vi.fn(), removeEventListener: vi.fn() });
+    const h = inputHarness();
+    h.submission.loading = false;
+    h.submission.activeTurnId = "";
+    h.common.getSessionController.mockReturnValue({ createAbortController: function create() { return new AbortController(); } });
+    h.common.consumeAgentStream.mockImplementationOnce(async function completed() { h.common.queuedFollowUpTurnIdRef.current = "A"; return "terminal"; });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(Response.json({ turnId: "A" }, { status: 202 })).mockResolvedValueOnce(new Response('data: {"type":"turn_completed","turnId":"A"}\n\n')));
+    const hook = mountHook(useConversationSubmission, h.submission);
+    try {
+      await hook.current.handleSend();
+      await frame();
+      expect(h.common.setLoading).toHaveBeenLastCalledWith(false);
+      expect(h.submission.requestFollowQueuedTurn).toHaveBeenCalledWith("A");
+    } finally { hook.unmount(); }
+  });
+
+  it("Work 202 使用真实终态流后释放加载", async function workAcceptedRealTerminal() {
+    vi.stubGlobal("window", { location: { search: "?mode=work&workspaceId=workspace&sessionId=session" }, setTimeout, clearTimeout, addEventListener: vi.fn(), removeEventListener: vi.fn() });
+    vi.stubGlobal("fetch", vi.fn(async function history() { return Response.json({ meta: { id: "session", productMode: "work", runtimeStatus: "idle" }, messages: [] }); }));
+    const conversation = mountHook(useSessionConversation, { workspaceId: "workspace", sessionId: "session", isChat: false, notifyNewProgress: vi.fn(), setSelectedSkills: vi.fn(), setPinnedSkills: vi.fn() });
+    const h = inputHarness();
+    h.submission.loading = false;
+    h.submission.activeTurnId = "";
+    h.common.getSessionController.mockReturnValue({ createAbortController: function create() { return new AbortController(); } });
+    try {
+      await frame();
+      h.submission.consumeAgentStream = conversation.current.consumeAgentStream;
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(Response.json({ turnId: "A" }, { status: 202 })).mockResolvedValueOnce(new Response('data: {"type":"turn_completed","turnId":"A"}\n\n')));
+      const hook = mountHook(useConversationSubmission, h.submission);
+      try {
+        await hook.current.handleSend();
+        expect(h.common.setLoading).toHaveBeenLastCalledWith(false);
+      } finally { hook.unmount(); }
+    } finally { conversation.unmount(); }
+  });
+
+  it("Work 202 旧观察流结束不清新执行段", async function workAcceptedStale() {
+    vi.stubGlobal("window", { location: { search: "?mode=work&workspaceId=workspace&sessionId=session" }, setTimeout, clearTimeout, addEventListener: vi.fn(), removeEventListener: vi.fn() });
+    const h = inputHarness();
+    h.submission.loading = false;
+    h.submission.activeTurnId = "";
+    const stream = deferred<"terminal">();
+    h.common.getSessionController.mockReturnValue({ createAbortController: function create() { return new AbortController(); } });
+    h.common.consumeAgentStream.mockReturnValueOnce(stream.promise);
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(Response.json({ turnId: "A" }, { status: 202 })).mockResolvedValueOnce(new Response("stream")));
+    const hook = mountHook(useConversationSubmission, h.submission);
+    try {
+      const sending = hook.current.handleSend();
+      await frame();
+      h.common.setLoading.mockClear();
+      h.common.executionEpochRef.current += 1;
+      stream.resolve("terminal");
+      await sending;
+      expect(h.common.setLoading).not.toHaveBeenCalled();
+    } finally { hook.unmount(); }
+  });
+
+  it("同会话宿主 Turn 旧观察流结束时不清新 Turn", async function sameSessionQueueFinalization() {
     const h = inputHarness();
     const stream = deferred<"terminal">();
+    h.common.getSessionController.mockReturnValue({ createAbortController: function create() { return new AbortController(); } });
     h.common.consumeAgentStream.mockReturnValueOnce(stream.promise);
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response("data: end\n\n", { headers: { "X-Agent-Input-Id": "queue", "X-Agent-Turn-Id": "B" } })));
+    vi.stubGlobal("fetch", vi.fn(async function respond(url: string) {
+      return String(url).includes("/turn-state") ? Response.json({ turnId: "B", status: "running" }) : new Response("data: end\n\n");
+    }));
     const recovery = mountHook(useTurnRecoveryActions, h.recovery);
     try {
-      const started = recovery.current.requestNextQueuedTurn();
+      const started = recovery.current.requestFollowQueuedTurn("A");
       await frame();
       h.common.activeTurnRef.current = { sessionId: "session", turnId: "C" };
       h.common.setLoading.mockClear();

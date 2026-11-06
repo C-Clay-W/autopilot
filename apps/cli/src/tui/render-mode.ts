@@ -12,17 +12,14 @@ export function resolveScreenReader(env: NodeJS.ProcessEnv): boolean {
   return env.INK_SCREEN_READER === "true" || env.SCREEN_READER === "1" || env.SCREEN_READER === "true";
 }
 
-/** R0 冻结的最终模式策略；平台由调用方注入，避免测试伪造全局 process.platform。 */
-export function resolveTuiRenderModePolicy(input: { env: NodeJS.ProcessEnv; platform: NodeJS.Platform | string }): TuiRenderMode {
-  if (resolveScreenReader(input.env) || input.env.AUTOPILOT_INLINE_TUI === "1") return "inline";
-  if (input.env.AUTOPILOT_TUI_FULLSCREEN === "1" && input.platform !== "win32") return "alternate-screen";
+/** 交互统一使用inline主屏，滚动交给终端，不启用备用屏/正文滚动条。 */
+export function resolveTuiRenderModePolicy(_input: { env: NodeJS.ProcessEnv; platform: NodeJS.Platform | string }): TuiRenderMode {
   return "inline";
 }
 
-/** R2 的 win32 FULLSCREEN 回落提示；返回值由启动副作用层写入 stderr。 */
-export function getTuiRenderModeFallbackNotice(input: { env: NodeJS.ProcessEnv; platform: NodeJS.Platform | string }): string | undefined {
-  if (input.platform !== "win32" || input.env.AUTOPILOT_TUI_FULLSCREEN !== "1") return undefined;
-  return "AUTOPILOT_TUI_FULLSCREEN is unsupported on win32; using inline mode. Remove AUTOPILOT_TUI_FULLSCREEN to cancel this request.\n";
+/** 各平台统一inline，不增加额外模式回落提示。 */
+export function getTuiRenderModeFallbackNotice(_input: { env: NodeJS.ProcessEnv; platform: NodeJS.Platform | string }): string | undefined {
+  return undefined;
 }
 
 /** 仅在 TUI 启动期决定内联或备用屏；宿主 TTY/Plain 门禁仍由 main.ts 保持。 */

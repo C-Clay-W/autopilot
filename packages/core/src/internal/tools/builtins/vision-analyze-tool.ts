@@ -2,6 +2,7 @@
  * vision_analyze 工具：只读取受控工作区图片，并调用 Turn 注入的视觉能力，不经过 RAG。
  */
 import { readFile, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
 import { assertRegularFile } from "../permissions/workspace-path";
@@ -13,6 +14,7 @@ const maxImageBytes = 5 * 1024 * 1024;
 const visionAnalyzeSchema = z.object({
   path: z.string().min(1),
   prompt: z.string().trim().min(1).max(4_000),
+  expectedSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
 }).strict();
 
 /** 根据受控文件扩展名选择明确 MIME 类型，拒绝未知二进制输入。 */
@@ -51,6 +53,7 @@ export function createVisionAnalyzeTool(): AgentToolDefinition<z.infer<typeof vi
       if (metadata.size > maxImageBytes) throw createToolError(TOOL_ERROR_CODES.FILE_TOO_LARGE, "图片超过 5 MB 输入上限");
       const mimeType = getMimeType(target.absolutePath);
       const buffer = await readFile(target.absolutePath);
+      if (buffer.byteLength > maxImageBytes || (input.expectedSha256 && createHash("sha256").update(buffer).digest("hex") !== input.expectedSha256)) throw createToolError(TOOL_ERROR_CODES.FILE_NOT_READ, "图片已变化或不可用");
       const imageDataUrl = `data:${mimeType};base64,${buffer.toString("base64")}`;
       if (context.signal?.aborted) throw createToolError(TOOL_ERROR_CODES.EXECUTION_CANCELLED, "用户已取消视觉分析");
       if (!context.visionAnalyzer) throw createToolError(TOOL_ERROR_CODES.CAPABILITY_UNAVAILABLE, "当前 Turn 未配置可用视觉能力");

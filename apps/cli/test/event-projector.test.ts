@@ -4,6 +4,7 @@ import type { AgentEvent } from "@autopilot-agent/core";
 import { describe, expect, it } from "vitest";
 import { createCliEventProjector, createInitialCliProjection, reduceCliEvent } from "../src/event-projector.js";
 import { createPlainRenderer } from "../src/renderer.js";
+import { getTuiTurnFailureReason } from "../src/tui/format.js";
 import type { CliEventEnvelope } from "../src/types.js";
 
 /** 将测试用的最小对象视为公开 AgentEvent，避免依赖 Core private 类型。 */
@@ -25,6 +26,23 @@ function checkpoint(turnId: string, status: string = "completed"): Record<string
 }
 
 describe("CLI event projector", function eventProjectorSuite() {
+  /** 安全transcript中的单调终态清除旧权限卡，旧暂停事件重复回放不能复活。 */
+  it("C2 回放 interrupted 清理旧审批卡且旧事件不复活", function replaysWaitingCancellation() {
+    const projector = createCliEventProjector({ sessionId: "waiting-session" });
+    const approval = { seq: 4, sessionId: "waiting-session", turnId: "waiting-turn", timestamp: "2026-11-02T00:00:00.000Z", event: asEvent({ type: "approval_required", turnId: "waiting-turn", callId: "call", toolName: "run_command", result: { status: "approval_required", approval: { approvalId: "old", toolName: "run_command", reason: "确认", risk: "write" } } }) };
+    const paused = { ...approval, seq: 5, event: asEvent({ type: "turn_paused", turnId: "waiting-turn", checkpoint: checkpoint("waiting-turn", "awaiting_approval") }) };
+    projector.observe(approval);
+    projector.observe(paused);
+    expect(projector.getProjection().pendingApproval?.approvalId).toBe("old");
+    projector.observe({ ...approval, seq: 6, event: asEvent({ type: "turn_interrupted", turnId: "waiting-turn", checkpoint: checkpoint("waiting-turn", "interrupted") }) });
+    expect(projector.getProjection().status).toBe("interrupted");
+    expect(projector.getProjection().pendingApproval).toBeUndefined();
+    projector.observe(approval);
+    projector.observe(paused);
+    expect(projector.getProjection().pendingApproval).toBeUndefined();
+    expect(projector.getProjection().status).toBe("interrupted");
+  });
+
   it("复用未变技能身份，新增事件仍保留旧历史快照", function sharesUnchangedSkills() {
     const initial = createInitialCliProjection();
     const envelope: CliEventEnvelope = { seq: 1, sessionId: "s1", turnId: "t1", timestamp: "2026-10-12T00:00:00.000Z", event: asEvent({ type: "reasoning_delta", turnId: "t1", stepId: "step1", delta: "private" }) };
@@ -195,6 +213,48 @@ describe("CLI event projector", function eventProjectorSuite() {
       expect(rendered).not.toContain("sk-unknown");
       expect(rendered).not.toContain("unknown.ts");
     }
+  });
+
+  it("中立错误共享 Core 提示并在 Plain、JSONL、TUI 中保留状态与反馈 ID", function projectsDeepSeekFailureGuidance() {
+    const feedbackId = "123e4567-e89b-42d3-a456-426614174000";
+    const projector = createCliEventProjector({ sessionId: "session-deepseek" });
+    projector.project(asEvent({ type: "turn_started", turnId: "turn-deepseek", stepCount: 0 }));
+    projector.project(asEvent({
+      type: "turn_failed",
+      turnId: "turn-deepseek",
+      error: "synthetic provider body sk-private C:\\private\\provider.ts",
+      errorCode: "PROVIDER_REQUEST_REJECTED",
+      failureStage: "provider_sampling",
+      feedbackId,
+      providerHttpStatus: 402,
+      providerFailureReason: "billing_insufficient",
+      providerFailureDetail: "code:capacity_exhausted",
+      checkpoint: checkpoint("turn-deepseek", "failed"),
+    }));
+    const event = projector.getProjection().events.at(-1)!;
+    const text = createPlainRenderer("text").render(event);
+    const jsonl = createPlainRenderer("jsonl").render(event);
+
+    expect(event).toMatchObject({ type: "status", status: "failed", code: "PROVIDER_REQUEST_REJECTED", reason: "模型服务账户余额不足或计费不可用。请检查账户余额和计费状态后重试。", feedbackId, providerHttpStatus: 402 });
+    expect(text).toContain("模型服务账户余额不足");
+    expect(text).toContain("HTTP 状态：402");
+    expect(text).toContain("上游标识：code:capacity_exhausted");
+    expect(JSON.parse(jsonl).providerFailureDetail).toBe("code:capacity_exhausted");
+    expect(text).toContain(`反馈 ID：${feedbackId}`);
+    expect(JSON.parse(jsonl)).toMatchObject({ reason: "模型服务账户余额不足或计费不可用。请检查账户余额和计费状态后重试。", feedbackId, providerHttpStatus: 402 });
+    expect(getTuiTurnFailureReason([event])).toBe(`模型服务账户余额不足或计费不可用。请检查账户余额和计费状态后重试。 · HTTP 状态：402 · 上游标识：code:capacity_exhausted · 反馈 ID：${feedbackId}`);
+    for (const rendered of [JSON.stringify(event), text, jsonl]) {
+      expect(rendered).not.toContain("synthetic provider body");
+      expect(rendered).not.toContain("sk-private");
+      expect(rendered).not.toContain("private\\provider.ts");
+    }
+
+    const unconfirmed = createCliEventProjector({ sessionId: "session-custom-gateway" });
+    unconfirmed.project(asEvent({ type: "turn_started", turnId: "turn-custom-gateway", stepCount: 0 }));
+    unconfirmed.project(asEvent({ type: "turn_failed", turnId: "turn-custom-gateway", error: "private body", errorCode: "PROVIDER_REQUEST_REJECTED", feedbackId, providerHttpStatus: 402, checkpoint: checkpoint("turn-custom-gateway", "failed") }));
+    const genericEvent = unconfirmed.getProjection().events.at(-1)!;
+    expect(genericEvent).toMatchObject({ code: "PROVIDER_REQUEST_REJECTED", feedbackId, providerHttpStatus: 402, reason: "模型服务未接受本次请求。请检查请求设置或稍后重试；如果持续失败，请提供反馈 ID。" });
+    expect(getTuiTurnFailureReason([genericEvent])).toBe(`模型服务未接受本次请求。请检查请求设置或稍后重试；如果持续失败，请提供反馈 ID。 · HTTP 状态：402 · 反馈 ID：${feedbackId}`);
   });
 
   it("只投影成功 edit_file 的最终相对路径 diff，不暴露工具 output", function projectsFinalEditDiff() {

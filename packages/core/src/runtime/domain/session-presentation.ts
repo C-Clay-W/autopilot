@@ -24,6 +24,13 @@ export interface SessionPresentationMessage {
   editDiffs?: Array<{ callId: string; filePath: string; replacements: number; diff: string }>;
   processSteps?: Array<{ stage: string; message: string }>;
   turnSegments?: Array<{ id: string; content: string; processSteps: Array<{ stage: string; message: string }> }>;
+  /**
+   * 受信来源：只有宿主在真实投递链上写入的 thread 来源 Prompt 才带此字段。
+   * 正文、标题或客户端自报都不能产生来源；Web 据此显示固定标签。
+   */
+  origin?: { kind: "thread"; threadId: string };
+  /** 仅由受信交付链生成的交接展示快照。 */
+  handoffDisplay?: { title: string; instruction: string; summary: string };
   createdAt: number;
 }
 

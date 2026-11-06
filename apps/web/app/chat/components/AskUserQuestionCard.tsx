@@ -3,7 +3,7 @@
  */
 "use client";
 
-import { useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type { UserQuestionItem } from "@autopilot-agent/presentation";
 
 export interface UserQuestionAnswerDraft {
@@ -42,13 +42,23 @@ function hasAnswer(draft: QuestionDraft | undefined): boolean {
 
 /** 渲染可持久化回答前的本地草稿卡；第一个模型选项固定为推荐项。 */
 export default function AskUserQuestionCard({ question, disabled = false, onSubmit, onCancel }: AskUserQuestionCardProps) {
+  const identity = JSON.stringify([question.turnId, question.requestId]);
+  const identityRef = useRef(identity);
+  identityRef.current = identity;
+  const [saved, setSaved] = useState(false);
+  /** 请求换代时释放旧编辑状态，迟到提交只能结算原请求。 */
+  useEffect(function resetRequest() {
+    identityRef.current = identity;
+    setActiveIndex(0); setDrafts({}); setError(""); setSubmitting(false); setSaved(false);
+    return function invalidate() { identityRef.current = ""; };
+  }, [identity]);
   const [activeIndex, setActiveIndex] = useState(0);
   const [drafts, setDrafts] = useState<Record<string, QuestionDraft>>({});
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const currentQuestion = question.questions[activeIndex];
   const currentDraft = currentQuestion ? drafts[currentQuestion.id] ?? createQuestionDraft() : createQuestionDraft();
-  const isBusy = disabled || submitting;
+  const isBusy = disabled || submitting || saved;
 
   /** 保存当前题局部草稿，其他题草稿保持原样以支持前后切换。 */
   function updateCurrentDraft(nextDraft: QuestionDraft): void {
@@ -100,13 +110,16 @@ export default function AskUserQuestionCard({ question, disabled = false, onSubm
       setError(`请先回答“${missingQuestion.header}”`);
       return;
     }
+    const submittedIdentity = identity;
     setSubmitting(true);
     setError("");
     try {
       await onSubmit(question.questions.map(function createAnswer(item) { return toAnswerDraft(item.id, drafts[item.id]); }));
+      if (identityRef.current === submittedIdentity) setSaved(true);
     } catch (submitError) {
-      setError(submitError instanceof Error ? submitError.message : "提交失败，请重试");
-      setSubmitting(false);
+      if (identityRef.current === submittedIdentity) setError(submitError instanceof Error ? submitError.message : "提交失败，请重试");
+    } finally {
+      if (identityRef.current === submittedIdentity) setSubmitting(false);
     }
   }
 
@@ -161,7 +174,7 @@ export default function AskUserQuestionCard({ question, disabled = false, onSubm
         <div className="flex gap-2">
           <button type="button" disabled={isBusy || activeIndex === 0} onClick={function showPreviousQuestion() { setActiveIndex(activeIndex - 1); setError(""); }} className="border-2 border-ink bg-card px-3 py-2 font-semibold hover:bg-ink hover:text-ink-on-dark disabled:cursor-not-allowed disabled:bg-muted disabled:text-ink-on-dark">上一题</button>
           <button type="button" disabled={isBusy || activeIndex === question.questions.length - 1} onClick={function showNextQuestion() { setActiveIndex(activeIndex + 1); setError(""); }} className="border-2 border-ink bg-card px-3 py-2 font-semibold hover:bg-ink hover:text-ink-on-dark disabled:cursor-not-allowed disabled:bg-muted disabled:text-ink-on-dark">下一题</button>
-          <button type="button" disabled={isBusy} onClick={function submitQuestionAnswers() { void submitAnswers(); }} className="border-2 border-ink bg-accent px-3 py-2 font-semibold text-ink-on-dark hover:bg-ink disabled:cursor-not-allowed disabled:bg-muted">{submitting ? "提交中…" : "提交并继续"}</button>
+          <button type="button" disabled={isBusy} onClick={function submitQuestionAnswers() { void submitAnswers(); }} className="border-2 border-ink bg-accent px-3 py-2 font-semibold text-ink-on-dark hover:bg-ink disabled:cursor-not-allowed disabled:bg-muted">{saved ? "答案已保存" : submitting ? "提交中…" : "提交并继续"}</button>
         </div>
       </div>
     </section>

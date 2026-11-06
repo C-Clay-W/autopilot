@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import type { Turn, TurnStore } from "@autopilot-agent/core";
 import { atomicReplace, readJsonFile, safeFilePath, withFileLock } from "../file-utils";
-import { ensureNodeStateRoot, getNodeStatePaths } from "../state-root";
+import { assertNodeStateSchema, ensureNodeStateRoot, getNodeStatePaths } from "../state-root";
 import type { NodeStoreOptions } from "../types";
 
 /** 创建基于共享状态根的 TurnStore。 */
@@ -25,8 +25,8 @@ export function createNodeTurnStore(options: NodeStoreOptions): TurnStore {
 
   return {
     async get(id: string): Promise<Turn | null> {
-      ensureDir();
-      return withFileLock(filePath(id), () => readJsonFile<Turn>(filePath(id)));
+      assertNodeStateSchema(paths.root);
+      return readJsonFile<Turn>(filePath(id));
     },
 
     async save(turn: Turn): Promise<void> {
@@ -37,8 +37,9 @@ export function createNodeTurnStore(options: NodeStoreOptions): TurnStore {
     },
 
     async list(sessionId: string): Promise<Turn[]> {
-      ensureDir();
+      assertNodeStateSchema(paths.root);
       const turns: Turn[] = [];
+      if (!fs.existsSync(paths.turnsDir)) return turns;
       for (const file of fs.readdirSync(paths.turnsDir).filter((entry) => entry.endsWith(".json"))) {
         const turn = readJsonFile<Turn>(filePath(file.slice(0, -5)));
         if (turn?.sessionId === sessionId) turns.push(turn);

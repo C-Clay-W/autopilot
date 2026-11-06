@@ -38,7 +38,7 @@ describe("TUI brand header resize", function tuiBrandResizeSuite() {
     }
   });
 
-  it("缩窄尺寸提交前清空旧视口和 scrollback，再通知 Ink 重算布局", function clearsReflowedFrameBeforeInkResize() {
+  it("缩窄尺寸仅通知 Ink 失效缓存并重算，不旁路清屏", function clearsReflowedFrameBeforeInkResize() {
     const writes: string[] = [];
     const source = {
       columns: 80,
@@ -50,11 +50,11 @@ describe("TUI brand header resize", function tuiBrandResizeSuite() {
     renderStdout.stdout.on?.("resize", function countResize(): void { resizeCount += 1; });
 
     renderStdout.setSize({ columns: 30, rows: 24 });
-    expect(writes).toEqual(["\u001b[2J\u001b[3J\u001b[H"]);
+    expect(writes).toEqual([]);
     expect(resizeCount).toBe(1);
 
     renderStdout.setSize({ columns: 80, rows: 24 });
     expect(resizeCount).toBe(2);
-    expect(writes).toHaveLength(1);
+    expect(writes).toHaveLength(0);
   });
 });

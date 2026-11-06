@@ -7,6 +7,7 @@ import type { AgentEvent } from "../../protocol";
 import { createMemoryPorts } from "../../adapters/memory";
 import { createAgentRuntime } from "../../public/create-agent-runtime";
 import type { ModelSampler } from "../../../internal/kernel/model-sampler";
+import { AgentSampleError } from "../../../internal/lib/llm";
 import { coalesceDeltaEvents } from "./turn-execution-coordinator";
 
 /** 构造一个不含用户正文之外元数据的 answer delta。 */
@@ -112,4 +113,29 @@ it("Transcript 追加失败时不提前通知 durable EventSink", async function
     return events;
   })()).rejects.toThrow("TRANSCRIPT_WRITE_FAILED");
   expect(order).toEqual(["transcript"]);
+});
+
+it("Provider 失败反馈 ID 与安全诊断在 live Runtime 和 durable Transcript 中一致", async function correlatesSafeProviderFailure() {
+  const ports = createMemoryPorts();
+  const sessionId = "session-failure-feedback";
+  await ports.sessionStore.save({ id: sessionId, persistenceMode: "durable", status: "idle", createdAt: 1, updatedAt: 1 });
+  const sampler: ModelSampler = {
+    async sample() {
+      throw new AgentSampleError("raw response sk-fixture-secret /private/provider/request", "PROVIDER_REQUEST_REJECTED", undefined, 429, "billing_insufficient", "code:capacity_exhausted");
+    },
+  };
+  const runtime = createAgentRuntime({ ports, defaultRunConfig: { permissionMode: "auto_approve", modelSampler: sampler } });
+  const events: AgentEvent[] = [];
+  for await (const event of runtime.turns.start({ sessionId, turnId: "turn-failure-feedback", content: "synthetic failure case" })) events.push(event);
+
+  const failure = events.find((event): event is Extract<AgentEvent, { type: "turn_failed" }> => event.type === "turn_failed");
+  expect(failure).toMatchObject({ errorCode: "PROVIDER_REQUEST_REJECTED", failureStage: "provider_sampling", providerHttpStatus: 429, providerFailureReason: "billing_insufficient", providerFailureDetail: "code:capacity_exhausted" });
+  expect(failure?.feedbackId).toMatch(/^[0-9a-f-]{36}$/i);
+  expect(events.filter((event) => event.type === "model_recovery")).toHaveLength(0);
+  const transcript = await ports.transcriptStore.getEvents(sessionId);
+  const persisted = transcript.find((envelope) => envelope.event.type === "turn_failed")?.event;
+  expect(persisted).toMatchObject({ feedbackId: failure?.feedbackId, errorCode: "PROVIDER_REQUEST_REJECTED", failureStage: "provider_sampling", providerHttpStatus: 429, providerFailureReason: "billing_insufficient", providerFailureDetail: "code:capacity_exhausted" });
+  expect(JSON.stringify(persisted)).not.toContain("raw response");
+  expect(JSON.stringify(persisted)).not.toContain("sk-fixture-secret");
+  expect(JSON.stringify(persisted)).not.toContain("/private/provider/request");
 });

@@ -15,6 +15,12 @@ interface MemoryLeaseRecord {
 export class MemoryLeaseStore implements LeaseStore {
   private leases = new Map<string, MemoryLeaseRecord>();
 
+  /** 复制当前所有权，仅用于只读执行投影。 */
+  async readCurrent(sessionId: string): Promise<MemoryLeaseRecord | null> {
+    const current = this.leases.get(sessionId);
+    return current ? structuredClone(current) : null;
+  }
+
   /** 原子取得 Session 租约；新鲜租约存在时拒绝第二个 owner。 */
   async acquire(input: { sessionId: string; turnId: string; lease: AgentLease; now: number; staleAfterMs: number }): Promise<AgentLease | null> {
     const current = this.leases.get(input.sessionId);

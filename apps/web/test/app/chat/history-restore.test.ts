@@ -65,12 +65,28 @@ describe("History message mapping", function historyMessageMappingSuite() {
     expect(mapped.canContinue).toBe(false);
   });
 
-  it("preserves failure data and termination on a matching failed assistant message", function preservesFailureProjection() {
-    const failure = { code: "TURN_EXECUTION_FAILED", message: "任务执行失败，请稍后重新发送。" } as const;
-    const mapped = mapHistoryMessage(createHistoryMessage({ role: "assistant", turnId: "turn-current", failure }), createRecoverableAgent("turn-current"), "turn-current");
+  it("旧 History failure DTO 获得稳定 ID 和固定安全文案", function normalizesLegacyFailureProjection() {
+    const messageId = "123e4567-e89b-42d3-a456-426614174001";
+    const failure = { code: "TURN_EXECUTION_FAILED", message: "PRIVATE_OLD_FAILURE_DETAIL" } as unknown as NonNullable<WebSessionMessageDto["failure"]>;
+    const message = createHistoryMessage({ id: messageId, role: "assistant", turnId: "turn-current", failure });
+    const mapped = mapHistoryMessage(message, createRecoverableAgent("turn-current"), "turn-current");
+    const refreshed = mapHistoryMessage(message, createRecoverableAgent("turn-current"), "turn-current");
 
-    expect(mapped.failure).toEqual(failure);
+    expect(mapped.failure?.feedbackId).toBe(messageId);
+    expect(mapped.failure).toEqual(refreshed.failure);
+    expect(mapped.failure?.message).not.toContain("PRIVATE_OLD_FAILURE_DETAIL");
+    expect(mapped.failure?.diagnostic.stage).toBe("legacy_history");
     expect(mapped.termination).toEqual(termination);
+  });
+
+  it("旧版精确凭据失败从消息正文恢复时重复刷新保留同一 ID", function restoresLegacyBodyWithStableId() {
+    const messageId = "123e4567-e89b-42d3-a456-426614174002";
+    const message = createHistoryMessage({ id: messageId, role: "assistant", turnId: "turn-legacy", content: "指定的 Provider credentialRef 无法解析" });
+    const first = mapHistoryMessage(message, undefined, undefined);
+    const second = mapHistoryMessage(message, undefined, undefined);
+
+    expect(first.failure?.feedbackId).toBe(messageId);
+    expect(second.failure?.feedbackId).toBe(messageId);
   });
 
   it("does not attach assistant termination to tool records normalized for display", function ignoresToolRecord() {

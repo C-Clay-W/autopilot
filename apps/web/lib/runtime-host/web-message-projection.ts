@@ -129,6 +129,10 @@ export function applyEvent(projection: MessageProjection, event: AgentEvent): Me
   const next = { ...projection };
 
   switch (event.type) {
+    case "ui_document":
+      // 无结构化 Renderer 的消息消费者仍能读取普通文字等价内容。
+      next.answer += `\n\n${event.document.fallbackText.slice(0, 2000)}`;
+      break;
     case "answer_delta":
       next.answer += event.delta;
       break;

@@ -5,14 +5,36 @@
 
 本 npm 包分发 CLI，不包含 Web 或 Desktop 应用，也不提供私有知识库 RAG、AutoMemory 或内置浏览器预览。
 
-本手册以已发布 npm 0.2.0 的安装和配置为基础；GitHub 源码可能包含后续修复。推荐 Node 20.20.2 与 npm 10。
+本手册以已发布 npm 0.3.0 的安装和配置为基础。推荐 Node 20.20.2 与 npm 10。
+
+## 0.3.0 示例截图
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/C-Clay-W/autopilot/main/.github/Autopilot-0.3.0-cli-collaboration.png" alt="Autopilot 0.3.0 CLI 主子会话协作" width="960"><br>
+  <em>CLI 主子会话协作</em>
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/C-Clay-W/autopilot/main/.github/Autopilot-0.3.0-chat-charts.png" alt="Intelligent UI" width="960"><br>
+  <em>Intelligent UI</em>
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/C-Clay-W/autopilot/main/.github/Autopilot-0.3.0-web-approval.png" alt="Autopilot 0.3.0 Web Work 子会话审批提示" width="960"><br>
+  <em>Web Work 子会话审批提示</em>
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/C-Clay-W/autopilot/main/.github/Autopilot-0.3.0-web-progress.png" alt="Autopilot 0.3.0 Web Work 协作进展" width="960"><br>
+  <em>Web Work 协作进展</em>
+</p>
 
 ## 安装
 
 需要 **Node.js >=20.11.0 且 <22** 和 npm。首次安装需要网络连接；部分依赖包含平台二进制或安装脚本。
 
 ```bash
-npm install -g autopilot-agent@0.2.0
+npm install -g autopilot-agent@0.3.0
 ap --help
 ```
 
@@ -127,7 +149,7 @@ npm uninstall -g autopilot-agent
 
 卸载 npm 包不表示删除用户配置、凭据或会话数据。
 
-## npm 0.2.0 的已知限制
+## npm 0.3.0 的已知限制
 
 - Windows 不启用 OS 进程沙箱；命令、后台 Job 和 host MCP 经逐次审批后以当前用户权限直接执行，审批不提供隔离。`ap sandbox status` / `ap sandbox setup` 返回停用报告，不安装 Windows 沙箱。
 - 后台 Job 的完整进程树回收仍有真实环境验收边界；不要仅凭根进程退出判断整棵进程树已停止。macOS 继续使用 Seatbelt，沙箱不可用时受隔离保护的命令拒绝执行。
@@ -140,6 +162,8 @@ npm uninstall -g autopilot-agent
 - 按需求编辑文件、执行开发命令，并把需要确认的操作交给审批。
 - 用 Todo 跟踪任务，通过后台 Job 查看输出和请求停止。
 - 保存会话、恢复可继续的任务，按模型能力管理上下文和压缩。
+- 通过单窗口多会话与主子 Thread 会话分派任务、沟通消息和查看进展。`Ctrl+T` 切换会话，`Ctrl+A` 处理待审批、待回答或可安全重试的请求。
+- 输入图片并关联历史图片，按模型和工具能力进行分析。已知旧版工作区在受信初始化时自动备份升级。
 - 加载本机 Skills；配置并显式授权 MCP 服务后扩展工具。
 - 按需配置网页搜索和视觉服务；这些服务与主问答连接的能力、费用和限制分别处理。
 
@@ -159,7 +183,7 @@ npm uninstall -g autopilot-agent
 | /undo | 先查看最近一轮可撤销文件改动，再确认撤销 |
 | /cancel、/exit | 取消任务或退出 |
 
-完整命令语法见 [CLI 参考](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/CLI-Reference.md)。该参考随源码更新，可能包含 npm 0.2.0 之后的能力；安装版先用 ap --help 确认可用命令。
+完整命令语法见 [CLI 参考](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/CLI-Reference.md)。该参考随源码更新，可能包含 npm 0.3.0 之后的能力；安装版先用 ap --help 确认可用命令。
 
 ## 脚本调用与会话管理
 
@@ -211,21 +235,21 @@ Windows 的进程执行不提供 OS 沙箱；macOS 的 Seatbelt 隔离依赖相�
 ## 五包组成与源码
 
 ```text
-autopilot-agent@0.2.0
-├── @autopilot-agent/cli@0.2.0
-│   └── @autopilot-agent/presentation@0.2.0
-├── @autopilot-agent/core@0.2.0
-└── @autopilot-agent/adapters@0.2.0
+autopilot-agent@0.3.0
+├── @autopilot-agent/cli@0.3.0
+│   └── @autopilot-agent/presentation@0.3.0
+├── @autopilot-agent/core@0.3.0
+└── @autopilot-agent/adapters@0.3.0
 ```
 
 CLI 也直接依赖 Core 和 Adapters，Adapters/Presentation 依赖 Core。主包的 bin 解析已安装的 CLI 并转发参数、标准流及退出结果；不重复实现 Agent Runtime。schema/cc-compatible-settings.schema.json 提供配置结构参考，实际允许字段仍受 Runtime 校验。
 
 源码仓库：https://github.com/C-Clay-W/autopilot 。源码还包含 Web；它不随 npm 主包安装。开发者可阅读各包 README、Core API 和 BUILD.md，从源码修改并验证。源码与 npm 分别交付；Web 不随 CLI 包安装，实际能力仍取决于宿主与平台。
 
-## 源码 0.2.0 与 npm 版本
+## 源码 0.3.0 与 npm 版本
 
-源码与五个 npm 包当前版本均为 0.2.0。Windows 不提供 OS 进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
+源码与五个 npm 包当前版本均为 0.3.0。Windows 不提供 OS 进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
 
 ## 许可证
 
-本公开源码采用 MIT，见 LICENSE；第三方依赖和字体保留各自许可证。已发布的 npm 0.2.0 不会因本次源码整理而被替换或重新发布。
+本公开源码采用 MIT，见 LICENSE；第三方依赖和字体保留各自许可证。

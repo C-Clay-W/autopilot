@@ -236,7 +236,7 @@ export function createTurnExecutionCoordinator(
     }
     const agentOptions = runtimeConfigResolver.buildAgentOptions(frozen, capabilities, sessionId, turnId, credential, providerConfig);
     const compactionSampler = agentOptions.modelSampler ?? createDefaultModelSampler();
-    agentOptions.contextCompaction = compactionCoordinator.buildContextCompactionManager(frozen, providerConfig, compactionSampler);
+    agentOptions.contextCompaction = compactionCoordinator.buildContextCompactionManager(frozen, providerConfig, compactionSampler, sessionId);
     // Context Usage 展示与 auto compact 共用同一冻结派生；无真实窗口或模型引用时保持 unknown。
     const budgetBounds = resolveContextBudgetBounds(providerConfig);
     agentOptions.contextUsageProjection = budgetBounds.contextWindowTokens && budgetBounds.triggerTokens && frozen.modelRef
@@ -274,6 +274,25 @@ export function createTurnExecutionCoordinator(
     let heartbeatWrite = Promise.resolve();
     let checkpointWrite = Promise.resolve();
     let highestCheckpointBoundary = -1;
+    let boundaryCommitted = false;
+
+    /** 暂停/终态事实先于外部流提交，释放旧执行段后finally不得再触碰后继执行。 */
+    async function commitBoundary(checkpoint: AgentCheckpoint): Promise<void> {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      await heartbeatWrite;
+      if (isDurable) await saveCheckpoint(checkpoint);
+      boundaryCommitted = true;
+      const status = deriveSessionStatus(checkpoint.status);
+      const turn = await ports.turnStore.get(turnId);
+      const writes = await Promise.allSettled([
+        ports.sessionStore.save({ ...session, status, activeTurnId: undefined, updatedAt: ports.clock.now() }),
+        turn ? ports.turnStore.save({ ...turn, status: deriveTurnStatus(checkpoint.status), completedAt: ports.clock.now() }) : Promise.resolve(),
+      ]);
+      if (activeTurns.get(turnId) === abortController) activeTurns.delete(turnId);
+      await leaseCoordinator.release(sessionId, lease);
+      const failure = writes.find(function failed(write) { return write.status === "rejected"; });
+      if (failure?.status === "rejected") throw failure.reason;
+    }
 
     /** 将 checkpoint 经 V2 校验后写入 durable Store，禁止旧 schema 回流。 */
     async function saveCheckpoint(checkpoint: AgentCheckpoint): Promise<void> {
@@ -304,11 +323,28 @@ export function createTurnExecutionCoordinator(
 
     try {
       let runtimeInput = makeRuntimeInput(internalRuntime);
-      if (runtimeInput.signal) runtimeInput.signal.addEventListener("abort", () => abortController.abort(), { once: true });
+      // 持久事件可先于下一份 checkpoint 落盘；恢复时按同 Turn 公开发布事实补齐私有预算。
+      if (isDurable && runtimeInput.checkpoint && session.productMode === "chat"
+        && (session.chatRetrievalMode === "none" || session.chatRetrievalMode === "web")) {
+        const published = new Set(runtimeInput.checkpoint.uiPublishedCallIds ?? []);
+        for (const envelope of await ports.transcriptStore.getEvents(sessionId)) {
+          if (envelope.turnId === turnId && envelope.event.type === "ui_document") published.add(envelope.event.callId);
+        }
+        if (published.size) runtimeInput = { ...runtimeInput, checkpoint: { ...runtimeInput.checkpoint, uiPublishedCallIds: [...published] } };
+      }
+      if (runtimeInput.signal) {
+        runtimeInput.signal.addEventListener("abort", () => abortController.abort(), { once: true });
+        // 取消可能先于本次注册发生（宿主异步执行 + 立即取消）：已 abort 的信号不会补发事件，必须显式检查。
+        if (runtimeInput.signal.aborted) abortController.abort();
+      }
       runtimeInput.signal = abortController.signal;
+      const previousRuntimeBudget = runtimeInput.checkpoint?.runtimeBudget;
       const runtimeBudget: NonNullable<AgentCheckpoint["runtimeBudget"]> = {
         startedAt: ports.clock.now(),
-        totalTokens: runtimeInput.checkpoint?.runtimeBudget?.totalTokens ?? 0,
+        totalTokens: previousRuntimeBudget?.totalTokens ?? 0,
+        // Turn 范围累计分项跨 Continue 保留；缺分项的旧 checkpoint 不补造，靠 DTO 的完整性校验降级。
+        ...(typeof previousRuntimeBudget?.inputTokens === "number" ? { inputTokens: previousRuntimeBudget.inputTokens } : {}),
+        ...(typeof previousRuntimeBudget?.outputTokens === "number" ? { outputTokens: previousRuntimeBudget.outputTokens } : {}),
         executionSegmentVersion: 1,
       };
       const initialCheckpoint: AgentCheckpoint = runtimeInput.checkpoint
@@ -326,7 +362,7 @@ export function createTurnExecutionCoordinator(
       if (shouldProactivelyCompact) {
         yield await persistEvent({ type: "context_compact_started", turnId, trigger: "proactive" });
         try {
-          const compacted = await compactionCoordinator.compact({ sessionId, turnId, messages: initialCheckpoint.messages, trigger: "proactive", signal: abortController.signal, sampler: compactionSampler });
+          const compacted = await compactionCoordinator.compact({ sessionId, turnId, messages: initialCheckpoint.messages, trigger: "proactive", signal: abortController.signal, sampler: compactionSampler, tools: initialCheckpoint.samplingTools ?? internalRuntime.getToolDefinitions().map(function modelTool(definition) { return { type: "function" as const, function: { name: definition.name, description: definition.description, parameters: definition.inputSchema } }; }) });
           // proactive compact 替换消息投影：旧 usage anchor 与 usage 快照不再可信。
           const { usageAnchor: _droppedProactiveUsageAnchor, contextUsage: _droppedProactiveContextUsage, ...proactiveCheckpointBase } = initialCheckpoint;
           const proactiveCheckpoint: AgentCheckpoint = { ...proactiveCheckpointBase, messages: compacted.messages, lease: { ...lease, heartbeatAt: ports.clock.now(), safeBoundarySeq: seq } };
@@ -336,7 +372,7 @@ export function createTurnExecutionCoordinator(
           const message = "proactive compact 失败";
           yield await persistEvent({ type: "context_compact_failed", turnId, trigger: "proactive", error: message });
           const failedCheckpoint: AgentCheckpoint = { ...initialCheckpoint, status: "failed", lease: { ...lease, heartbeatAt: ports.clock.now(), safeBoundarySeq: seq } };
-          yield await persistEvent({ type: "turn_failed", turnId, checkpoint: failedCheckpoint, error: message });
+          yield await persistEvent({ type: "turn_failed", turnId, checkpoint: failedCheckpoint, error: message, errorCode: "CONTEXT_COMPACTION_FAILED", failureStage: "context_compaction" });
           return;
         }
       }
@@ -373,9 +409,12 @@ export function createTurnExecutionCoordinator(
         lease.safeBoundarySeq = seq;
         recordPerformanceDiagnostic("runtime_event_produced", event.type);
         // Transcript/EventSink 持久化走共享 recorder，与 manual compact 保持同一脱敏与 seq 边界。
-        const persisted = await eventRecorder.record({ seq, sessionId, turnId, isDurable, event: normalized });
+        const boundary = normalizedCheckpoint && normalizedCheckpoint.status !== "running" && ["turn_paused", "turn_completed", "turn_failed", "turn_interrupted", "turn_limit_reached"].includes(event.type);
+        const persisted = await eventRecorder.record({ seq, sessionId, turnId, isDurable, event: normalized,
+          ...(boundary ? { onPersisted: function commitPublishedBoundary() { return commitBoundary(normalizedCheckpoint!); } } : {}),
+        });
         if (isDurable) {
-          if (normalizedCheckpoint) await saveCheckpoint(normalizedCheckpoint);
+          if (normalizedCheckpoint && !boundary) await saveCheckpoint(normalizedCheckpoint);
           else if ((event.type === "todo_updated" || event.type === "context_usage_updated") && latestCheckpoint) await saveCheckpoint(latestCheckpoint);
         }
         return persisted;
@@ -420,13 +459,13 @@ export function createTurnExecutionCoordinator(
         if (reactiveAttempts >= 1) {
           yield await persistEvent({ type: "context_compact_circuit_open", turnId, trigger: "reactive" });
           const failedCheckpoint: AgentCheckpoint = { ...overflowCheckpoint, status: "failed" };
-          yield await persistEvent({ type: "turn_failed", turnId, checkpoint: failedCheckpoint, error: "上下文溢出后已完成一次压缩重试，compact 熔断器已阻止重复请求" });
+          yield await persistEvent({ type: "turn_failed", turnId, checkpoint: failedCheckpoint, error: "上下文溢出后已完成一次压缩重试，compact 熔断器已阻止重复请求", errorCode: "CONTEXT_OVERFLOW", failureStage: "provider_recovery" });
           break;
         }
         reactiveAttempts += 1;
         yield await persistEvent({ type: "context_compact_started", turnId, trigger: "reactive" });
         try {
-          const compacted = await compactionCoordinator.compact({ sessionId, turnId, messages: overflowCheckpoint.messages, trigger: "reactive", signal: abortController.signal, sampler: compactionSampler });
+          const compacted = await compactionCoordinator.compact({ sessionId, turnId, messages: overflowCheckpoint.messages, trigger: "reactive", signal: abortController.signal, sampler: compactionSampler, tools: overflowCheckpoint.samplingTools ?? internalRuntime.getToolDefinitions().map(function modelTool(definition) { return { type: "function" as const, function: { name: definition.name, description: definition.description, parameters: definition.inputSchema } }; }) });
           const { usageAnchor: _droppedUsageAnchor, contextUsage: _droppedContextUsage, ...checkpointWithoutUsageSnapshot } = overflowCheckpoint;
           const retryCheckpoint: AgentCheckpoint = { ...checkpointWithoutUsageSnapshot, status: "running", messages: compacted.messages, lease: { ...lease, heartbeatAt: ports.clock.now(), safeBoundarySeq: seq } };
           yield await persistEvent({ type: "context_compacted", turnId, trigger: "reactive", summary: compacted.summary, preTokens: compacted.preTokens, postTokens: compacted.postTokens, preservedFromIndex: compacted.preservedFromIndex, checkpoint: retryCheckpoint });
@@ -438,30 +477,30 @@ export function createTurnExecutionCoordinator(
           yield await persistEvent({ type: "context_compact_failed", turnId, trigger: "reactive", error: message });
           yield await persistEvent({ type: "context_compact_circuit_open", turnId, trigger: "reactive" });
           const failedCheckpoint: AgentCheckpoint = { ...overflowCheckpoint, status: "failed" };
-          yield await persistEvent({ type: "turn_failed", turnId, checkpoint: failedCheckpoint, error: "reactive compact 失败，已熔断以避免重复请求" });
+          yield await persistEvent({ type: "turn_failed", turnId, checkpoint: failedCheckpoint, error: "reactive compact 失败，已熔断以避免重复请求", errorCode: "CONTEXT_COMPACTION_FAILED", failureStage: "context_compaction" });
           break;
         }
       }
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       await heartbeatWrite;
-      activeTurns.delete(turnId);
-      if (finalCheckpoint) {
-        if (isDurable) await saveCheckpoint(finalCheckpoint);
-        session.status = deriveSessionStatus(finalCheckpoint.status);
-      } else {
-        session.status = "failed";
+      if (!boundaryCommitted) {
+        // 无明确终态的流失败/return不能留下假running，也不能把未知工具结果当成功。
+        const stopped = finalCheckpoint
+          ? { ...finalCheckpoint, status: finalCheckpoint.status === "running" ? "interrupted_recoverable" as const : finalCheckpoint.status }
+          : undefined;
+        try {
+          if (stopped) await commitBoundary(stopped);
+          else {
+            await ports.sessionStore.save({ ...session, status: "failed", activeTurnId: undefined, updatedAt: ports.clock.now() });
+            const turn = await ports.turnStore.get(turnId);
+            if (turn) await ports.turnStore.save({ ...turn, status: "failed", completedAt: ports.clock.now() });
+          }
+        } finally {
+          if (activeTurns.get(turnId) === abortController) activeTurns.delete(turnId);
+          await leaseCoordinator.release(sessionId, lease);
+        }
       }
-      session.activeTurnId = session.status === "running" ? turnId : undefined;
-      session.updatedAt = ports.clock.now();
-      await ports.sessionStore.save(session);
-      const turn = await ports.turnStore.get(turnId);
-      if (turn) {
-        turn.status = finalCheckpoint ? deriveTurnStatus(finalCheckpoint.status) : "failed";
-        turn.completedAt = ports.clock.now();
-        await ports.turnStore.save(turn);
-      }
-      await leaseCoordinator.release(sessionId, lease);
     }
   }
 

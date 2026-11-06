@@ -30,16 +30,30 @@ export interface NodeStateRecoveryDiagnostic {
   reasonCode: NodeStateErrorCode | NodeChatErrorCode | AgentErrorCode;
 }
 
+/** 仅供本机显式诊断的安全阶段事实，不含目标路径或异常正文。 */
+export interface NodeStorageDiagnostic {
+  operation: "session_save";
+  target: "session";
+  phase: "prepare" | "identity" | "lock" | "temporary_write" | "rename" | "cleanup";
+  osCode?: string;
+  lockWaitMs?: number;
+  cleanupFailed?: boolean;
+}
+
 /** 存储错误的安全字段与恢复诊断分离，适用于 Work 和 Chat。 */
 export class NodeStateError extends Error {
   #recovery?: NodeStateRecoveryDiagnostic;
+  #storage?: NodeStorageDiagnostic;
   /** 只使用固定错误码作为消息，恢复信息保存为不可枚举的私有字段。 */
-  constructor(public readonly code: NodeStateErrorCode, recovery?: NodeStateRecoveryDiagnostic) {
+  constructor(public readonly code: NodeStateErrorCode, recovery?: NodeStateRecoveryDiagnostic, storage?: NodeStorageDiagnostic) {
     super(code);
     this.name = "NodeStateError";
     this.#recovery = recovery ? { ...recovery } : undefined;
+    this.#storage = storage ? { ...storage } : undefined;
   }
   /** 受信宿主显式取得恢复信息副本，不得将它投影到 HTTP 或模型事件。 */
+  /** 受信CLI诊断显式读取，序列化错误不会暴露内部阶段。 */
+  getStorageDiagnostic(): NodeStorageDiagnostic | undefined { return this.#storage ? { ...this.#storage } : undefined; }
   getRecoveryDiagnostic(): NodeStateRecoveryDiagnostic | undefined { return this.#recovery ? { ...this.#recovery } : undefined; }
 }
 
@@ -53,13 +67,13 @@ export class NodeChatError extends Error {
 export function createNodeIdentityError(code: NodeIdentityErrorCode): AgentRuntimeError { return new AgentRuntimeError(code, runtimeMessages[code]); }
 
 /** 按精确类型名称与错误码识别跨 CJS/ESM 异常；始终重建安全消息，不透传 message/cause。 */
-export function toNodeBoundaryError(error: unknown, fallback: NodeStateErrorCode | NodeChatErrorCode): NodeStateError | NodeChatError | AgentRuntimeError {
+export function toNodeBoundaryError(error: unknown, fallback: NodeStateErrorCode | NodeChatErrorCode, storage?: NodeStorageDiagnostic): NodeStateError | NodeChatError | AgentRuntimeError {
   if (error instanceof Error && "code" in error && typeof error.code === "string") {
     if (error.name === "AgentRuntimeError" && Object.prototype.hasOwnProperty.call(runtimeMessages, error.code)) return createNodeIdentityError(error.code as NodeIdentityErrorCode);
     if (error.name === "NodeStateError" && (stateCodes as readonly string[]).includes(error.code)) {
-      return new NodeStateError(error.code as NodeStateErrorCode, error instanceof NodeStateError ? error.getRecoveryDiagnostic() : undefined);
+      return new NodeStateError(error.code as NodeStateErrorCode, error instanceof NodeStateError ? error.getRecoveryDiagnostic() : undefined, storage ?? (error instanceof NodeStateError ? error.getStorageDiagnostic() : undefined));
     }
     if (error.name === "NodeChatError" && (chatCodes as readonly string[]).includes(error.code)) return new NodeChatError(error.code as NodeChatErrorCode);
   }
-  return (stateCodes as readonly string[]).includes(fallback) ? new NodeStateError(fallback as NodeStateErrorCode) : new NodeChatError(fallback as NodeChatErrorCode);
+  return (stateCodes as readonly string[]).includes(fallback) ? new NodeStateError(fallback as NodeStateErrorCode, undefined, storage) : new NodeChatError(fallback as NodeChatErrorCode);
 }

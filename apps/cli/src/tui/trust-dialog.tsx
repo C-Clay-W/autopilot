@@ -9,7 +9,8 @@ import { useRef, useState, type ReactNode } from "react";
 import { Box, Text, render, useInput, type Key } from "ink";
 import { TUI_ACCENT_COLOR } from "../design-tokens.js";
 import { parseTuiControlAction } from "./input/keys.js";
-import { createRoutedTuiStdin, createTuiTerminalLifecycle } from "./lifecycle.js";
+import { createRoutedTuiStdin, createTuiRenderStdout, createTuiTerminalLifecycle } from "./lifecycle.js";
+import { readTuiTerminalSize } from "./format.js";
 import { resolveNoColor, resolveScreenReader } from "./render-mode.js";
 
 /** Trust 对话框固定选项；Yes 是唯一授权动作。 */
@@ -59,7 +60,7 @@ export interface CliTrustDialogSignalSource {
 /** 首次 Trust 对话框的运行选项。 */
 export interface CliTrustDialogOptions {
   workspaceRoot: string;
-  streams: { stdout: { write(chunk: string): void; isTTY?: boolean; columns?: number }; stdin: NodeJS.ReadStream };
+  streams: { stdout: { write(chunk: string): void; isTTY?: boolean; columns?: number; rows?: number; on?(event: "resize", listener: () => void): unknown; off?(event: "resize", listener: () => void): unknown }; stdin: NodeJS.ReadStream };
   env?: NodeJS.ProcessEnv;
   signalSource?: CliTrustDialogSignalSource;
 }
@@ -75,6 +76,22 @@ export function runCliTrustDialog(options: CliTrustDialogOptions): Promise<CliTr
     const screenReader = resolveScreenReader(env);
     const routedStdin = createRoutedTuiStdin(options.streams.stdin);
     const terminalLifecycle = createTuiTerminalLifecycle(options.streams.stdout, "inline");
+    const renderStdout = createTuiRenderStdout(options.streams.stdout, readTuiTerminalSize(options.streams.stdout));
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined;
+    /** 防抖后提交稳定尺寸，复用主界面的缩窄清理。 */
+    function handleResize(): void {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(function commitSize() {
+        resizeTimer = undefined;
+        renderStdout.setSize(readTuiTerminalSize(options.streams.stdout));
+      }, 200);
+    }
+    /** 所有退出路径移除尺寸监听及待处理定时器。 */
+    function detachResize(): void {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      options.streams.stdout.off?.("resize", handleResize);
+    }
+    options.streams.stdout.on?.("resize", handleResize);
     let decision: CliTrustDecision = "declined";
     let settled = false;
     let instance: ReturnType<typeof render> | undefined;
@@ -131,7 +148,7 @@ export function runCliTrustDialog(options: CliTrustDialogOptions): Promise<CliTr
     try {
       terminalLifecycle.enter();
       instance = render(<TrustDialogApp />, {
-        stdout: options.streams.stdout as unknown as NodeJS.WriteStream,
+        stdout: renderStdout.stdout as unknown as NodeJS.WriteStream,
         stdin: routedStdin as unknown as NodeJS.ReadStream,
         exitOnCtrlC: false,
         patchConsole: true,
@@ -140,6 +157,7 @@ export function runCliTrustDialog(options: CliTrustDialogOptions): Promise<CliTr
       });
     } catch {
       terminalLifecycle.restore();
+      detachResize();
       detachTrustInput();
       options.signalSource?.removeListener("SIGINT", handleSigint);
       options.signalSource?.removeListener("SIGTERM", handleSigterm);
@@ -149,6 +167,7 @@ export function runCliTrustDialog(options: CliTrustDialogOptions): Promise<CliTr
 
     void instance.waitUntilExit().then(function finishTrustDialog(): void {
       terminalLifecycle.restore();
+      detachResize();
       detachTrustInput();
       options.signalSource?.removeListener("SIGINT", handleSigint);
       options.signalSource?.removeListener("SIGTERM", handleSigterm);

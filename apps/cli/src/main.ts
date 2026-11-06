@@ -6,6 +6,7 @@
  * Session、Turn、审批、恢复和持久化规则全部委托给 Core Runtime。
  */
 
+import { createCliSessionManager, type CliSessionManager } from "./tui/session-manager.js";
 import { WEB_SEARCH_DATA_FLOW_NOTICE } from "@autopilot-agent/presentation";
 import path from "node:path";
 import fs from "node:fs";
@@ -13,6 +14,7 @@ import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 import {
   AgentRuntimeError,
+  ThreadServiceError,
   WorkspaceTrustError,
   type AgentRuntime,
   type Job,
@@ -22,11 +24,13 @@ import {
 } from "@autopilot-agent/core";
 import { createCliCompositionRoot, type CliCompositionRoot, type CreateCliCompositionRootOptions } from "./composition-root.js";
 import { createCliController, type CliController, type CliControllerResult } from "./controller.js";
-import { classifyCliError } from "./error-diagnostics.js";
+import { classifyCliError, CLI_THREAD_RECOVERY_HINT } from "./error-diagnostics.js";
 import { parseArgv, parseSlashAction, renderHelp } from "./parser.js";
 import { createPlainRenderer } from "./renderer.js";
+import { CliThreadInputError, executeThreadCommand } from "./thread-commands.js";
+import type { CliThreadHost } from "./thread-host.js";
 import { runCliTui, runCliTrustDialog } from "./tui.js";
-import type { CliAction, CliCommand, CliExitCode, CliOutputFormat, CliParseResult } from "./types.js";
+import type { CliAction, CliCommand, CliExitCode, CliOutputFormat, CliParseResult, CliThreadCommand } from "./types.js";
 
 /** CLI 主入口使用的最小输出/输入流接口。 */
 export interface CliMainStreams {
@@ -65,7 +69,18 @@ function writeControllerResult(result: CliControllerResult, streams: CliMainStre
 function formatCliError(error: unknown): string {
   const classification = classifyCliError(error);
   if (classification.category === "config_directory") return classification.code;
+  if (classification.category === "node_state") {
+    const messages: Record<string, string> = {
+      STATE_SCHEMA_VERSION_UNSUPPORTED: "状态数据来自不支持的版本，请更新程序后重试；现有数据已保留",
+      STATE_SCHEMA_BUSY: "状态数据正在使用或升级，请停止其他运行实例后重试",
+      STATE_SCHEMA_MIGRATION_FAILED: "状态升级未完成，原数据和恢复备份已保留，请停止其他运行实例后重试；仍失败请联系支持",
+      STATE_SCHEMA_MIGRATION_MISSING: "缺少状态升级步骤，请更新程序后重试；现有数据已保留",
+      STATE_SCHEMA_RECOVERY_REQUIRED: "状态需要恢复，原数据已保留，请停止其他运行实例后重试；仍失败请联系支持",
+    };
+    return `${classification.code}${Object.hasOwn(messages, classification.code) ? `: ${messages[classification.code]}` : ""}`;
+  }
   if (error instanceof WorkspaceTrustError) return `WORKSPACE_TRUST_REQUIRED: ${error.status}`;
+  if (error instanceof AgentRuntimeError && error.code === "THREAD_RECOVERY_REQUIRED") return `${error.code}: ${CLI_THREAD_RECOVERY_HINT}`;
   if (error instanceof AgentRuntimeError) return `${error.code}: ${sanitizeErrorMessage(error.message)}`;
   return "CLI_RUNTIME_ERROR";
 }
@@ -102,6 +117,19 @@ function sanitizeManagementString(value: string): string {
     .slice(0, 16 * 1024)
     .replace(/(?:[A-Za-z]:[\\/]|\\\\|\/(?:Users|home|private|tmp|var|mnt|workspace|Volumes)\/)[^\s"'`]+/gu, "[path]")
     .replace(/\b(api[_-]?key|access[_-]?token|password|secret|dsn)\s*[:=]\s*[^\s,;]+/giu, "$1=[redacted]");
+}
+
+/** 协作结果直接输出 JSON；内容已由 Core 做安全投影与限额，这里不改写正文。 */
+function writeThreadResult(streams: CliMainStreams, value: unknown): void {
+  streams.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
+/** 读取全部 stdin；只在命令显式要求 --message-stdin 时调用，避免误吞交互输入。 */
+async function readStdinText(streams: CliMainStreams): Promise<string> {
+  const input = streams.stdin ?? process.stdin;
+  let text = "";
+  for await (const chunk of input as AsyncIterable<Buffer | string>) text += String(chunk);
+  return text;
 }
 
 /** 将 Core 安全 JobView 补充独立命令所需身份，不读取命令、路径、PID 或 owner。 */
@@ -172,7 +200,7 @@ async function ensureProject(runtime: AgentRuntime, workspaceRoot: string): Prom
 }
 
 /** 读取指定 Session 或创建当前 Project 下的新 Session。 */
-async function ensureChatSession(runtime: AgentRuntime, project: Project, sessionId: string | undefined, prompt: string | undefined): Promise<Session> {
+async function ensureChatSession(runtime: AgentRuntime, project: Project, sessionId: string | undefined): Promise<Session> {
   if (sessionId) {
     const session = await runtime.sessions.get(sessionId);
     if (!session) throw new AgentRuntimeError("SESSION_NOT_FOUND", `Session ${sessionId} 不存在`);
@@ -181,13 +209,14 @@ async function ensureChatSession(runtime: AgentRuntime, project: Project, sessio
   }
   return runtime.sessions.create({
     projectId: project.id,
-    title: prompt?.trim().slice(0, 80),
+    // 统一由Controller在首个有效交互时建立短标题，成功回答后沿Web范式更新。
+    title: undefined,
   });
 }
 
 /** 读取指定或最近的可恢复 Session；没有可用 Session 时返回稳定错误。 */
 async function selectResumeSession(runtime: AgentRuntime, project: Project, sessionId: string | undefined): Promise<Session> {
-  if (sessionId) return ensureChatSession(runtime, project, sessionId, undefined);
+  if (sessionId) return ensureChatSession(runtime, project, sessionId);
   const sessions = (await runtime.sessions.list())
     .filter(function selectProjectSession(item) { return !item.projectId || item.projectId === project.id; })
     .sort(function sortRecent(left, right) { return right.updatedAt - left.updatedAt; });
@@ -276,6 +305,68 @@ async function runInputLoop(
     return requestedExitCode ?? lastExitCode;
   } finally {
     inputInterface.close();
+    signalSource.removeListener("SIGINT", handleSigint);
+    signalSource.removeListener("SIGTERM", handleSigterm);
+  }
+}
+
+/**
+ * 执行协作薄命令。
+ *
+ * 只绑定当前 Project 并复用 Runtime 的同一份 Ports；不启动常驻 Runner，
+ * 因此回执只表示消息已接受，执行仍取决于是否有在线宿主。
+ */
+async function executeThreadInvocation(
+  command: CliThreadCommand,
+  root: CliCompositionRoot,
+  runtime: AgentRuntime,
+  workspaceRoot: string,
+  streams: CliMainStreams,
+  signalSource: CliSignalSource,
+): Promise<CliExitCode> {
+  // 协作组绑定到已存在的 Project；读取命令不为查询新建 Project。
+  const project = (await runtime.projects.list()).find(function matchWorkspace(item) { return item.workspaceRoot === workspaceRoot; });
+  if (!project) {
+    streams.stderr.write("THREADS_UNAVAILABLE: 当前工作区尚未建立 Project\n");
+    return 1;
+  }
+  root.bindThreadsProject(project.id);
+  const threads = root.createHumanThreads();
+  const controller = new AbortController();
+  let requestedExitCode: 130 | 143 | undefined;
+
+  /** 中断只结束本地观察或等待，不向任何目标提交取消。 */
+  function handleSignal(signal: "SIGINT" | "SIGTERM"): void {
+    requestedExitCode = exitCodeForSignal(signal);
+    controller.abort();
+  }
+  function handleSigint(): void { handleSignal("SIGINT"); }
+  function handleSigterm(): void { handleSignal("SIGTERM"); }
+
+  signalSource.on("SIGINT", handleSigint);
+  signalSource.on("SIGTERM", handleSigterm);
+  try {
+    const executed = await executeThreadCommand(command, {
+      threads,
+      readFile: function readFile(file) { return fs.promises.readFile(file, "utf8"); },
+      readStdin: function readStdin() { return readStdinText(streams); },
+      write: function write(line) { streams.stdout.write(`${line}\n`); },
+      signal: controller.signal,
+    });
+    if (executed.result !== undefined) writeThreadResult(streams, executed.result);
+    return requestedExitCode ?? executed.exitCode;
+  } catch (error) {
+    if (error instanceof CliThreadInputError) {
+      streams.stderr.write(`${error.message}\n`);
+      return 2;
+    }
+    if (error instanceof ThreadServiceError) {
+      // 参数类错误按 usage 退出码，其余按运行期失败；错误码本身足以定位，不回显路径。
+      streams.stderr.write(`${error.code}\n`);
+      return error.code === "INVALID_INPUT" || error.code === "MODEL_NOT_FOUND" ? 2 : 1;
+    }
+    throw error;
+  } finally {
     signalSource.removeListener("SIGINT", handleSigint);
     signalSource.removeListener("SIGTERM", handleSigterm);
   }
@@ -404,7 +495,13 @@ async function executeInvocation(
   }
 
   const runtime = await root.createRuntime(trust.workspaceRoot);
+  let threadHost: CliThreadHost | undefined;
+  let sessionManager: CliSessionManager | undefined;
   try {
+
+  if (command.type === "thread") {
+    return await executeThreadInvocation(command.command, root, runtime, trust.workspaceRoot, streams, signalSource);
+  }
 
   if (command.type === "job_list" || command.type === "job_show" || command.type === "job_output" || command.type === "job_kill") {
     if (command.type === "job_list") {
@@ -491,9 +588,13 @@ async function executeInvocation(
   }
 
   const project = await ensureProject(runtime, trust.workspaceRoot);
+  // 协作范围按 Project 绑定；常驻宿主发现已启用组后才接管驱动，未启用时保持轻量复查。
+  root.bindThreadsProject(project.id);
+  threadHost = root.createThreadHost(runtime, function reportThreadHostError(error, continuation) { const classification = classifyCliError(error); streams.stderr.write(`THREAD_HOST_ERROR ${classification.category}/${classification.code}\n`); const diagnostic = continuation?.failureDiagnostic; const notice = diagnostic ? `会话 ${continuation.threadId} / Turn ${continuation.expectedTurnId} / 控制 ${continuation.controlId}：决定已保存但恢复失败（${diagnostic.category}/${diagnostic.code}，${diagnostic.stage}，已观察启动=${diagnostic.started}）` : `关联任务状态提交失败（${classification.category}/${classification.code}），请查看目标会话确认执行状态`; streams.stderr.write(`${notice}\n`); sessionManager?.selected().store.addNotice(notice); });
+  threadHost.start();
   const session = command.type === "resume"
     ? await selectResumeSession(runtime, project, command.sessionId)
-    : await ensureChatSession(runtime, project, command.sessionId, command.prompt);
+    : await ensureChatSession(runtime, project, command.sessionId);
   const renderer = command.output === "interactive" && hasTty
     ? { format: "text" as const, render: function renderTuiEvent(): string { return ""; } }
     : createPlainRenderer(command.output === "jsonl" ? "jsonl" : "text");
@@ -505,9 +606,10 @@ async function executeInvocation(
     getRuntimeStatusDefaults: root.getRuntimeStatusDefaults,
     listSkills: root.listSkills,
     resolveSkill: root.resolveSkill,
+    registerExecution: threadHost.registerExecution,
   });
 
-  const recoverable = command.type === "chat" && !command.prompt
+  const recoverable = command.type === "chat" && !command.prompt && (command.output !== "interactive" || !hasTty)
     ? await runtime.turns.getRecoverableState({ sessionId: session.id })
     : undefined;
   if (recoverable?.recoverable && recoverable.status === "awaiting_user_input") {
@@ -522,7 +624,39 @@ async function executeInvocation(
       : command.prompt
         ? { type: "start" as const, content: command.prompt }
         : undefined;
+    sessionManager = createCliSessionManager({
+      runtime, projectId: project.id, initialSession: session, initialController: controller,
+      createController: function createForSession(sessionId) { return createCliController({ runtime, renderer, sessionId, workspaceRoot: trust.workspaceRoot, getRuntimeStatusDefaults: root.getRuntimeStatusDefaults, listSkills: root.listSkills, resolveSkill: root.resolveSkill, registerExecution: threadHost!.registerExecution }); },
+      /** 通过既有人类只读目录查询创建/关联事实，分页不启动任何目标。 */
+      readRelations: async function readRelations(sessionId, signal) {
+        signal?.throwIfAborted();
+        const threads = root.createHumanThreads();
+        const { group } = await threads.groupOf({ protocolVersion: 1, threadId: sessionId });
+        signal?.throwIfAborted();
+        if (!group) return [];
+        const items: import("./tui/session-manager.js").CliSessionRelation[] = [];
+        let cursor: string | undefined;
+        do {
+          signal?.throwIfAborted();
+          const page = await threads.list({ protocolVersion: 1, groupId: group.groupId, limit: 100, cursor });
+          for (const item of page.items) {
+            const parentThreadId = item.parentThreadId ?? (item.threadId === group.rootThreadId ? null : group.rootThreadId);
+            if (parentThreadId !== sessionId) continue;
+            signal?.throwIfAborted();
+            const summary = await root.readSessionSummary(item.threadId, signal);
+            if (summary) items.push({ threadId: item.threadId, parentThreadId, title: summary.title, status: summary.status, activeTurnId: summary.currentTurnId ?? summary.activeTurnId, executionView: summary.executionView });
+          }
+          cursor = page.nextCursor;
+        } while (cursor);
+        return items;
+      },
+      readDirectoryPage: function directory(input) { return root.readSessionDirectoryPage(project.id, input); },
+      readSummary: root.readSessionSummary,
+      readEventPage: root.readSessionEventPage,
+    });
+    sessionManager.start();
     const tuiResult = await runCliTui({
+      sessionManager,
       controller,
       sessionId: session.id,
       workspaceRoot: trust.workspaceRoot,
@@ -566,6 +700,13 @@ async function executeInvocation(
   }
   return resumed.exitCode;
   } finally {
+    const sessionsStopped = await sessionManager?.stop();
+    const stopReport = await threadHost?.stop();
+    if (sessionsStopped) streams.stderr.write(`宿主退出：确认停止=${sessionsStopped.stopped.length} 等待审批或输入=${sessionsStopped.waiting.length} 可恢复=${sessionsStopped.recoverable.length} 未确认=${sessionsStopped.unconfirmed.length}\n`);
+    // 停机报告只陈述事实：取消与未确认项必须显式可见，不能写成目标已完成。
+    if (stopReport) {
+      streams.stderr.write(`thread runner stopped: cancelled=${stopReport.cancelledTurnIds.length} unconfirmed=${stopReport.unconfirmedTurnIds.length} waiting=${stopReport.waitingTurnIds?.length ?? 0} undelivered=${stopReport.pendingMessageIds?.length ?? 0} recoverable=${stopReport.recoverableTurnIds?.length ?? 0}\n`);
+    }
     await runtime.shutdown?.();
   }
 }

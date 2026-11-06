@@ -6,6 +6,14 @@
 
 import type { ModelRef, ReasoningEffort } from "../domain/model-ref";
 
+/**
+ * 提示缓存的客户端标记策略，只描述"本端是否发送协议缓存标记"。
+ * - server-auto：服务端自动前缀缓存，本端不发标记（DeepSeek 官方上下文缓存默认开启）。
+ * - explicit：必须由本端在协议允许的稳定前缀边界发送缓存标记（Anthropic 原生 cache_control）。
+ * - none：未确认或不启用客户端标记；不代表服务端一定没有缓存。
+ */
+export type PromptCacheMode = "server-auto" | "explicit" | "none";
+
 /** 受信模型的统一能力描述。 */
 export interface ModelCapability {
   provider: "deepseek" | "ali";
@@ -15,13 +23,15 @@ export interface ModelCapability {
   supportedReasoningEfforts: readonly ReasoningEffort[];
   contextWindowTokens: number;
   maxOutputTokens: number;
+  /** 只有 explicit 允许发送协议缓存标记；未登记模型一律按 none 处理。 */
+  promptCacheMode: PromptCacheMode;
 }
 
 /** 首发内置目录；未知 Provider 或模型一律不进入此处。 */
 const MODEL_CAPABILITIES: readonly ModelCapability[] = [
-  { provider: "deepseek", modelId: "deepseek-v4-flash", inputModalities: ["text"], supportsToolCalls: true, supportedReasoningEfforts: ["none", "low", "high", "max"], contextWindowTokens: 1_000_000, maxOutputTokens: 384_000 },
-  { provider: "deepseek", modelId: "deepseek-v4-pro", inputModalities: ["text"], supportsToolCalls: true, supportedReasoningEfforts: ["none", "high", "max"], contextWindowTokens: 1_000_000, maxOutputTokens: 384_000 },
-  { provider: "ali", modelId: "qwen3-vl-flash", inputModalities: ["text", "image"], supportsToolCalls: true, supportedReasoningEfforts: [], contextWindowTokens: 128_000, maxOutputTokens: 8_192 },
+  { provider: "deepseek", modelId: "deepseek-v4-flash", inputModalities: ["text", "image"], supportsToolCalls: true, supportedReasoningEfforts: ["none", "low", "high", "max"], contextWindowTokens: 1_000_000, maxOutputTokens: 384_000, promptCacheMode: "server-auto" },
+  { provider: "deepseek", modelId: "deepseek-v4-pro", inputModalities: ["text"], supportsToolCalls: true, supportedReasoningEfforts: ["none", "high", "max"], contextWindowTokens: 1_000_000, maxOutputTokens: 384_000, promptCacheMode: "server-auto" },
+  { provider: "ali", modelId: "qwen3-vl-flash", inputModalities: ["text", "image"], supportsToolCalls: true, supportedReasoningEfforts: [], contextWindowTokens: 128_000, maxOutputTokens: 8_192, promptCacheMode: "none" },
 ];
 
 /** 受信生产 ModelRef 到目录身份的精确别名；不扩展未知 Provider 或模型。 */

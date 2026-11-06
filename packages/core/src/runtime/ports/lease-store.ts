@@ -8,6 +8,8 @@ import type { AgentLease } from "../../internal/agent-runtime";
 
 /** 跨进程租约持久化接口。 */
 export interface LeaseStore {
+  /** 只读当前执行所有权，不创建目录、不迁移、不恢复；旧Port缺省时投影为待确认。 */
+  readCurrent?(sessionId: string): Promise<{ turnId: string; lease: AgentLease } | null>;
   /** 原子取得 Session 租约；存在新鲜租约时返回 null。 */
   acquire(input: {
     sessionId: string;

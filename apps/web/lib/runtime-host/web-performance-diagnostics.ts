@@ -1,5 +1,7 @@
 /** Web 性能诊断：仅在显式诊断模式下记录分段时刻与耗时，不保存回答、输入、凭据或路径。 */
 
+import { isWebTurnFailure, type WebTurnFailure } from "./web-turn-failure";
+
 const WEB_PERFORMANCE_DIAGNOSTICS_KEY = Symbol.for("autopilot.webPerformanceDiagnostics");
 
 export interface WebPerformanceDiagnosticRecord {
@@ -10,14 +12,26 @@ export interface WebPerformanceDiagnosticRecord {
   durationMs?: number;
 }
 
+/** 只含经安全 DTO 校验的失败关联字段，不包含异常正文或堆栈。 */
+export interface WebFailureDiagnosticRecord extends WebPerformanceDiagnosticRecord {
+  point: "turn_failure";
+  eventType: "turn_failed";
+  feedbackId: string;
+  diagnosticCode: WebTurnFailure["diagnostic"]["code"];
+  failureStage: WebTurnFailure["diagnostic"]["stage"];
+  providerHttpStatus?: number;
+}
+
+type WebDiagnosticRecord = WebPerformanceDiagnosticRecord | WebFailureDiagnosticRecord;
+
 type DiagnosticRuntime = typeof globalThis & {
   __AUTOPILOT_PERF_DIAGNOSTICS__?: boolean;
   process?: { env?: Record<string, string | undefined> };
 };
 
 /** 返回 Web 进程内共享的诊断缓冲；缓冲本身不触发文件或网络 I/O。 */
-function getDiagnosticBuffer(): WebPerformanceDiagnosticRecord[] {
-  const target = globalThis as DiagnosticRuntime & Record<symbol, WebPerformanceDiagnosticRecord[] | undefined>;
+function getDiagnosticBuffer(): WebDiagnosticRecord[] {
+  const target = globalThis as DiagnosticRuntime & Record<symbol, WebDiagnosticRecord[] | undefined>;
   target[WEB_PERFORMANCE_DIAGNOSTICS_KEY] ??= [];
   return target[WEB_PERFORMANCE_DIAGNOSTICS_KEY];
 }
@@ -43,8 +57,30 @@ export function recordWebPerformanceDiagnostic(point: string, eventType: string,
   getDiagnosticBuffer().push(record);
 }
 
+/** 默认写入仅含白名单字段的服务器日志；显式诊断模式下额外缓冲失败关联字段。 */
+export function recordWebTurnFailureDiagnostic(value: unknown): void {
+  if (!isWebTurnFailure(value)) return;
+  const failure = value;
+  const safeDiagnostic = {
+    feedbackId: failure.feedbackId,
+    diagnosticCode: failure.diagnostic.code,
+    failureStage: failure.diagnostic.stage,
+    ...(failure.diagnostic.providerHttpStatus !== undefined ? { providerHttpStatus: failure.diagnostic.providerHttpStatus } : {}),
+  };
+  if (typeof window === "undefined") console.error("[autopilot-web] turn failure diagnostic", safeDiagnostic);
+  if (!isDiagnosticsEnabled()) return;
+  const record: WebFailureDiagnosticRecord = {
+    version: 1,
+    point: "turn_failure",
+    eventType: "turn_failed",
+    monotonicMs: Number(performance.now().toFixed(3)),
+    ...safeDiagnostic,
+  };
+  getDiagnosticBuffer().push(record);
+}
+
 /** 返回当前诊断快照，供确定性测试或显式诊断宿主读取。 */
-export function readWebPerformanceDiagnostics(): WebPerformanceDiagnosticRecord[] {
+export function readWebPerformanceDiagnostics(): WebDiagnosticRecord[] {
   return [...getDiagnosticBuffer()];
 }
 

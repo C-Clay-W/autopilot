@@ -150,25 +150,85 @@ describe("Web Search Stage 2 persistence", function webSearchPersistenceSuite() 
     expect("checkpoint" in serialized ? serialized.checkpoint : undefined).not.toHaveProperty("pendingCalls");
   });
 
-  /** H1：终态只公开登记过的沙箱失败类别，其他内部错误码不进入公开事件。 */
-  it("终态只放行登记的沙箱错误码", function projectsSafeTerminalErrorCode() {
+  /** 终态失败只公开白名单类别、阶段、反馈 ID 与有限 HTTP 状态。 */
+  it("终态诊断字段受白名单约束并移除异常原文", function projectsSafeTerminalFailureDiagnostic() {
+    const feedbackId = "123e4567-e89b-42d3-a456-426614174000";
     const sandbox = sanitizeEventForExternal({
       type: "turn_failed",
       turnId: "turn-terminal-sandbox",
       error: "沙箱不可用，无法提供已隔离执行，本次任务已停止，不会无沙箱直接执行。",
       errorCode: "SANDBOX_UNAVAILABLE",
+      failureStage: "tool_execution",
+      feedbackId,
       checkpoint: { turnId: "turn-terminal-sandbox", status: "failed", stepCount: 1, messages: [], completedCallIds: [] },
     } as unknown as AgentLoopEvent);
-    expect(sandbox).toMatchObject({ errorCode: "SANDBOX_UNAVAILABLE" });
+    expect(sandbox).toMatchObject({ errorCode: "SANDBOX_UNAVAILABLE", failureStage: "tool_execution", feedbackId });
 
     const internal = sanitizeEventForExternal({
       type: "turn_failed",
       turnId: "turn-terminal-internal",
-      error: "Agent Loop 执行失败",
+      error: "raw response sk-private /private/user/path",
       errorCode: "PRIVATE_INTERNAL_CODE",
+      failureStage: "private/path",
+      feedbackId: "PRIVATE_INTERNAL_ID",
+      providerHttpStatus: 200,
       checkpoint: { turnId: "turn-terminal-internal", status: "failed", stepCount: 1, messages: [], completedCallIds: [] },
     } as unknown as AgentLoopEvent);
+    expect(internal).toMatchObject({ errorCode: "TURN_EXECUTION_FAILED", failureStage: "agent_loop" });
     expect(JSON.stringify(internal)).not.toContain("PRIVATE_INTERNAL_CODE");
+    expect(JSON.stringify(internal)).not.toContain("PRIVATE_INTERNAL_ID");
+    expect(JSON.stringify(internal)).not.toContain("private/path");
+    expect(JSON.stringify(internal)).not.toContain("sk-private");
+    expect(JSON.stringify(internal)).not.toContain("/private/user/path");
+    expect(internal).not.toHaveProperty("providerHttpStatus");
+
+    const provider = sanitizeEventForExternal({
+      type: "turn_failed",
+      turnId: "turn-provider-rejected",
+      error: "raw response sk-provider-secret /private/request",
+      errorCode: "PROVIDER_REQUEST_REJECTED",
+      failureStage: "provider_sampling",
+      feedbackId,
+      providerHttpStatus: 402,
+      providerFailureReason: "billing_insufficient",
+      providerFailureProfile: "deepseek_official",
+      checkpoint: { turnId: "turn-provider-rejected", status: "failed", stepCount: 0, messages: [], completedCallIds: [] },
+    } as unknown as AgentLoopEvent);
+    expect(provider).not.toHaveProperty("providerFailureProfile");
+    expect(provider).toMatchObject({ errorCode: "PROVIDER_REQUEST_REJECTED", failureStage: "provider_sampling", feedbackId, providerHttpStatus: 402, providerFailureReason: "billing_insufficient" });
+    expect(JSON.stringify(provider)).not.toContain("sk-provider-secret");
+    expect(JSON.stringify(provider)).not.toContain("/private/request");
+
+    const unknownProfile = sanitizeEventForExternal({
+      type: "turn_failed",
+      turnId: "turn-provider-unknown-profile",
+      error: "raw provider response",
+      errorCode: "PROVIDER_REQUEST_REJECTED",
+      providerHttpStatus: 402,
+      providerFailureReason: "untrusted_reason",
+      checkpoint: { turnId: "turn-provider-unknown-profile", status: "failed", stepCount: 0, messages: [], completedCallIds: [] },
+    } as unknown as AgentLoopEvent);
+    expect(unknownProfile).not.toHaveProperty("providerFailureReason");
+
+    const mismatchedProfile = sanitizeEventForExternal({
+      type: "turn_failed",
+      turnId: "turn-provider-mismatched-profile",
+      error: "raw provider response",
+      errorCode: "PROVIDER_SERVER_ERROR",
+      providerHttpStatus: 402,
+      providerFailureReason: "billing_insufficient",
+      checkpoint: { turnId: "turn-provider-mismatched-profile", status: "failed", stepCount: 0, messages: [], completedCallIds: [] },
+    } as unknown as AgentLoopEvent);
+    expect(mismatchedProfile).toMatchObject({ errorCode: "PROVIDER_SERVER_ERROR", providerHttpStatus: 402 });
+    expect(mismatchedProfile).not.toHaveProperty("providerFailureReason");
+    const objectReason = sanitizeEventForExternal({
+      type: "turn_failed", turnId: "object-reason", error: "private",
+      errorCode: "PROVIDER_REQUEST_REJECTED",
+      providerFailureReason: { toString() { return "billing_insufficient"; }, private: "must-not-leak" },
+      checkpoint: { turnId: "object-reason", status: "failed", stepCount: 0, messages: [], completedCallIds: [] },
+    } as unknown as AgentLoopEvent);
+    expect(objectReason).not.toHaveProperty("providerFailureReason");
+    expect(JSON.stringify(objectReason)).not.toContain("must-not-leak");
   });
 
   /** 旧事件没有预算投影时保留可恢复事实，但不从等待时间补算预算数值。 */

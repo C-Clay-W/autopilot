@@ -15,6 +15,8 @@ import { getAgentMessageText, validateAgentMessages } from "../../internal/types
 import type { ModelSampleOptions } from "../../internal/types";
 import type { ModelBehaviorProfile } from "./model-behavior-profile";
 import { createDefaultModelBehaviorProfile } from "./model-behavior-profile";
+import type { PromptCacheMode } from "./model-capability-catalog";
+import { normalizeProviderHttpFailure, parseRetryAfterMs } from "./provider-failure-normalization";
 
 /** 创建 Anthropic Messages 采样器所需的已冻结参数。 */
 export interface CreateAnthropicMessagesSamplerInput {
@@ -24,6 +26,8 @@ export interface CreateAnthropicMessagesSamplerInput {
   timeoutMs?: number;
   sampleOptions: ModelSampleOptions;
   behaviorProfile?: ModelBehaviorProfile;
+  /** 由受信能力目录声明的缓存标记策略；缺省或非 explicit 一律不发缓存标记。 */
+  promptCacheMode?: PromptCacheMode;
 }
 
 /** 只保存 Anthropic replay 所需的最小字段，主动排除 citations/caller 等 SDK 响应字段。 */
@@ -189,9 +193,7 @@ function createAssistantContent(message: AgentMessage, tolerateUnsignedThinking:
     assertReplayMatchesCanonical(message, normalizedReplay);
     return normalizedReplay as Anthropic.ContentBlockParam[];
   }
-  if (message.content.some(function hasReasoning(block) { return block.type === "reasoning"; })) {
-    throw new AgentSampleError("Anthropic reasoning 缺少可重放 signature，已拒绝伪造请求", "PROVIDER_REQUEST_REJECTED");
-  }
+  // 跨协议或旧历史没有 Anthropic signature：只投影公开正文/工具，绝不伪造 thinking。
   return message.content.flatMap(function mapAssistantBlock(block): Anthropic.ContentBlockParam[] {
     if (block.type === "text") return [{ type: "text", text: block.text }];
     if (block.type === "tool-call") return [{ type: "tool_use", id: block.id, name: block.name, input: block.input }];
@@ -200,11 +202,17 @@ function createAssistantContent(message: AgentMessage, tolerateUnsignedThinking:
 }
 
 /** 将连续 V2 tool-result 合并为一条 Anthropic user message，保留 error 语义。 */
-function appendToolResult(requestMessages: Anthropic.MessageParam[], block: Extract<AgentContentBlock, { type: "tool-result" }>): void {
+function appendToolResult(requestMessages: Anthropic.MessageParam[], block: Extract<AgentContentBlock, { type: "tool-result" }>, imageData?: import("../../internal/kernel/model-sampler").ModelImageData): void {
+  const content: Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam> = block.content.map(function mapResultText(item) { return { type: "text", text: item.text }; });
+  for (const reference of block.images ?? []) {
+    const image = imageData?.[reference.id];
+    if (!image) throw new Error("会话图片不可用");
+    content.push({ type: "image", source: { type: "base64", media_type: image.mimeType, data: image.data } });
+  }
   const result: Anthropic.ToolResultBlockParam = {
     type: "tool_result",
     tool_use_id: block.toolCallId,
-    content: block.content.map(function mapResultText(item) { return { type: "text" as const, text: item.text }; }),
+    content,
     is_error: block.isError,
   };
   const previous = requestMessages.at(-1);
@@ -217,21 +225,66 @@ function appendToolResult(requestMessages: Anthropic.MessageParam[], block: Extr
 }
 
 /** 将完整 V2 历史转换为 Anthropic 的非 system 消息，并在入口验证配对不变量。 */
-export function createAnthropicConversationMessages(messages: AgentMessage[], tolerateUnsignedThinking = false): Anthropic.MessageParam[] {
+export function createAnthropicConversationMessages(messages: AgentMessage[], tolerateUnsignedThinking = false, imageData?: import("../../internal/kernel/model-sampler").ModelImageData): Anthropic.MessageParam[] {
   const requestMessages: Anthropic.MessageParam[] = [];
   for (const message of validateAgentMessages(messages)) {
-    if (message.role === "system") continue;
+    if (message.role === "system") {
+      if (requestMessages.length > 0) requestMessages.push({ role: "user", content: `<system-reminder>\n${getAgentMessageText(message)}\n</system-reminder>` });
+      continue;
+    }
     if (message.role === "user" && message.content[0]?.type === "tool-result") {
-      appendToolResult(requestMessages, message.content[0]);
+      appendToolResult(requestMessages, message.content[0], imageData);
       continue;
     }
     if (message.role === "assistant") {
       requestMessages.push({ role: "assistant", content: createAssistantContent(message, tolerateUnsignedThinking) });
       continue;
     }
-    requestMessages.push({ role: "user", content: getAgentMessageText(message) });
+    if (message.content.some(function isImage(block) { return block.type === "image-ref"; })) {
+      const content: Anthropic.ContentBlockParam[] = message.content.map(function mapBlock(block): Anthropic.ContentBlockParam {
+        if (block.type === "text") return { type: "text", text: block.text };
+        if (block.type !== "image-ref" || !imageData?.[block.id]) throw new Error("会话图片不可用");
+        const image = imageData[block.id];
+        if (image.data.length > 5_242_880) throw new Error("图片编码超过发送上限");
+        return { type: "image", source: { type: "base64", media_type: image.mimeType, data: image.data } };
+      });
+      requestMessages.push({ role: "user", content });
+    } else requestMessages.push({ role: "user", content: getAgentMessageText(message) });
   }
   return requestMessages;
+}
+
+/**
+ * 显式缓存要求同一 Turn 内请求形状稳定：非 assistant 的字符串 content 统一改写为单个 text block，
+ * 使后续步骤回放历史时字节形状不变；空串保持原样（空 text block 不被协议接受）。
+ */
+function normalizeMessageContentForCache(messages: Anthropic.MessageParam[]): void {
+  for (const message of messages) {
+    if (typeof message.content !== "string" || message.content.length === 0) continue;
+    message.content = [{ type: "text", text: message.content }];
+  }
+}
+
+/**
+ * 只在协议允许的稳定前缀边界打缓存断点：最后一个工具定义、system 与对话前缀末尾（不超过三个断点）。
+ * 标记完全由请求内容确定性派生，不写入 canonical 历史，也不随步骤累积；
+ * 前缀稳定性由“历史只追加、不重写”保证，压缩重建历史后缓存自然转冷。
+ */
+function applyExplicitPromptCacheMarkers(request: Anthropic.MessageStreamParams): void {
+  const marker: Anthropic.CacheControlEphemeral = { type: "ephemeral" };
+  const lastTool = request.tools?.at(-1);
+  if (lastTool) lastTool.cache_control = marker;
+  if (typeof request.system === "string") {
+    if (request.system.length > 0) request.system = [{ type: "text", text: request.system, cache_control: marker }];
+  } else {
+    const lastSystemBlock = request.system?.at(-1);
+    if (lastSystemBlock?.type === "text") lastSystemBlock.cache_control = marker;
+  }
+  const lastMessage = request.messages.at(-1);
+  // 只标记以 user 结尾的请求（普通输入或 tool_result 批次）；assistant 结尾不是采样前的稳定边界。
+  if (!lastMessage || lastMessage.role !== "user" || !Array.isArray(lastMessage.content)) return;
+  const lastBlock = lastMessage.content.at(-1);
+  if (lastBlock?.type === "text" || lastBlock?.type === "tool_result" || lastBlock?.type === "image") lastBlock.cache_control = marker;
 }
 
 /** 将 V2 canonical 和冻结采样选项转换为 Anthropic SDK 请求。 */
@@ -242,17 +295,25 @@ export function createAnthropicMessagesRequest(
   sampleOptions: ModelSampleOptions,
   maxTokens: number,
   tolerateUnsignedThinking = false,
+  promptCacheMode: PromptCacheMode = "none",
+  imageData?: import("../../internal/kernel/model-sampler").ModelImageData,
 ): Anthropic.MessageStreamParams {
   const canonical = validateAgentMessages(messages);
-  const system = canonical.filter(function isSystemMessage(message) { return message.role === "system"; })
+  const firstConversation = canonical.findIndex(function isConversation(message) { return message.role !== "system"; });
+  const system = canonical.slice(0, firstConversation < 0 ? canonical.length : firstConversation).filter(function isSystemMessage(message) { return message.role === "system"; })
     .map(getAgentMessageText)
     .filter(Boolean)
     .join("\n\n");
   const effort = sampleOptions.reasoningEffort;
-  return {
+  // 合成工具调用（如视觉回退注入的 vision_analyze）没有可回传的 thinking；thinking 模式要求逐轮原样回传，
+  // 因此这类历史存在时对该请求关闭 thinking，避免 Provider 以 invalid_request 拒绝。
+  const hasSyntheticToolCall = canonical.some(function isSynthetic(message) {
+    return message.role === "assistant" && !message.adapterReplayState && message.content.some(function isCall(block) { return block.type === "tool-call"; });
+  });
+  const request = {
     model,
     max_tokens: maxTokens,
-    messages: createAnthropicConversationMessages(canonical, tolerateUnsignedThinking),
+    messages: createAnthropicConversationMessages(canonical, tolerateUnsignedThinking, imageData),
     stream: true,
     ...(system ? { system } : {}),
     ...(tools.length > 0 ? {
@@ -263,9 +324,15 @@ export function createAnthropicMessagesRequest(
     } : {}),
     ...(sampleOptions.toolChoice ? { temperature: 0 } : sampleOptions.temperature !== undefined ? { temperature: sampleOptions.temperature } : {}),
     ...(!sampleOptions.toolChoice && sampleOptions.topP !== undefined ? { top_p: sampleOptions.topP } : {}),
-    ...(sampleOptions.toolChoice ? { thinking: { type: "disabled" as const } } : sampleOptions.thinking === "enabled" ? { thinking: { type: "adaptive" as const } } : sampleOptions.thinking === "disabled" ? { thinking: { type: "disabled" as const } } : {}),
+    ...(sampleOptions.toolChoice || hasSyntheticToolCall ? { thinking: { type: "disabled" as const } } : sampleOptions.thinking === "enabled" ? { thinking: { type: "adaptive" as const } } : sampleOptions.thinking === "disabled" ? { thinking: { type: "disabled" as const } } : {}),
     ...(!sampleOptions.toolChoice && (effort === "low" || effort === "medium" || effort === "high" || effort === "max") ? { output_config: { effort } } : {}),
   } as Anthropic.MessageStreamParams;
+  // 只有受信能力目录显式声明 explicit 才改请求形状；server-auto/none/未知一律保持原样（透明降级）。
+  if (promptCacheMode === "explicit") {
+    normalizeMessageContentForCache(request.messages);
+    applyExplicitPromptCacheMarkers(request);
+  }
+  return request;
 }
 
 /** 将 Anthropic stop_reason 映射为 Kernel 的既有完成边界。 */
@@ -310,20 +377,44 @@ function extractAnthropicResult(message: Anthropic.Message, tolerateUnsignedThin
 }
 
 /** 将 SDK HTTP 错误映射为不含 Provider 原文的稳定 Agent 错误。 */
-function normalizeProviderError(error: unknown, signal?: AbortSignal): never {
+function normalizeProviderError(error: unknown, baseUrl: string | undefined, signal?: AbortSignal): never {
   if (error instanceof AgentSampleError || signal?.aborted) throw error;
   if (error instanceof APIError) {
-    if (error.status === 429) throw new AgentSampleError("供应商请求被限流", "PROVIDER_RATE_LIMIT");
-    if (error.status === 408) throw new AgentSampleError("供应商请求超时", "PROVIDER_TIMEOUT");
-    if (typeof error.status === "number" && error.status >= 500) throw new AgentSampleError(`供应商服务暂时不可用 (${error.status})`, "PROVIDER_SERVER_ERROR");
-    throw new AgentSampleError(`供应商拒绝请求（HTTP ${error.status ?? 0}）`, "PROVIDER_REQUEST_REJECTED");
+    const providerHttpStatus = Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : undefined;
+    const failure = normalizeProviderHttpFailure(baseUrl, providerHttpStatus, error.error);
+    const retryAfterMs = parseRetryAfterMs(error.headers?.get("retry-after"));
+    throw new AgentSampleError("供应商请求失败", failure.code, undefined, providerHttpStatus, failure.reason, failure.detail, retryAfterMs);
   }
   throw new AgentSampleError("无法连接模型供应商", "PROVIDER_CONNECTION");
 }
 
+/** 非负安全整数判定；浮点、负数或超大值都不作为可信计量。 */
+function isTokenCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/** 读取 Anthropic 缓存桶：缺失或 null 视为 0，出现非法值时该桶不可信。 */
+function readCacheTokenBucket(value: unknown): number | undefined {
+  if (value === undefined || value === null) return 0;
+  return isTokenCount(value) ? value : undefined;
+}
+
+/**
+ * 归一化 Anthropic usage：协议语义下 input_tokens 不含缓存读/写，三者之和才是本次请求的完整输入量，
+ * 每个 token 只计一次；任一桶非法时整份 usage 不可信，绝不生成部分锚点。
+ */
+function normalizeAnthropicUsage(usage: Anthropic.Usage): AgentSampleResult["usage"] | undefined {
+  const cacheCreation = readCacheTokenBucket(usage.cache_creation_input_tokens);
+  const cacheRead = readCacheTokenBucket(usage.cache_read_input_tokens);
+  if (cacheCreation === undefined || cacheRead === undefined) return undefined;
+  if (!isTokenCount(usage.input_tokens) || !isTokenCount(usage.output_tokens)) return undefined;
+  const inputTokens = usage.input_tokens + cacheCreation + cacheRead;
+  return { inputTokens, outputTokens: usage.output_tokens, contextTokens: inputTokens + usage.output_tokens };
+}
+
 /** 创建只接收 V2 canonical 的 Anthropic Messages ModelSampler。 */
 export function createAnthropicMessagesSampler(input: CreateAnthropicMessagesSamplerInput): ModelSampler {
-  const { baseUrl, apiKey, authMode = "api_key", timeoutMs, sampleOptions, behaviorProfile = createDefaultModelBehaviorProfile() } = input;
+  const { baseUrl, apiKey, authMode = "api_key", timeoutMs, sampleOptions, behaviorProfile = createDefaultModelBehaviorProfile(), promptCacheMode = "none" } = input;
   // 非官方兼容网关的 thinking 可能缺签名且不支持 redacted_thinking：提取与回放都启用容忍开关。
   const tolerateUnsignedThinking = !isOfficialAnthropicBaseUrl(baseUrl);
   return {
@@ -340,7 +431,7 @@ export function createAnthropicMessagesSampler(input: CreateAnthropicMessagesSam
       });
       try {
         const stream = client.messages.stream(
-          createAnthropicMessagesRequest(model, messages, tools, { ...sampleOptions, toolChoice: options.toolChoice }, options.maxTokens ?? sampleOptions.maxTokens ?? 8_192, tolerateUnsignedThinking),
+          createAnthropicMessagesRequest(model, messages, tools, { ...sampleOptions, toolChoice: options.toolChoice }, options.maxTokens ?? sampleOptions.maxTokens ?? 8_192, tolerateUnsignedThinking, promptCacheMode, options.imageData),
           { signal: options.signal },
         );
         stream.on("text", function collectTextDelta(delta) {
@@ -355,18 +446,15 @@ export function createAnthropicMessagesSampler(input: CreateAnthropicMessagesSam
         if (message.stop_reason === "max_tokens" && result.toolCalls.length === 0) {
           throw new AgentSampleError("模型输出达到上限，未形成完整可执行结果", "MODEL_OUTPUT_LIMIT");
         }
-        const inputTokens = message.usage.input_tokens;
-        const outputTokens = message.usage.output_tokens;
+        const usage = normalizeAnthropicUsage(message.usage);
         return {
           ...result,
           reasoningSummary: result.toolCalls.length > 0 ? `模型请求调用 ${result.toolCalls.map(function getToolName(call) { return call.name; }).join("、")}` : "模型已完成当前步骤判断",
           finishReason: normalizeFinishReason(message.stop_reason),
-          ...(Number.isSafeInteger(inputTokens) && Number.isSafeInteger(outputTokens) && inputTokens >= 0 && outputTokens >= 0
-            ? { usage: { inputTokens, outputTokens, contextTokens: inputTokens + outputTokens } }
-            : {}),
+          ...(usage ? { usage } : {}),
         };
       } catch (error) {
-        normalizeProviderError(error, options.signal);
+        normalizeProviderError(error, baseUrl, options.signal);
       }
     },
   };

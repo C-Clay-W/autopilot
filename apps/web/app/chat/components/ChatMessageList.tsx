@@ -6,6 +6,7 @@ import PinnedSkillsBar from "./PinnedSkillsBar";
 import KnowledgeIngestProgress from "./KnowledgeIngestProgress";
 import ActivityIndicator from "./ActivityIndicator";
 import ChatMessageItem from "./ChatMessageItem";
+import type { UiContinuation } from "./interactive-ui/continue-chat";
 import type { ProcessStep } from "./process-step";
 import type { UserQuestionAnswerDraft } from "./AskUserQuestionCard";
 import type { AgentPresentationState, ApprovalItem, UserQuestionItem } from "@autopilot-agent/presentation";
@@ -17,8 +18,10 @@ import type { WebActivityState } from "@/lib/runtime-host/web-activity";
 import type { AgentStorageQuotaView } from "./StorageQuotaPanel";
 import type { WorkspaceSummary } from "../session-task-context";
 import { recordWebPerformanceDiagnostic } from "@/lib/runtime-host/web-performance-diagnostics";
+import { getTurnPresentationMessageIds } from "../chat-message-state";
 
 interface ChatMessageListProps {
+  uiContinuation?: UiContinuation;
   isChat: boolean;
   messages: Message[];
   sessionId: string;
@@ -69,7 +72,7 @@ interface ChatMessageListProps {
 }
 
 /** 渲染消息滚动容器与浮动提示；所有状态与动作由装配层注入。 */
-function ChatMessageList({ isChat, messages, sessionId, loading, submissionActivity, currentRetrieval, knowledgeProgress, pinnedSkills, getSkillDisplayName, togglePinnedSkill, storageQuota, setStorageQuotaPanelOpen, presentation, refreshTransport, isPinned, unreadCount, showLatest, pendingApproval, pendingUserQuestion, focusPendingApproval, focusPendingUserQuestion, containerRef, contentRef, handleScroll, workspaceId, workspace, canWrite, showProcess, renderEvidence, activity, setRequestedJobId, handleApproval, handleUserQuestion, cancelCurrentTurn, handleContinueTurn, stopping, editingPrompt, setEditingPrompt, handleResendEditedPrompt, handleCopyMessage, copiedMessageId, handleEditPrompt, setSelectedImage, readOnlyReason, workPreview }: ChatMessageListProps) {
+function ChatMessageList({ isChat, messages, sessionId, loading, submissionActivity, currentRetrieval, knowledgeProgress, pinnedSkills, getSkillDisplayName, togglePinnedSkill, storageQuota, setStorageQuotaPanelOpen, presentation, refreshTransport, isPinned, unreadCount, showLatest, pendingApproval, pendingUserQuestion, focusPendingApproval, focusPendingUserQuestion, containerRef, contentRef, handleScroll, workspaceId, workspace, canWrite, showProcess, renderEvidence, activity, setRequestedJobId, handleApproval, handleUserQuestion, cancelCurrentTurn, handleContinueTurn, stopping, editingPrompt, setEditingPrompt, handleResendEditedPrompt, handleCopyMessage, copiedMessageId, handleEditPrompt, setSelectedImage, readOnlyReason, workPreview, uiContinuation }: ChatMessageListProps) {
   const previousPresentationRef = useRef(presentation);
   useLayoutEffect(function recordPresentationCommit() {
     if (previousPresentationRef.current === presentation) return;
@@ -77,6 +80,7 @@ function ChatMessageList({ isChat, messages, sessionId, loading, submissionActiv
     recordWebPerformanceDiagnostic("presentation_commit", "presentation");
   }, [presentation]);
 
+  const turnPresentationMessageIds = getTurnPresentationMessageIds(messages);
   return (
     <div className="relative min-h-0 flex-1">
       <div ref={containerRef} onScroll={handleScroll} className="h-full overflow-y-auto px-4 py-6" aria-label="对话消息">
@@ -101,13 +105,21 @@ function ChatMessageList({ isChat, messages, sessionId, loading, submissionActiv
            submissionActivity === "upload"
              ? isChat && currentRetrieval === "rag"
                ? <KnowledgeIngestProgress steps={knowledgeProgress.length ? knowledgeProgress : [{ stage: "upload", message: "正在准备上传文件" }]} />
-               : <p role="status" className="border-2 border-ink bg-card px-4 py-3 text-sm">{isChat ? "正在上传临时附件，上传完成后开始问答" : "正在上传任务图片"}</p>
+               : isChat
+                 ? <p role="status" className="border-2 border-ink bg-card px-4 py-3 text-sm">正在上传临时附件，上传完成后开始问答</p>
+                 : <div role="status" className="w-64 max-w-full border-2 border-ink bg-card px-3 py-2 text-sm">
+                     <p>正在上传并处理图片</p>
+                     <div role="progressbar" aria-label="图片上传处理中" className="mt-2 h-1 overflow-hidden bg-ink/10">
+                       <div className="h-full w-1/3 animate-pulse bg-accent motion-reduce:animate-none" />
+                     </div>
+                   </div>
              : <ActivityIndicator running />
          )}
-         {messages.map((msg) => (
+        {messages.map((msg) => (
           <ChatMessageItem
             key={msg.id}
             msg={msg}
+            showTurnPresentation={!msg.turnId || turnPresentationMessageIds.has(msg.id)}
             workspaceId={workspaceId}
             workspace={workspace}
             sessionId={sessionId}
@@ -134,6 +146,7 @@ function ChatMessageList({ isChat, messages, sessionId, loading, submissionActiv
             handleEditPrompt={handleEditPrompt}
             setSelectedImage={setSelectedImage}
             workPreview={workPreview}
+            uiContinuation={uiContinuation}
           />
         ))}
         </div>
@@ -200,7 +213,8 @@ function areChatMessageListPropsEqual(previous: ChatMessageListProps, next: Chat
     && previous.editingPrompt === next.editingPrompt
   && previous.copiedMessageId === next.copiedMessageId
   && previous.readOnlyReason === next.readOnlyReason
-  && previous.workPreview === next.workPreview;
+  && previous.workPreview === next.workPreview
+  && previous.uiContinuation === next.uiContinuation;
 }
 
 export default memo(ChatMessageList, areChatMessageListPropsEqual);

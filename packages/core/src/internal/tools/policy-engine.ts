@@ -38,7 +38,7 @@ export class PolicyEngine {
    * 旧 program: 宽约束一律不命中（同程序不同参数、不同 cwd 必须重新判断）。
    */
   canUsePersistentGrant(context: ToolExecutionContext, facts: ToolActionFacts): boolean {
-    if (facts.requiresApproval !== true || facts.toolName === "stop_background_job") return false;
+    if (facts.requiresApproval !== true || facts.toolName === "stop_background_job" || facts.toolName === "resume_thread") return false;
     // 集合声明（工作区与外部）必须逐次审批：旧集合 grant 不能静默放行后续的新清单声明（增量要用户明确确认）。
     if (isTaskFileSetDeclarationConstraint(facts.stableConstraint)) return false;
     if (context.permissionMode === "ask" && facts.toolName === "run_command") return isWorkspaceCommandConstraint(facts.stableConstraint);
@@ -93,6 +93,8 @@ export class PolicyEngine {
         allowedApprovalDecisions: ["allow_once", "deny"],
       };
     }
+    // 用户暂停属于显式控制边界；全权限、自动批准与持久 grant 都不能代替恢复确认。
+    if (facts.toolName === "resume_thread") return { decision: "approval_required", reason: facts.approval?.reason ?? "恢复暂停任务需要确认", ...base, allowedApprovalDecisions: ["allow_once", "deny"] };
     if (!facts.requiresApproval) return { decision: "allow", reason: facts.approval?.reason ?? "本地策略确认该操作为只读", ...base };
     // Talk-Plan1013 Stage5 R5：外部读取 ask 逐次询问——先于 grant 与任何权限模式分支，
     // allowedDecisions 收窄为单次允许/拒绝，不写任何持久规则，full_access 也不能跳过。

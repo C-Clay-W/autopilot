@@ -34,10 +34,15 @@ export type {
 } from "./internal/types";
 
 export type { AgentCompactionResult, AgentInjectedInput, AgentInputInboxCapability, AgentLease, AgentRunInput, RagCapability } from "./internal/agent-runtime";
+export type { UiDocument } from "./ui/document";
 export type { CreateDatabaseSearchCapabilityOptions, DatabaseAggregationKeyword, DatabaseFilterOperatorKeyword, DatabaseQueryPlan, DatabaseQueryPlannerInput, DatabaseQueryProfile, DatabaseSearchCapability, DatabaseSearchPolicy, DatabaseSearchRequest, DatabaseSearchResult, RagSourcePolicy } from "./internal/database-search";
 
 // ── Runtime 公开 Facade（Phase 2 / Phase 3）───────────
 export { createAgentRuntime } from "./runtime/public";
+export { normalizeWorkImage } from "./internal/lib/image-normalization";
+export { getAgentProviderFailureMessage, sanitizeAgentProviderFailureReason, sanitizeAgentProviderFailureDetail } from "./runtime/provider/provider-failure-guidance";
+export { normalizeLegacyProviderFailureReason } from "./runtime/provider/provider-failure-normalization";
+export type { AgentProviderFailureReason } from "./runtime/provider/provider-failure-guidance";
 export { JOB_RECORD_VERSION, normalizeJobServiceUrl, jobServicePort, sameServiceOrigin } from "./runtime/domain";
 export type { AgentRuntime, AgentRuntimeFacade, CreateAgentRuntimeOptions } from "./runtime/public";
 export type {
@@ -97,6 +102,7 @@ export type {
   InboxDelivery,
   InboxStatus,
   InboxBoundary,
+  InboxOrigin,
   InboxAttachmentRef,
   InboxSkillRef,
   PostInboxInput,
@@ -105,6 +111,7 @@ export type {
   ConsumeInboxInput,
   ListInboxInput,
 } from "./runtime/domain";
+export { inboxOriginKey } from "./runtime/domain/input-inbox";
 export type {
   AgentEvent,
   AgentEventEnvelope,
@@ -199,6 +206,8 @@ export type {
   JobStoreWriteCondition,
   FileMutationStore,
   SessionResourceStore,
+  SessionImageStore,
+  SessionImageRef,
   UserQuestionStore,
   GetUserQuestionInput,
   SaveUserQuestionAnswerInput,
@@ -239,6 +248,7 @@ export {
 export type { ExternalFileOperation, ParsedExternalPermissionRule } from "./runtime/domain";
 export type { ProjectService } from "./runtime/application/project-service";
 export type { SessionService, CreateSessionInput } from "./runtime/application/session-service";
+export type { SessionDirectoryPage, SessionDirectoryQuery, SessionDirectoryEntry } from "./runtime/ports/session-store";
 export type { TurnService, TurnState } from "./runtime/application/turn-service";
 export type { ApprovalService } from "./runtime/application/approval-service";
 export type { InputInboxService } from "./runtime/application/input-inbox-service";
@@ -283,6 +293,7 @@ export {
 export type {
   CreateFirstPartyModelSamplerInput,
   ModelCapability,
+  PromptCacheMode,
   VisionAnalyzer,
   FirstPartyEffortSource,
   ResolvedFirstPartyModelSample,
@@ -316,6 +327,8 @@ export type {
   ContextUsageCategoryView,
   ContextUsageView,
 } from "./internal/kernel/context-budget";
+// Turn 累计用量安全展示 DTO：只导出类型与只读查询产出的视图，不导出私有 runtimeBudget 与投影实现。
+export type { TurnUsageSummaryView } from "./internal/kernel/turn-usage";
 
 // ── Runtime Bootstrap / Trust（Phase 2.5）───────────
 export {
@@ -743,3 +756,22 @@ export type { ExternalFileApproval } from "./runtime/domain/external-permissions
 export type { SandboxDegradeApproval } from "./runtime/domain/sandbox-policy";
 export type { ChatCapability, ChatCapabilityBinding, ChatAttachmentGrant, ChatKnowledgeCapability, ChatRagEvidence, ChatRagEvidenceBatch } from "./runtime/protocol/chat-capability";
 export type { WorkPreviewCapability, WorkPreviewPrepareRequest, WorkPreviewPrepareResult, WorkPreviewOpenWhen } from "./runtime/protocol/work-preview-capability";
+
+// 会话协作持久化基础类型。
+export { sanitizeContinuationFailure } from "./runtime/domain/thread-collaboration";
+export type { ThreadActor, ThreadEventActor, ThreadGroup, ThreadMember, ThreadReceipt, ThreadCreateIntent, ThreadControl, ThreadMessage, ThreadEvent, ThreadDelivery, ThreadDeliveryReason, ThreadControlIntent, ThreadHandoffInput, ThreadHandoffRef, ThreadProgressEntry, ThreadProgressKind } from "./runtime/domain/thread-collaboration";
+export type { ThreadStore } from "./runtime/ports/thread-store";
+// 显式交接文档 Port：Core 只定义契约，Node/Web/CLI 由受信宿主注入实现。
+export type { ThreadHandoffDocumentInput, ThreadHandoffDocument, ThreadHandoffWriter } from "./runtime/ports/thread-handoff";
+
+export type { ThreadHostContext, ThreadFacade, WaitResult, WaitTargetResult, ThreadProgressView } from "./runtime/application/thread-service";
+export { ThreadServiceError, createThreadFacade } from "./runtime/application/thread-service";
+// 受信宿主注入的协作范围与绑定后的 Agent 工具能力；组、父会话与 actor 不来自模型参数。
+export type { ThreadsCapability } from "./runtime/protocol/threads-capability";
+export type { AgentThreadsCapability, AgentThreadMemberView, AgentThreadMessageView, AgentThreadReadResult, AgentThreadProgressPage } from "./runtime/application/thread-tool-binding";
+// 宿主持有的协作投递/恢复服务：领取、桥接、收敛与跨进程中断意图。
+export { createThreadDeliveryService } from "./runtime/application/thread-delivery-service";
+export type { ThreadDeliveryHostContext, ThreadDeliveryService, ThreadStartDelivery, ThreadReconcileResult } from "./runtime/application/thread-delivery-service";
+// 所有宿主共用的只读执行/交互安全投影，不进行状态恢复或工具重放。
+export { readTurnExecutionView } from "./runtime/application/turn/turn-execution-view";
+export type { TurnExecutionView } from "./runtime/application/turn/turn-execution-view";

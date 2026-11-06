@@ -94,6 +94,8 @@ export class BoundedOutputBuffer {
   get byteLength(): number { return this.totalBytes; }
   /** 返回当前仍可按原始字节 cursor 读取的最早位置。 */
   get retainedStartCursor(): number { return this.truncated ? this.totalBytes - this.tailBytes : 0; }
+  /** 返回当前全部已接收字节；仅在未截断时可按原始顺序完整重建，用于首次溢出前落盘。 */
+  toBuffer(): Buffer { return this.readFullBuffer(); }
   /** 返回受限 UTF-8 输出。 */
   toString(): string {
     if (!this.truncated) {

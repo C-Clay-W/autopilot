@@ -37,10 +37,8 @@ export function renderTimeline(events: CliTuiTimelineEvent[], useColor: boolean,
 
   function flushAnswer(): void {
     if (!answer) return;
-    const isFirstAnswer = answerSeq === 0;
     nodes.push(
       <Box key={"answer:" + String(answerSeq++)} flexDirection="column">
-        {isFirstAnswer && timing?.thoughtDurationMs !== undefined ? <Text dimColor={useColor}>Thought for {formatTuiDuration(timing.thoughtDurationMs)}</Text> : null}
         <Text bold color={useColor ? TUI_ACCENT_COLOR : undefined}>• {TUI_AGENT_LABEL}</Text>
         <TuiMarkdown content={answer} keyPrefix={"answer:" + String(answerSeq)} useColor={useColor} maximumWidth={maximumWidth} />
       </Box>,

@@ -26,12 +26,12 @@ const internalEntries = [
 ];
 
 /** 构造保持旧产物布局的 esbuild 配置，避免破坏动态 require。 */
-function createBuildOptions(entryPoint, outfile, format, external = []) {
+function createBuildOptions(entryPoint, outfile, format, external = [], platform = "node") {
   return {
     entryPoints: [resolve(sourceRoot, entryPoint)],
     outfile: resolve(distRoot, outfile),
     bundle: true,
-    platform: "node",
+    platform,
     format,
     minify: !isDev,
     legalComments: "none",
@@ -77,10 +77,14 @@ async function buildAll() {
   buildTypes();
 
   const entries = [
-    createBuildOptions("index.ts", "index.mjs", "esm", ["@lancedb/*", "mysql2/*"]),
-    createBuildOptions("index.ts", "index.js", "cjs", ["@lancedb/*", "mysql2/*"]),
+    createBuildOptions("index.ts", "index.mjs", "esm", ["@lancedb/*", "mysql2/*", "@napi-rs/canvas"]),
+    createBuildOptions("index.ts", "index.js", "cjs", ["@lancedb/*", "mysql2/*", "@napi-rs/canvas"]),
     createBuildOptions("experimental/index.ts", "experimental/index.mjs", "esm", ["@lancedb/*", "mysql2/*"]),
     createBuildOptions("experimental/index.ts", "experimental/index.js", "cjs", ["@lancedb/*", "mysql2/*"]),
+    createBuildOptions("failure.ts", "failure.mjs", "esm", [], "browser"),
+    createBuildOptions("failure.ts", "failure.js", "cjs", [], "browser"),
+    createBuildOptions("ui/index.ts", "ui/index.mjs", "esm", ["zod", "zod/*"], "browser"),
+    createBuildOptions("ui/index.ts", "ui/index.js", "cjs", ["zod", "zod/*"], "browser"),
     createBuildOptions("lancedb-cli.ts", "lancedb-cli.js", "cjs", ["@lancedb/*"]),
     ...internalEntries.map(([entryPoint, outfile, external]) => createBuildOptions(entryPoint, outfile, "cjs", external)),
   ];
@@ -99,8 +103,8 @@ async function buildAll() {
 async function watchAll() {
   await buildAll();
   const entries = [
-    createBuildOptions("index.ts", "index.mjs", "esm", ["@lancedb/*"]),
-    createBuildOptions("index.ts", "index.js", "cjs", ["@lancedb/*"]),
+    createBuildOptions("index.ts", "index.mjs", "esm", ["@lancedb/*", "@napi-rs/canvas"]),
+    createBuildOptions("index.ts", "index.js", "cjs", ["@lancedb/*", "@napi-rs/canvas"]),
   ];
   await Promise.all(entries.map(async (options) => {
     const buildContext = await context(options);

@@ -12,6 +12,7 @@ import type { RuntimePorts } from "../ports";
 import type { Session, SessionPersistenceMode, SessionRunConfig } from "../domain";
 import { AgentRuntimeError as RuntimeError } from "../protocol";
 import type { InternalJobService, JobService } from "./job-service";
+import type { SessionDirectoryPage, SessionDirectoryQuery } from "../ports/session-store";
 
 /** SessionService 接口。 */
 export interface SessionService {
@@ -20,6 +21,9 @@ export interface SessionService {
 
   /** 列出当前宿主可见的全部 Session。 */
   list(): Promise<Session[]>;
+
+  /** 按Project分页读取标题与UUID，不读取正文或触发恢复。 */
+  listDirectoryPage(query: SessionDirectoryQuery): Promise<SessionDirectoryPage>;
 
   /** 根据 ID 读取 Session。 */
   get(id: string): Promise<Session | null>;
@@ -55,6 +59,7 @@ export function createSessionService(ports: RuntimePorts, jobService?: JobServic
   return {
     create,
     list,
+    listDirectoryPage,
     get,
     save,
     setDefaultRunConfig,
@@ -64,40 +69,7 @@ export function createSessionService(ports: RuntimePorts, jobService?: JobServic
 
   /** 创建前校验身份及 ID；旧 Work 调用方缺省 projectId 时只复用宿主绑定工作区。 */
   async function create(input: CreateSessionInput): Promise<Session> {
-    const productMode = input.productMode === undefined ? "work" : input.productMode;
-    let projectId = input.projectId;
-    if (productMode === "work" && !projectId && input.productMode === undefined && input.chatRetrievalMode === undefined) {
-      const workspaceRoot = await ports.workspaceAdapter.resolveWorkspaceRoot();
-      if (!workspaceRoot) throw new RuntimeError("WORKSPACE_REQUIRED", "Work 需要有效工作区归属");
-      /** 只复用宿主当前工作区对应的 Project，缺失时再创建。 */
-      const project = (await ports.projectStore.list()).find(function matchesWorkspace(item) { return item.workspaceRoot === workspaceRoot; })
-        ?? await ports.projectStore.create({ name: "Workspace", workspaceRoot });
-      projectId = project.id;
-    }
-    readSessionIdentity({ productMode, chatRetrievalMode: input.chatRetrievalMode, projectId });
-    if (productMode === "work") {
-      const project = await ports.projectStore.get(projectId!);
-      const workspaceRoot = await ports.workspaceAdapter.resolveWorkspaceRoot();
-      if (!project || project.workspaceRoot !== workspaceRoot) throw new RuntimeError("WORKSPACE_REQUIRED", "Work 必须归属当前宿主工作区 Project");
-    }
-    if (input.id && await ports.sessionStore.get(input.id)) throw new RuntimeError("SESSION_MODE_MISMATCH", "Session ID 已存在，不能覆盖身份");
-    const now = ports.clock.now();
-    const session: Session = {
-      id: input.id ?? randomUUID(),
-      productMode,
-      ...(productMode === "work" ? { workContextVersion: 1 as const } : {}),
-      chatRetrievalMode: input.chatRetrievalMode,
-      projectId,
-      persistenceMode: input.persistenceMode ?? "durable",
-      status: "idle",
-      title: input.title,
-      defaultRunConfig: input.defaultRunConfig,
-      createdAt: now,
-      updatedAt: now,
-      schemaVersion: 1,
-    };
-    await ports.sessionStore.save(session);
-    return structuredClone(session);
+    return createSessionRecord(ports, input);
   }
 
   /** 读取列表时只校验身份并返回副本，不执行旧数据迁移。 */
@@ -105,6 +77,13 @@ export function createSessionService(ports: RuntimePorts, jobService?: JobServic
     const sessions = await ports.sessionStore.list();
     for (const session of sessions) readSessionIdentity(session);
     return structuredClone(sessions);
+  }
+
+  /** 只调用明确提供的目录能力，旧适配器不偷偷降级为全量list。 */
+  async function listDirectoryPage(query: SessionDirectoryQuery): Promise<SessionDirectoryPage> {
+    if (!Number.isInteger(query.limit) || query.limit < 1 || query.limit > 100 || !query.projectId.trim()) throw new RuntimeError("INVALID_INPUT", "目录分页参数无效");
+    if (!ports.sessionStore.listDirectoryPage) throw new RuntimeError("INVALID_INPUT", "当前存储不支持轻量会话目录");
+    return structuredClone(await ports.sessionStore.listDirectoryPage(query));
   }
 
   /** 返回隔离副本，避免内存 Store 被调用方先修改再绕过 save 校验。 */
@@ -123,6 +102,9 @@ export function createSessionService(ports: RuntimePorts, jobService?: JobServic
     if (!stored) throw new RuntimeError("SESSION_NOT_FOUND", "Session 不存在");
     const identity = readSessionIdentity(stored);
     const next = readSessionIdentity(session);
+    if (JSON.stringify(stored.collaborationAllowedTools) !== JSON.stringify(session.collaborationAllowedTools)) throw new RuntimeError("SESSION_MODE_MISMATCH", "协作能力上限不可修改");
+    if (JSON.stringify(stored.creationSource) !== JSON.stringify(session.creationSource)) throw new RuntimeError("SESSION_MODE_MISMATCH", "Session 创建来源不可修改");
+    if (stored.collaborationCreationId !== session.collaborationCreationId) throw new RuntimeError("SESSION_MODE_MISMATCH", "Session 协作创建身份不可修改");
     if (stored.workContextVersion !== session.workContextVersion) throw new RuntimeError("SESSION_MODE_MISMATCH", "Session 来源版本不可修改");
     if (identity.productMode !== next.productMode || (stored.projectId !== undefined && stored.projectId !== session.projectId)) {
       throw new RuntimeError("SESSION_MODE_MISMATCH", "Session 产品模式与归属不可修改");
@@ -162,6 +144,14 @@ export function createSessionService(ports: RuntimePorts, jobService?: JobServic
 
   /** 先清理宿主资源，再级联删除 Runtime 状态。 */
   async function deleteSession(id: string): Promise<boolean> {
+    return ports.threadStore.withSessionLock(id, async function deleteWithThreadLock() {
+      if (await ports.threadStore.hasMembership(id)) throw new RuntimeError("THREAD_HAS_PENDING_WORK", "Session 仍被协作组引用");
+      return deleteWithJobLock(id);
+    });
+  }
+
+  /** 组合既有 Job 锁，避免资源清理和新 Job 并发。 */
+  async function deleteWithJobLock(id: string): Promise<boolean> {
     if (jobService && "withSessionLock" in jobService) {
       return (jobService as InternalJobService).withSessionLock(id, function deleteWithJobLock() { return deleteInsideLock(id); });
     }
@@ -192,4 +182,54 @@ export function createSessionService(ports: RuntimePorts, jobService?: JobServic
     await ports.userQuestionStore.deleteBySession(id);
     return ports.sessionStore.delete(id);
   }
+}
+
+/** 仅供已鉴权 ThreadService 调用的内部创建入口；不注册公开 facade，不接受模型或 HTTP 自报来源。 */
+export async function createSessionForThread(ports: RuntimePorts, input: CreateSessionInput & { id: string }, creation: { creationId: string; source: NonNullable<Session["creationSource"]> }): Promise<Session> {
+  return createSessionRecord(ports, input, creation);
+}
+
+/** 普通与 Thread 创建共用身份/Project/配置规则；协作意图只增加原子幂等与可信来源。 */
+async function createSessionRecord(ports: RuntimePorts, input: CreateSessionInput, creation?: { creationId: string; source: NonNullable<Session["creationSource"]> }): Promise<Session> {
+  const productMode = input.productMode === undefined ? "work" : input.productMode;
+  let projectId = input.projectId;
+  if (productMode === "work" && !projectId && input.productMode === undefined && input.chatRetrievalMode === undefined) {
+    const workspaceRoot = await ports.workspaceAdapter.resolveWorkspaceRoot();
+    if (!workspaceRoot) throw new RuntimeError("WORKSPACE_REQUIRED", "Work 需要有效工作区归属");
+    /** 只复用宿主当前工作区对应的 Project，缺失时再创建。 */
+    const project = (await ports.projectStore.list()).find(function matchesWorkspace(item) { return item.workspaceRoot === workspaceRoot; })
+      ?? await ports.projectStore.create({ name: "Workspace", workspaceRoot });
+    projectId = project.id;
+  }
+  readSessionIdentity({ productMode, chatRetrievalMode: input.chatRetrievalMode, projectId });
+  if (productMode === "work") {
+    const project = await ports.projectStore.get(projectId!);
+    const workspaceRoot = await ports.workspaceAdapter.resolveWorkspaceRoot();
+    if (!project || project.workspaceRoot !== workspaceRoot) throw new RuntimeError("WORKSPACE_REQUIRED", "Work 必须归属当前宿主工作区 Project");
+  }
+  if (!creation && input.id && await ports.sessionStore.get(input.id)) throw new RuntimeError("SESSION_MODE_MISMATCH", "Session ID 已存在，不能覆盖身份");
+  const now = ports.clock.now();
+  const session: Session = {
+    id: input.id ?? randomUUID(),
+    ...(creation ? { collaborationCreationId: creation.creationId, creationSource: structuredClone(creation.source) } : {}),
+    productMode,
+    ...(productMode === "work" ? { workContextVersion: 1 as const } : {}),
+    chatRetrievalMode: input.chatRetrievalMode,
+    projectId,
+    persistenceMode: input.persistenceMode ?? "durable",
+    status: "idle",
+    title: input.title,
+    defaultRunConfig: input.defaultRunConfig,
+    createdAt: now,
+    updatedAt: now,
+    schemaVersion: 1,
+  };
+  if (creation) {
+    if (!await ports.sessionStore.createIfAbsent(session)) {
+      const existing = await ports.sessionStore.get(session.id);
+      if (!existing || existing.collaborationCreationId !== creation.creationId || JSON.stringify(existing.creationSource) !== JSON.stringify(creation.source) || existing.productMode !== session.productMode || existing.projectId !== session.projectId) throw new RuntimeError("SESSION_MODE_MISMATCH", "Session 创建身份冲突");
+      return structuredClone(existing);
+    }
+  } else await ports.sessionStore.save(session);
+  return structuredClone(session);
 }

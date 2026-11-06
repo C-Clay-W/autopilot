@@ -6,7 +6,9 @@
  */
 
 import { getWorkHistoryRestriction } from "./work-history-boundary";
+import { readTurnExecutionView } from "./turn-execution-view";
 import { projectPublicContextUsage, type ContextUsageView } from "../../../internal/kernel/context-budget";
+import { buildTurnUsageSummary, projectPublicTurnUsageSummary, type TurnUsageSummaryView } from "../../../internal/kernel/turn-usage";
 import type { AgentCheckpoint, AgentEventEnvelope, FrozenRunConfigView, PublicCheckpointView, RecoverableTurnView } from "../../protocol";
 import { AgentRuntimeError as RuntimeError } from "../../protocol";
 import { sanitizeCheckpoint, sanitizeEventForExternal } from "../../protocol/sanitize-checkpoint";
@@ -48,6 +50,10 @@ export interface TurnRecoveryService {
   getFrozenRunConfig(input: { sessionId: string; turnId?: string }): Promise<FrozenRunConfigView | null>;
   /** 只读返回最新私有 checkpoint 的安全 Context Usage 快照；无数据时为 null。 */
   getContextUsage(input: { sessionId: string; turnId?: string }): Promise<ContextUsageView | null>;
+  /** 只读返回最新私有 checkpoint 的 Turn 累计用量汇总；无数据时为 null，宿主不得自行重算。 */
+  getTurnUsageSummary(input: { sessionId: string; turnId?: string }): Promise<TurnUsageSummaryView | null>;
+  /** 同一次checkpoint读取投影上下文与累计用量，避免宿主重复读取。 */
+  getUsageSnapshot(input: { sessionId: string; turnId?: string }): Promise<{ contextUsage: ContextUsageView | null; turnUsage: TurnUsageSummaryView | null }>;
   getContinuation(sessionId: string, turnId: string | undefined): Promise<RecoverableContinuation>;
 }
 
@@ -197,7 +203,7 @@ export function createTurnRecoveryService(
       : await ports.turnStore.getLatest(input.sessionId);
     const session = await ports.sessionStore.get(input.sessionId);
     const readOnlyReason = session ? await getWorkHistoryRestriction(ports, session) : undefined;
-    const checkpoint = readOnlyReason ? await ports.checkpointStore.getLatest(input.sessionId) : await recoverCheckpoint(input.sessionId);
+    const checkpoint = await ports.checkpointStore.getLatest(input.sessionId);
     if (readOnlyReason) return null;
     const selectedTurnId = input.turnId ?? checkpoint?.turnId ?? turn?.id;
     if (!selectedTurnId) return null;
@@ -205,11 +211,12 @@ export function createTurnRecoveryService(
     if (checkpoint && checkpoint.turnId !== selectedTurnId) return null;
 
     const events = (await ports.transcriptStore.getEvents(input.sessionId)).filter((event) => event.turnId === selectedTurnId);
-    const approvalEvent = [...events].reverse().find((envelope) => envelope.event.type === "approval_required");
+    const executionView = await readTurnExecutionView(ports, input);
+    const approvalEvent = executionView?.interaction?.state === "pending" || executionView?.interaction?.state === "decided" ? executionView.interaction.approval : undefined;
     const safetyBudgetMigration = turn && checkpoint ? assessSafetyBudgetMigration(turn, checkpoint) : undefined;
     const status = safetyBudgetMigration?.terminalizeCheckpoint
       ? "failed"
-      : checkpoint?.status ?? mapTurnStatus(turn?.status);
+      : executionView?.execution === "lost" || executionView?.execution === "unconfirmed" ? "interrupted_recoverable" : executionView?.execution === "active" ? "running" : checkpoint?.status ?? mapTurnStatus(turn?.status);
     if (!status) return null;
     const recoverable = isContinuableStatus(status);
     const terminalEvent = isTerminalStatus(status)
@@ -238,8 +245,11 @@ export function createTurnRecoveryService(
       turnId: selectedTurnId,
       status: mapRecoverableStatus(status),
       recoverable,
+      execution: executionView?.execution,
+      interactionState: executionView?.interaction?.state,
+      warning: executionView?.warning,
       ...(termination ? { termination } : {}),
-      approval: checkpoint?.status === "awaiting_approval" && approvalEvent?.event.type === "approval_required"
+      approval: checkpoint?.status === "awaiting_approval" && approvalEvent?.event.type === "approval_required" && Date.parse(approvalEvent.event.result.approval.expiresAt) > ports.clock.now()
         ? {
             approvalId: approvalEvent.event.result.approval.approvalId,
             toolName: approvalEvent.event.toolName,
@@ -280,6 +290,27 @@ export function createTurnRecoveryService(
     if (input.turnId && checkpoint.turnId !== input.turnId) return null;
     // 出口统一走白名单投影：非法 DTO fail closed 为 null，不把对象形状当可信输入。
     return projectPublicContextUsage(checkpoint.contextUsage);
+  }
+
+  /**
+   * 只读返回最新私有 checkpoint 的 Turn 累计用量汇总（累计输入/输出/总量与执行段耗时）；
+   * 数字来自 Kernel 同一 runtimeBudget 累计点，不触发恢复副作用，宿主不得自行重算。
+   */
+  async function getTurnUsageSummary(input: { sessionId: string; turnId?: string }): Promise<TurnUsageSummaryView | null> {
+    const checkpoint = await ports.checkpointStore.getLatest(input.sessionId);
+    if (!checkpoint) return null;
+    if (input.turnId && checkpoint.turnId !== input.turnId) return null;
+    return projectPublicTurnUsageSummary(buildTurnUsageSummary({ turnId: checkpoint.turnId, runtimeBudget: checkpoint.runtimeBudget }));
+  }
+
+  /** 同一checkpoint一次读取后复用两个既有白名单投影，不暴露私有状态。 */
+  async function getUsageSnapshot(input: { sessionId: string; turnId?: string }): Promise<{ contextUsage: ContextUsageView | null; turnUsage: TurnUsageSummaryView | null }> {
+    const checkpoint = await ports.checkpointStore.getLatest(input.sessionId);
+    if (!checkpoint || (input.turnId && checkpoint.turnId !== input.turnId)) return { contextUsage: null, turnUsage: null };
+    return {
+      contextUsage: projectPublicContextUsage(checkpoint.contextUsage),
+      turnUsage: projectPublicTurnUsageSummary(buildTurnUsageSummary({ turnId: checkpoint.turnId, runtimeBudget: checkpoint.runtimeBudget })),
+    };
   }
 
   /** 在 continue 前确认最新 Turn、checkpoint 与 stale lease 边界均一致。 */
@@ -335,7 +366,7 @@ export function createTurnRecoveryService(
     return { turn: migratedTurn, checkpoint: migratedCheckpoint };
   }
 
-  return { getState, getRecoverableState, getFrozenRunConfig, getContextUsage, getContinuation };
+  return { getState, getRecoverableState, getFrozenRunConfig, getContextUsage, getTurnUsageSummary, getUsageSnapshot, getContinuation };
 }
 
 /** 只有已结束、暂停或中断的 checkpoint 才能继承最近一次终态投影。 */

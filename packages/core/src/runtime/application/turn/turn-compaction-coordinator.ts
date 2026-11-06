@@ -5,6 +5,7 @@
  * 不管理执行循环、事件序号或终态收尾。
  */
 
+import { createAgentRuntime } from "../../../internal/agent-runtime";
 import { compactMessages } from "../../../internal/kernel/compact";
 import { createDefaultModelSampler } from "../../../internal/kernel/model-sampler";
 import type { ModelSampler } from "../../../internal/kernel/model-sampler";
@@ -32,6 +33,7 @@ const DEFAULT_COMPACT_POLICY = { preserveRecentTurns: 4, targetTokens: Math.floo
 /** 供执行协调器传入摘要采样器的内部 compact 请求。 */
 export interface TurnCompactionRequest extends CompactTurnInput {
   sampler?: ModelSampler;
+  tools?: import("../../../internal/lib/llm").AgentModelToolDefinition[];
 }
 
 /** 统一派生的 Context 预算边界；展示投影与 auto compact 共用，禁止两处各自推导。 */
@@ -68,7 +70,7 @@ export function resolveContextBudgetBounds(providerConfig: FrozenProviderConfig 
 
 /** Turn 上下文压缩协调器的内部职责。 */
 export interface TurnCompactionCoordinator {
-  buildContextCompactionManager(frozen: FrozenRunConfig, providerConfig: FrozenProviderConfig | undefined, sampler: ModelSampler): ContextCompactionManager | undefined;
+  buildContextCompactionManager(frozen: FrozenRunConfig, providerConfig: FrozenProviderConfig | undefined, sampler: ModelSampler, sessionId?: string): ContextCompactionManager | undefined;
   compact(input: TurnCompactionRequest): Promise<CompactTurnResult>;
 }
 
@@ -106,6 +108,7 @@ export function createTurnCompactionCoordinator(
     frozen: FrozenRunConfig,
     providerConfig: FrozenProviderConfig | undefined,
     sampler: ModelSampler,
+    sessionId?: string,
   ): ContextCompactionManager | undefined {
     const bounds = resolveContextBudgetBounds(providerConfig);
     if (!bounds.budgetWindowTokens || !bounds.triggerTokens) return undefined;
@@ -124,6 +127,9 @@ export function createTurnCompactionCoordinator(
       async compact(input) {
         return compactMessages({
           messages: input.messages,
+          tools: input.tools,
+          contextWindowTokens: providerConfig?.contextWindowTokens ?? providerConfig?.compactThresholdTokens,
+          sessionImageStore: ports.sessionImageStore, sessionId, supportsImageInput: providerConfig?.supportsImageInput === true,
           trigger: "auto",
           preserveRecentTurns: policy.preserveRecentTurns,
           targetTokens: policy.targetTokens,
@@ -177,6 +183,9 @@ export function createTurnCompactionCoordinator(
       : createDefaultModelSampler());
     const result = await compactMessages({
       messages: input.messages ?? checkpoint!.messages,
+      tools: input.tools ?? checkpoint?.samplingTools ?? (turn ? createAgentRuntime(runtimeConfigResolver.buildAgentOptions(turn.frozenRunConfig, defaultRunConfig, input.sessionId, input.turnId, undefined, turn.frozenProviderConfig)).getToolDefinitions().map(function modelTool(definition) { return { type: "function" as const, function: { name: definition.name, description: definition.description, parameters: definition.inputSchema } }; }) : []),
+      contextWindowTokens: turn?.frozenProviderConfig?.contextWindowTokens ?? turn?.frozenProviderConfig?.compactThresholdTokens,
+      sessionImageStore: ports.sessionImageStore, sessionId: input.sessionId, supportsImageInput: turn?.frozenProviderConfig?.supportsImageInput === true,
       trigger: input.trigger,
       preserveRecentTurns: input.preserveRecentTurns ?? policy.preserveRecentTurns,
       targetTokens: input.targetTokens ?? policy.targetTokens,

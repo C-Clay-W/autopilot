@@ -20,6 +20,21 @@ export interface WorkspaceSummary {
   trustStatus: "trusted" | "pending" | "denied" | "expired";
 }
 
+/** 协作事件观察流状态：idle 未观察，live 已连通，reconnecting 断线重连中。 */
+export type ThreadEventsState = "idle" | "live" | "reconnecting";
+
+/** 需要重新校准侧栏的协作事件类型；共享板等无关事件不触发整表刷新。 */
+const SIDEBAR_THREAD_EVENT_KINDS: ReadonlySet<string> = new Set([
+  "member_created",
+  "group_enabled",
+  "group_disabled",
+  "message_delivered",
+  "turn_terminal",
+]);
+
+/** 协作事件触发的会话与归属校准合并窗口；同一窗口内的多个事件只刷新一次。 */
+const THREAD_EVENT_REFRESH_DEBOUNCE_MS = 300;
+
 interface SessionTaskContextValue {
   manager: SessionTaskManager;
   loading: boolean;
@@ -29,6 +44,15 @@ interface SessionTaskContextValue {
   refreshSessions(workspaceId?: string): Promise<void>;
   removeSession(workspaceId: string, sessionId: string): void;
   removeWorkspace(workspaceId: string): Promise<boolean>;
+  /** 声明当前需要观察的协作组；传空值取消观察，由 Provider 统一持有事件流。 */
+  observeThreadGroup(workspaceId: string | null, groupId: string | null): void;
+  /** 协作归属代次；事件到达后递增，供归属读取方重新校准。 */
+  threadGroupRevision: number;
+  /** create_thread成功后按workspace定向失效；不从工具output或正文推导目标。 */
+  invalidateThreadDirectory(workspaceId: string, sessionId: string, turnId: string, seq: number): void;
+  threadDirectoryRevisions: Readonly<Record<string, number>>;
+  /** 协作事件观察流状态；reconnecting 表示断线重连中。 */
+  threadEventsState: ThreadEventsState;
 }
 
 const SessionTaskContext = createContext<SessionTaskContextValue | null>(null);
@@ -62,6 +86,25 @@ export function SessionTaskProvider({ children }: { children: ReactNode }) {
   const sessionsRefreshInFlightRef = useRef<Map<string, Promise<void>>>(new Map());
   /** 上次窗口恢复校准时间；用于合并 focus 与 visibilitychange 的连发事件。 */
   const lastRestoreRefreshAtRef = useRef(0);
+  /** 当前要观察的协作组；由当前会话归属决定，避免为空闲会话长期占用连接。 */
+  const [threadWatch, setThreadWatch] = useState<{ workspaceId: string; groupId: string } | null>(null);
+  /** 协作归属代次；事件到达时递增，驱动归属读取方重新校准。 */
+  const [threadGroupRevision, setThreadGroupRevision] = useState(0);
+  const [threadEventsState, setThreadEventsState] = useState<ThreadEventsState>("idle");
+  const [threadDirectoryRevisions, setThreadDirectoryRevisions] = useState<Record<string, number>>({});
+  const createdEventsRef = useRef(new Set<string>());
+  const directoryTimersRef = useRef(new Map<string, ReturnType<typeof setTimeout>>());
+  /** sessions可读代表该workspace宿主已初始化；首次可读仅发一次发现信号，不随每次刷新重置退避。 */
+  const readableWorkspacesRef = useRef(new Set<string>());
+
+  /** 记录当前需要观察的协作组；值未变化时保留原引用，避免重建事件流。 */
+  const observeThreadGroup = useCallback(function observeThreadGroup(workspaceId: string | null, groupId: string | null): void {
+    setThreadWatch(function nextWatch(current) {
+      if (!workspaceId || !groupId) return current === null ? current : null;
+      if (current?.workspaceId === workspaceId && current.groupId === groupId) return current;
+      return { workspaceId, groupId };
+    });
+  }, []);
 
   /** 从安全工作区 API 读取可选择的本机工作区，不请求能力或路径信息。 */
   const refreshWorkspaces = useCallback(async function refreshWorkspaces(): Promise<readonly WorkspaceSummary[]> {
@@ -116,6 +159,10 @@ export function SessionTaskProvider({ children }: { children: ReactNode }) {
           if (!response.ok) return;
           const payload = await response.json() as { sessions?: WebSessionDto[] };
           manager.syncWorkspaceSessions(workspace.workspaceId, payload.sessions ?? []);
+          if (!readableWorkspacesRef.current.has(workspace.workspaceId)) {
+            readableWorkspacesRef.current.add(workspace.workspaceId);
+            setThreadDirectoryRevisions(function hostBecameReadable(current) { return current[workspace.workspaceId] === undefined ? { ...current, [workspace.workspaceId]: 1 } : current; });
+          }
         }));
       } catch {
         /* 网络短暂不可用时保留最后一个安全快照，避免页面恢复产生未处理 Promise。 */
@@ -127,6 +174,95 @@ export function SessionTaskProvider({ children }: { children: ReactNode }) {
     inFlight.set(scopeKey, run);
     return run;
   }, [manager]);
+
+  /** 安全成功事件按真实源身份去重，合并同workspace创建；沿既有目录请求合并，不抢选择焦点。 */
+  const invalidateThreadDirectory = useCallback(function invalidateThreadDirectory(workspaceId: string, sessionId: string, turnId: string, seq: number): void {
+    if (!workspaceId || workspaceId === CHAT_SCOPE || !sessionId || !turnId || !Number.isSafeInteger(seq) || seq < 1) return;
+    const key = JSON.stringify([workspaceId, sessionId, turnId, seq]);
+    if (createdEventsRef.current.has(key)) return;
+    createdEventsRef.current.add(key);
+    const timers = directoryTimersRef.current;
+    if (timers.has(workspaceId)) return;
+    timers.set(workspaceId, setTimeout(function resyncCreatedThread() {
+      timers.delete(workspaceId);
+      void refreshSessions(workspaceId);
+      setThreadDirectoryRevisions(function bump(current) { return { ...current, [workspaceId]: (current[workspaceId] ?? 0) + 1 }; });
+    }, THREAD_EVENT_REFRESH_DEBOUNCE_MS));
+  }, [refreshSessions]);
+
+  /** Provider卸载时只清本页创建事件安排的校准，不留下额外轮询。 */
+  useEffect(function cleanDirectoryRefreshTimers() {
+    const timers = directoryTimersRef.current;
+    return function cleanup() { for (const timer of timers.values()) clearTimeout(timer); timers.clear(); };
+  }, []);
+
+  /**
+   * 观察当前协作组的事件流，用组事件驱动侧栏会话列表与归属校准。
+   * 只按事件类型触发受限快照刷新，不把子会话输出写进父会话，也不额外轮询。
+   */
+  useEffect(function observeThreadGroupEvents() {
+    if (!threadWatch) return;
+    const { workspaceId, groupId } = threadWatch;
+    // 原生 EventSource 会携带 Last-Event-ID 自动重连，正好复用既有事件游标协议。
+    const source = new EventSource(`/api/workspaces/${encodeURIComponent(workspaceId)}/threads/groups/${encodeURIComponent(groupId)}/events`);
+    let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+    let disposed = false;
+
+    /** 合并短时间内的多个协作事件，只触发一次会话列表与归属校准。 */
+    function scheduleResync(): void {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(function runResync() {
+        debounceTimer = undefined;
+        if (disposed) return;
+        void refreshSessions(workspaceId);
+        setThreadGroupRevision(function bumpRevision(revision) { return revision + 1; });
+      }, THREAD_EVENT_REFRESH_DEBOUNCE_MS);
+    }
+
+    /** 只在事件涉及会话创建、投递或终态时校准，共享板更新不牵动侧栏。 */
+    function handlePage(event: Event): void {
+      setThreadEventsState("live");
+      let items: Array<{ kind?: string; threadId?: string; turnId?: string }>;
+      try {
+        const payload = JSON.parse((event as MessageEvent<string>).data) as { items?: Array<{ kind?: string; threadId?: string; turnId?: string }> };
+        items = Array.isArray(payload.items) ? payload.items : [];
+      } catch {
+        // 损坏分片不触发刷新；下一次事件仍按游标到达。
+        return;
+      }
+      // 终态事件先按 workspace/session/turn 身份清理陈旧执行态，未访问子会话不必等下一次快照才停止转圈。
+      items.forEach(function settleTerminalTurn(item) {
+        if (item.kind !== "turn_terminal" || !item.threadId || !item.turnId) return;
+        manager.applyThreadTurnTerminal(workspaceId, item.threadId, item.turnId);
+      });
+      const affectsSidebar = items.some(function isSidebarEvent(item) {
+        return typeof item.kind === "string" && SIDEBAR_THREAD_EVENT_KINDS.has(item.kind);
+      });
+      if (!affectsSidebar) return;
+      scheduleResync();
+    }
+
+    /** 每次连通（含自动重连）都做一次校准，补齐断线期间发生的创建与终态。 */
+    function handleOpen(): void {
+      setThreadEventsState("live");
+      scheduleResync();
+    }
+
+    /** 断线只更新可见状态，重连与游标续读交给浏览器。 */
+    function handleError(): void {
+      if (disposed) return;
+      setThreadEventsState("reconnecting");
+    }
+
+    source.addEventListener("page", handlePage);
+    source.addEventListener("open", handleOpen);
+    source.addEventListener("error", handleError);
+    return function closeThreadEventStream(): void {
+      disposed = true;
+      if (debounceTimer) clearTimeout(debounceTimer);
+      source.close();
+    };
+  }, [threadWatch, refreshSessions, manager]);
 
   useEffect(function loadSessionList() {
     void refreshSessions(CHAT_SCOPE);
@@ -180,7 +316,10 @@ export function SessionTaskProvider({ children }: { children: ReactNode }) {
     }
   }
 
-  return <SessionTaskContext.Provider value={{ manager, loading, workspaces, directoryPickerAvailable, refreshWorkspaces, refreshSessions, removeSession, removeWorkspace }}>{children}</SessionTaskContext.Provider>;
+  // 取消观察后立即回到 idle，避免断线提示残留在没有协作组的会话上。
+  const effectiveThreadEventsState: ThreadEventsState = threadWatch ? threadEventsState : "idle";
+
+  return <SessionTaskContext.Provider value={{ manager, loading, workspaces, directoryPickerAvailable, refreshWorkspaces, refreshSessions, removeSession, removeWorkspace, observeThreadGroup, threadGroupRevision, invalidateThreadDirectory, threadDirectoryRevisions, threadEventsState: effectiveThreadEventsState }}>{children}</SessionTaskContext.Provider>;
 }
 
 // 下边两个函数Chat 和 Work 共用同一套

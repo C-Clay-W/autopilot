@@ -7,7 +7,6 @@ import {
   TUI_ALTERNATE_SCREEN_ENABLE,
   TUI_BRACKETED_PASTE_DISABLE,
   TUI_BRACKETED_PASTE_ENABLE,
-  TUI_INLINE_RESIZE_CLEAR,
   TUI_MOUSE_TRACKING_DISABLE,
   TUI_MOUSE_TRACKING_ENABLE,
   TUI_TERMINAL_FOCUS_DISABLE,
@@ -50,13 +49,11 @@ class StableTuiOutputStream {
     return this;
   }
 
-  /** 更新 Ink 后续布局使用的稳定尺寸，并在缩窄时清空旧物理回流行及 scrollback。 */
+  /** 更新 Ink 后续布局使用的稳定尺寸，并交由 Ink 自身失效旧输出缓存后重绘。 */
   public setSize(size: { columns: number; rows: number }): void {
     const changed = size.columns !== this.size.columns || size.rows !== this.size.rows;
-    const widthDecreased = size.columns < this.size.columns;
     this.size = size;
     if (!changed) return;
-    if (widthDecreased) this.source.write(TUI_INLINE_RESIZE_CLEAR);
     for (const listener of this.resizeListeners) listener();
   }
 }

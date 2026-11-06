@@ -90,6 +90,11 @@ export interface RunConfig {
   workPreview?: WorkPreviewCapability;
   /** 受信宿主在每个 Work Turn 开始前重新解析预览能力；undefined 必须清除旧能力。 */
   workPreviewLoader?: () => Promise<WorkPreviewCapability | undefined>;
+  /**
+   * 受信宿主注入的协作能力范围；仅进程内存在，不进入 FrozenRunConfig。
+   * Turn 层 override 不能注入或替换它，Runtime 只按宿主默认值把当前 Turn 绑定成协作来源。
+   */
+  threads?: import("./threads-capability").ThreadsCapability;
   databaseSearch?: DatabaseSearchCapability;
   /** 仅控制 Work 当前 Turn 是否注册独立 database_search。 */
   databaseSearchPolicy?: DatabaseSearchPolicy;

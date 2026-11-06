@@ -29,7 +29,7 @@ export function getTuiStatusLabel(status: CliTurnStatus): string {
     case "idle": return "Ready";
     case "running": return "Working";
     case "waiting_approval": return "Waiting for approval";
-    case "waiting_user_input": return "Waiting for Web answer";
+    case "waiting_user_input": return "Waiting for answer";
     case "interrupted": return "Stopped";
     case "interrupted_recoverable": return "Paused — resume available";
     case "completed": return "Completed";
@@ -42,7 +42,14 @@ export function getTuiStatusLabel(status: CliTurnStatus): string {
 export function getTuiTurnFailureReason(events: CliTuiTimelineEvent[]): string | undefined {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
-    if (event?.type === "status" && event.status === "failed" && event.reason) return event.reason;
+    if (event?.type === "status" && event.status === "failed") {
+      const details = [
+        event.providerHttpStatus !== undefined ? `HTTP 状态：${event.providerHttpStatus}` : undefined,
+        event.providerFailureDetail ? `上游标识：${event.providerFailureDetail}` : undefined,
+        event.feedbackId ? `反馈 ID：${event.feedbackId}` : undefined,
+      ].filter(Boolean);
+      return [event.reason, ...details].filter(Boolean).join(" · ") || undefined;
+    }
   }
   return undefined;
 }
@@ -57,7 +64,11 @@ export function getTuiTerminationSummary(events: CliTuiTimelineEvent[], currentS
   if (currentStatus !== undefined && !isRealTurnEndStatus(currentStatus)) return undefined;
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
-    if (event?.type === "status") return event.termination && isRealTurnEndStatus(event.status) ? formatAgentTermination(event.termination) : undefined;
+    if (event?.type === "status") {
+      if (!event.termination || !isRealTurnEndStatus(event.status)) return undefined;
+      const failureReason = event.status === "failed" ? getTuiTurnFailureReason([event]) : undefined;
+      return [failureReason, formatAgentTermination(event.termination)].filter(Boolean).join(" · ");
+    }
   }
   return undefined;
 }
@@ -144,7 +155,7 @@ export function formatTuiDiffStats(diff?: { text?: string; added?: number; remov
 /** 将内部错误码收敛为用户能理解的结果，不把 Core/工具实现细节直接打印到终端。 */
 export function getTuiToolFailureMessage(status: Extract<CliPublicEvent, { type: "tool_result" }>["status"], errorCode?: string, detail?: string): string {
   if (status === "approval_required") return "需要确认";
-  if (status === "question_required") return "请在支持结构化回答的 Web 中处理";
+  if (status === "question_required") return "等待回答，请在目标会话输入选项编号或自定义答案";
   // 2.5：沙箱不可用类拒绝是环境阻塞而非用户拒绝，文案必须区分。
   if (status === "denied") return isSandboxUnavailableErrorCode(errorCode) ? "沙箱不可用，命令未启动" : "已拒绝";
   if (status === "cancelled") return "已取消";
@@ -181,10 +192,10 @@ export function getTuiApprovalDecisionLabel(decision: Extract<CliAction, { type:
   return decision === "allow_once" ? "本次" : decision === "allow_session" ? "本次会话" : decision === "allow_workspace" ? "此工作区" : "拒绝";
 }
 
-/** 将终端流尺寸收敛为 TUI 布局使用的列/行数；宽度保留最小 30、最大 120 的既有约束。 */
+/** 将终端流尺寸收敛为 TUI 布局使用的列/行数；物理尺寸不受正文宽度策略限制。 */
 export function readTuiTerminalSize(stdout: { columns?: number; rows?: number }): { columns: number; rows: number } {
   return {
-    columns: Math.max(30, Math.min(Number(stdout.columns ?? 80) - 2, 120)),
-    rows: Math.max(8, Number(stdout.rows ?? 24)),
+    columns: Math.max(1, Math.floor(Number(stdout.columns ?? 80))),
+    rows: Math.max(1, Math.floor(Number(stdout.rows ?? 24))),
   };
 }

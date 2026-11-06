@@ -11,6 +11,7 @@ import { AgentSampleError } from "./lib/llm";
 import type { AgentModelToolDefinition, AgentSampleResult } from "./lib/llm";
 import type { ModelSampler } from "./kernel/model-sampler";
 import * as runtimeLimits from "../runtime/config/runtime-limits";
+import type { AgentThreadsCapability } from "../runtime/application/thread-tool-binding";
 
 const mocks = vi.hoisted(function createAgentRuntimeMocks() {
   return {
@@ -66,7 +67,7 @@ describe("Agent Runtime mutation gate", function mutationGateSuite() {
 
     expect(systemPrompt).toContain("你的产品身份是 Autopilot");
     expect(systemPrompt).toContain("底层模型供应商不改变 Autopilot 的产品身份");
-    expect(systemPrompt).toContain("任何 write_file 或 edit_file 成功后，必须立即");
+    expect(systemPrompt).toContain("落盘校验仅确认实际磁盘字节与预期一致");
     expect(systemPrompt).toContain("Todo 使用策略");
     expect(systemPrompt).toContain("只读不等于简单：多阶段只读分析也应建表");
     expect(systemPrompt).toContain("难以判断时使用 todo_write");
@@ -159,7 +160,7 @@ describe("Agent Runtime mutation gate", function mutationGateSuite() {
     expect(completed?.type === "turn_completed" && completed.checkpoint.mutationGate?.required).toBe(false);
   });
 
-  it("写入后未读回验证不宣称完成而进入待验证暂停", async function unverifiedWritePauses() {
+  it("可靠写入已由宿主验证时不强制模型read即可完成", async function reliableWriteCompletes() {
     const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "agent-runtime-unverified-"));
     const fixturePath = path.join(workspaceRoot, "fixture.txt");
     await writeFile(fixturePath, "before\n", "utf8");
@@ -173,8 +174,8 @@ describe("Agent Runtime mutation gate", function mutationGateSuite() {
       const runtime = createTestRuntime({ workspaceRoot, permissionMode: "auto_approve", workspaceTrusted: true });
       for await (const event of runtime.run({ turnId: "unverified-write-test", messages: [createAgentTextMessage("user", "请修改 fixture.txt 的内容。")] })) events.push(event);
       const paused = events.find(function findPause(event) { return event.type === "turn_interrupted"; });
-      expect(paused).toMatchObject({ checkpoint: { status: "interrupted_recoverable", interruptionReason: "write_verification" } });
-      expect(events.some(function completed(event) { return event.type === "turn_completed"; })).toBe(false);
+      expect(paused).toBeUndefined();
+      expect(events.some(function completed(event) { return event.type === "turn_completed"; })).toBe(true);
     } finally {
       await rm(workspaceRoot, { recursive: true, force: true });
     }
@@ -359,41 +360,23 @@ describe("Agent Runtime limit resume", function limitResumeSuite() {
     }
   });
 
-  it("同一路径再次写入撤销验证，有限纠正后可恢复且继续只允许读回", async function repeatedWriteInvalidatesVerification() {
+  it("同一路径再次可靠写入以新磁盘版本完成，不强制模型再次read", async function repeatedWriteVerifiesActualDisk() {
     const workspaceRoot = await mkdtemp(path.join(os.tmpdir(), "agent-runtime-repeated-write-"));
     const fixturePath = path.join(workspaceRoot, "fixture.txt");
     await writeFile(fixturePath, "before\n", "utf8");
     mocks.sample.mockReset();
     mockToolCall("read_file", { path: "fixture.txt", limit: 100 }, "read-before-repeat");
     mockToolCall("edit_file", { path: "fixture.txt", oldString: "before", newString: "after" }, "edit-first");
-    mockToolCall("read_file", { path: "fixture.txt", limit: 100 }, "read-first-write");
     mockToolCall("edit_file", { path: "fixture.txt", oldString: "after", newString: "again" }, "edit-second");
     mockPlainAnswer("修改完成。");
-
     try {
       const events = [];
       const runtime = createTestRuntime({ workspaceRoot, permissionMode: "auto_approve", workspaceTrusted: true });
       for await (const event of runtime.run({ turnId: "repeated-write-test", messages: [createAgentTextMessage("user", "请修改 fixture.txt 的内容。再检查一次。")] })) events.push(event);
-      const failed = events.find(function findPause(event) { return event.type === "turn_interrupted"; });
-
-      expect(events.filter(function countDiscard(event) { return event.type === "answer_discard"; })).toHaveLength(2);
-      expect(failed?.type).toBe("turn_interrupted");
-      if (failed?.type !== "turn_interrupted") throw new Error("verification checkpoint missing");
-      expect(failed.checkpoint).toMatchObject({ status: "interrupted_recoverable", interruptionReason: "write_verification" });
-      expect(failed.checkpoint.mutationGate?.changedPaths).toContain("fixture.txt");
-      expect(failed.checkpoint.mutationGate?.verifiedPaths).not.toContain("fixture.txt");
-      expect(failed.checkpoint.mutationGate?.recoveryAttempts).toBe(1);
-      expect(getAgentMessageText(failed.checkpoint.messages.at(-1)!)).toContain('"fixture.txt"');
-      mocks.sample.mockReset();
-      mockToolCall("edit_file", { path: "fixture.txt", oldString: "again", newString: "forbidden" }, "resume-write-forbidden");
-      mockToolCall("read_file", { path: "fixture.txt", limit: 100 }, "resume-verify");
-      mockPlainAnswer("验证完成。");
-      const resumed = [];
-      for await (const event of runtime.run({ checkpoint: failed.checkpoint })) resumed.push(event);
-      expect(resumed).toEqual(expect.arrayContaining([expect.objectContaining({ type: "tool_result", callId: "resume-write-forbidden", result: expect.objectContaining({ status: "denied" }) })]));
-      const completed = resumed.find(function findCompletion(event) { return event.type === "turn_completed"; });
+      expect(events.filter(function read(event) { return event.type === "tool_result" && event.toolName === "read_file"; })).toHaveLength(1);
+      const completed = events.find(function complete(event) { return event.type === "turn_completed"; });
       expect(completed?.type).toBe("turn_completed");
-      expect(completed?.type === "turn_completed" && completed.checkpoint.completedCallIds).toEqual(expect.arrayContaining(["edit-first", "edit-second", "resume-verify"]));
+      expect(completed?.type === "turn_completed" && completed.checkpoint.mutationGate?.verifiedPaths).toContain("fixture.txt");
       expect(await readFile(fixturePath, "utf8")).toBe("again\n");
     } finally {
       await rm(workspaceRoot, { recursive: true, force: true });
@@ -622,5 +605,52 @@ describe("Agent Runtime RAG capability boundary", function ragBoundarySuite() {
       "run_command",
       "todo_write",
     ]);
+  });
+});
+
+/** 协作能力在构造期只用于注册工具，本组用例不触发任何协作调用。 */
+function threadCapabilityStub(): AgentThreadsCapability {
+  return { handoffPath: function handoffPath() { return ""; } } as unknown as AgentThreadsCapability;
+}
+
+/** 运行一次受控 Turn，返回实际组装给模型的系统提示。 */
+async function systemPromptOf(options: Parameters<typeof createAgentRuntime>[0]): Promise<string> {
+  mockPlainAnswer("完成");
+  const runtime = createTestRuntime(options);
+  const migrated = migrateAgentMessages({ messages: [{ role: "user", content: "汇报一下进展" }] });
+  if (!migrated.ok) throw new Error(migrated.message);
+  for await (const _event of runtime.run({ turnId: "thread-prompt-test", messages: migrated.messages })) { /* 只取组装结果 */ }
+  const sampled = mocks.sample.mock.calls.at(-1)?.[0] as AgentMessage[];
+  return sampled.filter(function selectSystem(message) { return message.role === "system"; }).map(getAgentMessageText).join("\n");
+}
+
+describe("协作约定注入", function threadPromptSuite() {
+  it("注册协作工具时注入派工、摘要与两种游标约定", async function injectsThreadConvention() {
+    const prompt = await systemPromptOf({ threads: threadCapabilityStub() });
+    expect(prompt).toContain("【会话协作】");
+    // 派工约定：汇报要求写进任务正文，改变要求时同步调整接收与汇报。
+    expect(prompt).toContain("派工时把汇报约定写进任务正文");
+    // 摘要约定：普通进度与关键条目的区别，避免关键结论被合并或淘汰。
+    expect(prompt).toContain("kind=progress");
+    expect(prompt).toContain("不能只写在普通进度里");
+    expect(prompt).toContain("只是进度就不要再重复发一遍 send_thread");
+    // attention不是审批权威事实；只有精确pending请求才引导处理，未知执行不得代批/恢复。
+    expect(prompt).toContain("reason=attention 仅表示需要关注，不等于审批");
+    expect(prompt).toContain("只有summary.waiting=approval且interactionState=pending");
+    expect(prompt).toContain("不能推导审批、要求用户按Ctrl+A或主动恢复");
+    expect(prompt).not.toContain("reason=attention 表示目标正等待审批或用户回答");
+    expect(prompt).toContain("不要把 attention 当成任务完成而提前收尾汇报");
+    // 接收约定：两种游标分开维护，进度读取不退回带历史的 read_thread。
+    expect(prompt).toContain("等待游标与进度游标分开维护");
+    expect(prompt).toContain("nextCursor");
+    expect(prompt).toContain("不要改用 read_thread");
+  });
+
+  it("Chat 与未注册协作工具的 Work 都不出现协作约定", async function omitsOutsideThreads() {
+    const work = await systemPromptOf({});
+    expect(work).not.toContain("【会话协作】");
+    const chat = await systemPromptOf({ capabilityCeiling: { productMode: "chat", chatRetrievalMode: "none" }, threads: threadCapabilityStub() });
+    expect(chat).not.toContain("【会话协作】");
+    expect(chat).toContain("Autopilot Chat");
   });
 });

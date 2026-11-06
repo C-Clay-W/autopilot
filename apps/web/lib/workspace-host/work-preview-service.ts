@@ -123,6 +123,7 @@ export interface CreateWorkPreviewServiceOptions {
 
 /** Web Work 预览服务：prepare（工具路径）/ resolve+stop（受限 API）/ openManualLink（手动路径）。 */
 export interface WebWorkPreviewService {
+  validatePreviewTarget?(url: string): void;
   preparePreview(request: WorkPreviewPrepareRequest): Promise<WorkPreviewPrepareResult>;
   resolveNavigation(input: { previewId: string; sessionId: string }): Promise<WorkPreviewNavigation>;
   stopPreviewJob(input: { previewId: string; sessionId: string }): Promise<{ previewId: string; state: "stopped" }>;
@@ -169,6 +170,7 @@ export function createWorkPreviewService(options: CreateWorkPreviewServiceOption
   }
 
   /**
+   * 页面目标已由预览策略校验，仅取其origin与Job声明比较，保持Job声明仅接受origin。
    * 核验声明绑定的当前有效性：Job 仍活动且由本 Runtime 拥有、声明地址与目标精确同源，
    * 并且该端口的当前监听者属于该 Job 的进程树。无法证明（unverifiable）同样视为不成立。
    */
@@ -177,7 +179,7 @@ export function createWorkPreviewService(options: CreateWorkPreviewServiceOption
     try {
       const listed = await jobs.list({ limit: 100 });
       const job = listed.jobs.find(function sameJob(item) { return item.jobId === jobId; });
-      if (!job || !isOwnedActiveJob(job) || !job.serviceUrl || !sameServiceOrigin(job.serviceUrl, navigationUrl)) return false;
+      if (!job || !isOwnedActiveJob(job) || !job.serviceUrl || !sameServiceOrigin(job.serviceUrl, new URL(navigationUrl).origin)) return false;
       return (await jobs.verifyServiceOwnership({ jobId, serviceUrl: job.serviceUrl })) === "owned";
     } catch {
       return false;
@@ -196,7 +198,7 @@ export function createWorkPreviewService(options: CreateWorkPreviewServiceOption
       return undefined;
     }
     const candidates = listed.jobs.filter(function declaresTarget(job) {
-      return isOwnedActiveJob(job) && job.serviceUrl !== undefined && sameServiceOrigin(job.serviceUrl, navigationUrl);
+      return isOwnedActiveJob(job) && job.serviceUrl !== undefined && sameServiceOrigin(job.serviceUrl, new URL(navigationUrl).origin);
     });
     const owned: string[] = [];
     for (const candidate of candidates) {
@@ -267,6 +269,10 @@ export function createWorkPreviewService(options: CreateWorkPreviewServiceOption
 
   return {
     /** 准备预览：目标校验 → Job 归属最小验证 → 有界就绪探测 → 稳定引用入缓存。 */
+    /** 工具审批前复用完整纯目标规则，包括 Agent 自身端口；不发出探测。 */
+    validatePreviewTarget(url: string): void {
+      if (!normalizePreviewTarget(url, options.agentAuthorities).ok) throw new WorkPreviewError("PREVIEW_INVALID_TARGET");
+    },
     async preparePreview(request: WorkPreviewPrepareRequest): Promise<WorkPreviewPrepareResult> {
       if (!isOpaqueId(request.sessionId) || !isOpaqueId(request.turnId)) throw new WorkPreviewError("PREVIEW_UNAVAILABLE");
       if (request.callId.length === 0 || request.callId.length > 256) throw new WorkPreviewError("PREVIEW_UNAVAILABLE");

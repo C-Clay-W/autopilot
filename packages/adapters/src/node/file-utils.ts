@@ -8,6 +8,26 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { FileHandle } from "node:fs/promises";
 
+/** 内部文件阶段诊断只记录封闭阶段与OS码，原始异常不进入公开DTO。 */
+export interface FileOperationDiagnostic {
+  phase: "lock" | "temporary_write" | "rename" | "cleanup";
+  osCode?: string;
+  lockWaitMs?: number;
+  cleanupFailed?: boolean;
+}
+const fileDiagnostics = new WeakMap<object, FileOperationDiagnostic>();
+/** 取得内部诊断副本，不读取异常正文、路径或stack。 */
+export function getFileOperationDiagnostic(error: unknown): FileOperationDiagnostic | undefined {
+  return error && typeof error === "object" ? fileDiagnostics.get(error) : undefined;
+}
+/** 只接受已知OS错误码；任意自定义code不得进入日志。 */
+function rememberFileFailure(error: unknown, diagnostic: FileOperationDiagnostic): void {
+  if (!error || typeof error !== "object") return;
+  const code = (error as NodeJS.ErrnoException).code;
+  const osCode = ["EACCES", "EPERM", "ENOENT", "EEXIST", "ENOSPC", "EIO", "EMFILE", "ENFILE", "EBUSY", "EROFS", "ENOTDIR", "ETIMEDOUT"].includes(code ?? "") ? code : undefined;
+  fileDiagnostics.set(error, { ...diagnostic, ...(osCode ? { osCode } : {}) });
+}
+
 const fileLocks = new Map<string, Promise<void>>();
 const PROCESS_LOCK_RETRY_MS = 10;
 const PROCESS_LOCK_TIMEOUT_MS = 30_000;
@@ -168,7 +188,10 @@ export async function withFileLock<T>(filePath: string, operation: () => T | Pro
   fileLocks.set(key, queued);
   try {
     await previous;
-    const handle = await acquireProcessLock(key, options?.requireExitedOwner);
+    const startedAt = Date.now();
+    let handle: ProcessLockHandle;
+    try { handle = await acquireProcessLock(key, options?.requireExitedOwner); }
+    catch (error) { rememberFileFailure(error, { phase: "lock", lockWaitMs: Date.now() - startedAt }); throw error; }
     try {
       return await operation();
     } finally {
@@ -260,11 +283,22 @@ export function ensureParentDirectory(filePath: string): void {
 export function atomicReplace(filePath: string, content: string): void {
   ensureParentDirectory(filePath);
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let phase: FileOperationDiagnostic["phase"] = "temporary_write";
+  let failure: unknown;
   try {
     fs.writeFileSync(temporaryPath, content, { encoding: "utf8", flag: "wx" });
+    phase = "rename";
     fs.renameSync(temporaryPath, filePath);
+  } catch (error) {
+    failure = error;
+    rememberFileFailure(error, { phase });
+    throw error;
   } finally {
-    if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath);
+    try { if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath); }
+    catch (error) {
+      if (failure) rememberFileFailure(failure, { ...getFileOperationDiagnostic(failure)!, cleanupFailed: true });
+      else { rememberFileFailure(error, { phase: "cleanup" }); throw error; }
+    }
   }
 }
 

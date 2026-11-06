@@ -35,6 +35,11 @@ export function createNodeLeaseStore(options: NodeStoreOptions): LeaseStore {
   }
 
   return {
+    /** 原子替换文件允许无锁只读；禁止在状态查询中初始化或迁移存储。 */
+    async readCurrent(sessionId) {
+      const current = readJsonFile<NodeLeaseRecord>(filePath(sessionId));
+      return current ? { turnId: current.turnId, lease: { ...current.lease } } : null;
+    },
     async acquire(input): Promise<AgentLease | null> {
       ensureDir();
       const target = filePath(input.sessionId);

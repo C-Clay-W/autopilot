@@ -95,4 +95,9 @@ export interface RecoverableTurnView {
   approval?: RecoverableApprovalView;
   lastSeq?: number;
   activeSkills: Array<{ skillId: string; contentHash: string }>;
+  /** 同Core只读执行投影；缺证据不能声称仍在工作。 */
+  execution?: "active" | "inactive" | "unconfirmed" | "lost";
+  /** 交互状态独立于运行摘要；已有决定/过期保留显式恢复提示。 */
+  interactionState?: "pending" | "decided" | "expired" | "unconfirmed";
+  warning?: "summary_lag";
 }

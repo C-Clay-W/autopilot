@@ -12,10 +12,14 @@
 import type { AgentCheckpoint } from "../../internal/agent-runtime";
 import { normalizeAgentMessages, type AgentMessage } from "../../internal/types/agent-message";
 import { projectPublicContextUsage } from "../../internal/kernel/context-budget";
+import { projectPublicTurnUsageSummary } from "../../internal/kernel/turn-usage";
 import type { AgentEvent } from "./event-envelope";
 import type { AgentLoopEvent } from "../../internal/agent-runtime";
 import { sanitizeAgentTerminationView } from "./recoverable-turn-view";
 import { isSandboxAvailabilityFailureCode } from "../domain/sandbox-policy";
+import { sanitizeAgentProviderFailureDetail, sanitizeAgentProviderFailureReason } from "../provider/provider-failure-guidance";
+import { projectUiDocument } from "../../ui/document";
+import { TOOL_ERROR_CODES } from "../../internal/tools/tool-error";
 
 /** 将 Web 工具与 open_preview 的调用与结果改成可恢复的安全占位；完整工具消息仍只保留在 Core 私有 checkpoint。 */
 export function redactWebCheckpoint(checkpoint: AgentCheckpoint): AgentCheckpoint {
@@ -129,11 +133,38 @@ function sanitizeTodoToolResult(event: AgentLoopEvent): AgentLoopEvent {
   return { ...event, result: { ...event.result, output: { counts: output.counts } } };
 }
 
-/** 把 context_usage_updated 的 usage 收窄为白名单副本；任一字段非法时 fail closed 为 null，不信任对象形状。 */
+/** render_ui 仅向模型和通用工具事件保留有限确认，不让文档副本进入工具结果。 */
+function sanitizeRenderUiToolResult(event: AgentLoopEvent): AgentLoopEvent {
+  if (event.type !== "tool_result" || event.toolName !== "render_ui" || event.result.status !== "success") return event;
+  return { ...event, result: { ...event.result, output: { delivered: true } } };
+}
+
+/** 对 ui_document 再做一次字段白名单投影，事件只暴露文档协议所需身份与内容。 */
+function sanitizeUiDocumentEvent(event: AgentLoopEvent): AgentLoopEvent {
+  if (event.type !== "ui_document") return event;
+  return {
+    type: "ui_document",
+    turnId: event.turnId,
+    stepId: event.stepId,
+    callId: event.callId,
+    document: projectUiDocument(event.document),
+  };
+}
+
+/**
+ * 把 context_usage_updated 的 usage 与 turnUsage 收窄为白名单副本；
+ * 任一字段非法时 usage fail closed 为 null，turnUsage 缺省保持缺省（表示无新事实），不信任对象形状。
+ */
 function sanitizeContextUsageEvent(event: AgentLoopEvent): AgentLoopEvent {
   if (event.type !== "context_usage_updated") return event;
   const usage = projectPublicContextUsage(event.usage);
-  return usage === event.usage ? event : { ...event, usage };
+  const turnUsage = event.turnUsage === undefined ? undefined : projectPublicTurnUsageSummary(event.turnUsage);
+  if (usage === event.usage && turnUsage === event.turnUsage) return event;
+  return {
+    ...event,
+    usage,
+    ...(turnUsage === undefined ? {} : { turnUsage }),
+  };
 }
 
 /** 把 Web 工具的公开事件结果降级为安全事实，原始答案、网页正文与 URL 只留在进程内采样链。 */
@@ -146,6 +177,35 @@ function sanitizeWebToolResult(event: AgentLoopEvent): AgentLoopEvent {
       ? { host: detail.host, contentType: detail.contentType, truncated: detail.truncated }
       : { redacted: true };
   return { ...event, result: { ...event.result, output } };
+}
+
+/** 系统会话图片回退的公开事件只保留审批身份和有限状态，私有调用与观察不变。 */
+function sanitizeSessionImageFallback(event: AgentLoopEvent): AgentLoopEvent {
+  if ((event.type !== "tool_started" && event.type !== "tool_progress" && event.type !== "tool_result" && event.type !== "approval_required")
+    || event.toolName !== "vision_analyze" || !/^image-fallback-[0-9a-f-]{36}-[0-9a-f-]{36}$/i.test(event.callId)) return event;
+  const base = { turnId: event.turnId, stepId: event.stepId, callId: event.callId, toolName: event.toolName };
+  if (event.type === "tool_started") return { type: "tool_started", ...base, summary: "正在分析会话图片" };
+  if (event.type === "tool_progress") return { type: "tool_progress", ...base, tail: "正在分析会话图片" };
+  if (event.type === "approval_required") {
+    const approval = event.result.approval;
+    const allowedDecisions = approval.display?.allowedDecisions ?? approval.allowedDecisions ?? [];
+    return { type: "approval_required", ...base, result: { status: "approval_required", callId: event.callId, toolName: event.toolName, approval: {
+      approvalId: approval.approvalId, callId: event.callId, toolName: event.toolName, normalizedInputHash: approval.normalizedInputHash,
+      constraint: "vision-analyze:workspace", reason: "向配置的视觉 Provider 发送会话图片需要用户审批", risk: "read_only", preview: {}, expiresAt: approval.expiresAt,
+      ...(approval.allowedDecisions ? { allowedDecisions: approval.allowedDecisions } : {}),
+      display: { operation: "analyze", effect: "external", destructive: false, resource: "会话图片", risk: "read_only", allowedDecisions },
+    } } };
+  }
+  const result = event.result;
+  const meta = "meta" in result && result.meta ? { durationMs: result.meta.durationMs, inputHash: result.meta.inputHash, ...(result.meta.outputBytes !== undefined ? { outputBytes: result.meta.outputBytes } : {}), ...(result.meta.truncated !== undefined ? { truncated: result.meta.truncated } : {}) } : undefined;
+  const display = { titleKey: result.status === "success" ? "tool.other.completed" : "tool.other.failed", target: "会话图片" };
+  if (result.status === "success") return { type: "tool_result", ...base, retryCount: event.retryCount, summary: "会话图片分析完成", result: { status: "success", callId: event.callId, toolName: event.toolName, output: { analyzed: true }, meta: meta!, display } };
+  if (result.status === "approval_required") return sanitizeSessionImageFallback({ type: "approval_required", ...base, result });
+  if (result.status === "question_required") return { type: "tool_result", ...base, retryCount: event.retryCount, summary: "会话图片分析失败", result: { status: "error", callId: event.callId, toolName: event.toolName, error: { code: "TOOL_EXECUTION_FAILED", message: "会话图片分析失败" }, display } };
+  const code = Object.values(TOOL_ERROR_CODES).find(function known(item) { return item === result.error.code; }) ?? "TOOL_EXECUTION_FAILED";
+  const error = { code, message: "会话图片分析失败" };
+  if (result.status === "cancelled" || result.status === "timeout") return { type: "tool_result", ...base, retryCount: event.retryCount, summary: "会话图片分析未完成", result: { status: result.status, callId: event.callId, toolName: event.toolName, error, meta: meta!, interruption: { phase: result.interruption.phase, normalizedInputHash: result.interruption.normalizedInputHash, sideEffectState: result.interruption.sideEffectState, safeToRetry: result.interruption.safeToRetry, reason: "会话图片分析未完成" }, display } };
+  return { type: "tool_result", ...base, retryCount: event.retryCount, summary: "会话图片分析失败", result: { status: result.status, callId: event.callId, toolName: event.toolName, error, ...(meta ? { meta } : {}), display } } as AgentLoopEvent;
 }
 
 /** 只保留稳定错误码或 Core 固定文案；其他内容统一降级，避免 Provider 文本流出。 */
@@ -178,15 +238,63 @@ function sanitizeExternalError(value: string): string {
     "模型输出连续截断，已达到最大恢复次数",
     "上下文溢出后已完成一次压缩重试，compact 熔断器已阻止重复请求",
     "reactive compact 失败，已熔断以避免重复请求",
+    "视觉分析工具不可用，无法处理图片",
+    "图片视觉分析失败，无法继续处理",
+    "会话图片不可用或已损坏",
     "Agent Loop 执行失败",
   ];
   return safeMessages.find(function findKnownMessage(message) { return value === message; }) ?? "Agent Loop 执行失败";
 }
 
-/** 终态结构化失败类别只放行沙箱可用性失败，避免内部错误码扩散为公开协议面。 */
-function sanitizeTerminalErrorCode(event: AgentLoopEvent): AgentLoopEvent {
-  if (!("errorCode" in event) || typeof event.errorCode !== "string") return event;
-  return isSandboxAvailabilityFailureCode(event.errorCode) ? event : { ...event, errorCode: undefined };
+/** 终态只保留明确登记的诊断类别、阶段、反馈 ID 与 Provider HTTP 状态。 */
+function sanitizeTerminalFailureDiagnostic(event: AgentLoopEvent): AgentLoopEvent {
+  if (event.type !== "turn_failed") return event;
+  const allowedCodes = new Set([
+    "MISSING_CREDENTIAL", "PROVIDER_CONFIGURATION_INVALID", "CREDENTIAL_REF_INVALID", "PROVIDER_PROTOCOL_REQUIRED", "UNSUPPORTED_API_PROTOCOL", "TURN_EXECUTION_FAILED",
+    "TOOL_CALL_REJECTED", "TOKEN_BUDGET_EXCEEDED", "TOOL_DENIED", "CONTEXT_COMPACTION_FAILED", "IMAGE_VISION_UNAVAILABLE", "IMAGE_VISION_FAILED", "IMAGE_INPUT_UNAVAILABLE",
+    "TURN_COMPLETION_REJECTED", "CONTEXT_OVERFLOW", "MODEL_OUTPUT_LIMIT", "TOOL_CALL_TRUNCATED",
+    "TOOL_CALL_INVALID_JSON", "STREAM_INCOMPLETE", "EMPTY_RESPONSE", "PROVIDER_CONNECTION",
+    "PROVIDER_TIMEOUT", "PROVIDER_RATE_LIMIT", "PROVIDER_SERVER_ERROR", "PROVIDER_REQUEST_REJECTED",
+  ]);
+  const allowedStages = new Set([
+    "tool_preflight", "runtime_budget", "tool_execution", "context_compaction", "provider_sampling",
+    "provider_recovery", "completion_policy", "agent_loop",
+  ]);
+  const errorCode = typeof event.errorCode === "string"
+    && (allowedCodes.has(event.errorCode) || isSandboxAvailabilityFailureCode(event.errorCode))
+    ? event.errorCode
+    : "TURN_EXECUTION_FAILED";
+  const feedbackId = typeof event.feedbackId === "string"
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(event.feedbackId)
+    ? event.feedbackId
+    : undefined;
+  const failureStage = typeof event.failureStage === "string" && allowedStages.has(event.failureStage)
+    ? event.failureStage as Extract<AgentLoopEvent, { type: "turn_failed" }>["failureStage"]
+    : "agent_loop";
+  const providerHttpStatus = errorCode.startsWith("PROVIDER_")
+    && Number.isInteger(event.providerHttpStatus)
+    && event.providerHttpStatus! >= 400
+    && event.providerHttpStatus! <= 599
+    ? event.providerHttpStatus
+    : undefined;
+  const providerFailureReason = sanitizeAgentProviderFailureReason(errorCode, event.providerFailureReason);
+  const providerFailureDetail = errorCode.startsWith("PROVIDER_") ? sanitizeAgentProviderFailureDetail(event.providerFailureDetail) : undefined;
+  const safeEvent = { ...event };
+  delete safeEvent.feedbackId;
+  delete safeEvent.failureStage;
+  delete safeEvent.providerHttpStatus;
+  delete (safeEvent as unknown as Record<string, unknown>).providerFailureProfile;
+  delete safeEvent.providerFailureReason;
+  delete safeEvent.providerFailureDetail;
+  return {
+    ...safeEvent,
+    errorCode,
+    failureStage,
+    ...(feedbackId ? { feedbackId } : {}),
+    ...(providerHttpStatus !== undefined ? { providerHttpStatus } : {}),
+    ...(providerFailureReason ? { providerFailureReason } : {}),
+    ...(providerFailureDetail ? { providerFailureDetail } : {}),
+  };
 }
 
 /** 终态可继续状态只由 Core checkpoint 状态计算。 */
@@ -222,8 +330,12 @@ function projectTermination(event: AgentLoopEvent): ReturnType<typeof sanitizeAg
  * @returns 脱敏后的事件副本
  */
 export function sanitizeEventForExternal(event: AgentLoopEvent | AgentEvent): AgentEvent {
+  if (event.type === "thread_wait") {
+    const valid = ["waiting", "processing", "none"].includes(event.phase) && [event.pending, event.running, event.approvals].every(function bounded(value) { return Number.isSafeInteger(value) && value >= 0 && value <= 8; }) && event.running + event.approvals <= event.pending;
+    return { type: "thread_wait", turnId: event.turnId, phase: valid ? event.phase : "none", pending: valid ? event.pending : 0, running: valid ? event.running : 0, approvals: valid ? event.approvals : 0 };
+  }
   const internalEvent = event as AgentLoopEvent;
-  const safeEvent = sanitizeContextUsageEvent(sanitizeWebToolResult(sanitizeTodoToolResult(sanitizeTerminalErrorCode(internalEvent))));
+  const safeEvent = sanitizeSessionImageFallback(sanitizeUiDocumentEvent(sanitizeContextUsageEvent(sanitizeWebToolResult(sanitizeRenderUiToolResult(sanitizeTodoToolResult(sanitizeTerminalFailureDiagnostic(internalEvent)))))));
   const eventWithoutRawError = "error" in safeEvent && typeof safeEvent.error === "string"
     ? { ...safeEvent, error: sanitizeExternalError(safeEvent.error) } as AgentLoopEvent
     : safeEvent;

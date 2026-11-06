@@ -5,8 +5,8 @@
  * 工具输入、raw reasoning 或绝对受控路径的公开 ViewModel。
  */
 
-import { sanitizeAgentTerminationView, type AgentEvent, type PublicCheckpointView, type RecoverableTurnView } from "@autopilot-agent/core";
-import { createPresentationState, getPresentationCopy, getToolPresentationProfile, reducePresentationInput } from "@autopilot-agent/presentation";
+import { getAgentProviderFailureMessage, sanitizeAgentProviderFailureDetail, normalizeLegacyProviderFailureReason, sanitizeAgentTerminationView, type AgentEvent, type AgentEventEnvelope, type PublicCheckpointView, type RecoverableTurnView } from "@autopilot-agent/core";
+import { createPresentationState, getPresentationCopy, getToolPresentationProfile, reconcilePresentationApprovals, reducePresentationInput } from "@autopilot-agent/presentation";
 import type { CliEventEnvelope, CliProjection, CliPublicEvent, CliTurnStatus } from "./types.js";
 
 /** 创建空的 CLI 投影状态。 */
@@ -54,10 +54,18 @@ function safeErrorCode(value: unknown): string | undefined {
     "TOOL_CALL_INVALID_JSON",
     "TOOL_CALL_TRUNCATED",
     "PROVIDER_UNAUTHORIZED",
+    "PROVIDER_CONNECTION",
+    "PROVIDER_TIMEOUT",
+    "PROVIDER_RATE_LIMIT",
+    "PROVIDER_SERVER_ERROR",
+    "PROVIDER_REQUEST_REJECTED",
     "MODEL_NOT_FOUND",
     "RUNTIME_ERROR",
     "COMMAND_FAILED",
     "TOOL_TIMEOUT",
+    "IMAGE_VISION_UNAVAILABLE",
+    "IMAGE_VISION_FAILED",
+    "IMAGE_INPUT_UNAVAILABLE",
   ];
   return knownCodes.find(function findKnownCode(code: string): boolean { return text.includes(code); });
 }
@@ -78,9 +86,18 @@ function safeTurnFailureReason(value: unknown): string | undefined {
     "模型输出连续截断，已达到最大恢复次数",
     "上下文溢出后已完成一次压缩重试，compact 熔断器已阻止重复请求",
     "reactive compact 失败，已熔断以避免重复请求",
+    "视觉分析工具不可用，无法处理图片",
+    "图片视觉分析失败，无法继续处理",
+    "会话图片不可用或已损坏",
     "Agent Loop 执行失败",
   ];
   return safeReasons.find(function matchSafeReason(reason: string): boolean { return text === reason; });
+}
+
+/** 只接受 Core Recorder 生成的 UUID 形状，避免任意失败字段进入 CLI 输出。 */
+function safeFeedbackId(value: unknown): string | undefined {
+  const text = String(value ?? "");
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(text) ? text : undefined;
 }
 
 /** 复制投影状态，确保 reducer 不修改调用方持有的旧快照。 */
@@ -108,7 +125,9 @@ function sameSkills(first: Array<{ skillId: string; contentHash: string }>, seco
 /** 从 checkpoint 提取只包含 Skill 身份的安全投影。 */
 function applyCheckpoint(projection: CliProjection, checkpoint: Pick<PublicCheckpointView, "status" | "activeSkills">, seq: number, turnId: string): void {
   projection.status = mapCheckpointStatus(checkpoint.status);
+  if (checkpoint.status !== "running") projection.threadWait = undefined;
   if (checkpoint.status !== "awaiting_approval") projection.pendingApproval = undefined;
+  if (checkpoint.status !== "awaiting_user_input") projection.questionRequestId = undefined;
   const activeSkills = (checkpoint.activeSkills ?? []).map(function copySkill(skill) {
     return { skillId: skill.skillId, contentHash: skill.contentHash };
   });
@@ -129,8 +148,14 @@ function projectEvent(envelope: CliEventEnvelope, projection: CliProjection): Cl
   switch (event.type) {
     case "turn_started":
       projection.status = "running";
+      projection.pendingApproval = undefined;
+      projection.questionRequestId = undefined;
+      projection.threadWait = undefined;
       projection.recoverable = false;
       return { ...base, type: "turn_started", stepCount: event.stepCount };
+    case "thread_wait":
+      projection.threadWait = event.phase === "none" ? undefined : { phase: event.phase, pending: event.pending, running: event.running, approvals: event.approvals };
+      return { ...base, ...projection.threadWait, type: "thread_wait", phase: event.phase, pending: event.pending, running: event.running, approvals: event.approvals };
     case "reasoning_summary":
       return { ...base, type: "reasoning_summary", summary: sanitizeText(event.summary) };
     case "reasoning_delta":
@@ -146,6 +171,7 @@ function projectEvent(envelope: CliEventEnvelope, projection: CliProjection): Cl
       projection.answer = "";
       return { ...base, type: "answer_reset" };
     case "tool_started":
+      projection.threadWait = undefined;
       {
         const profile = getToolPresentationProfile(event.toolName);
       return {
@@ -207,6 +233,10 @@ function projectEvent(envelope: CliEventEnvelope, projection: CliProjection): Cl
         display,
       };
       }
+    case "question_required":
+      projection.questionRequestId = event.requestId;
+      projection.status = "waiting_user_input";
+      return undefined;
     case "input_queued":
       return { ...base, type: "input_queued", inputId: event.inputId, delivery: event.delivery };
     case "todo_updated":
@@ -252,12 +282,26 @@ function projectEvent(envelope: CliEventEnvelope, projection: CliProjection): Cl
       if (event.type === "turn_failed") {
         const failedStatus = projection.status === "idle" ? "failed" : projection.status;
         const termination = sanitizeAgentTerminationView(event.termination);
+        const code = safeErrorCode(event.errorCode) ?? safeErrorCode(event.error) ?? "RUNTIME_ERROR";
+        const providerHttpStatus = code.startsWith("PROVIDER_")
+          && Number.isInteger(event.providerHttpStatus)
+          && event.providerHttpStatus! >= 400
+          && event.providerHttpStatus! <= 599
+          ? event.providerHttpStatus
+          : undefined;
+        const providerFailureDetail = code.startsWith("PROVIDER_") ? sanitizeAgentProviderFailureDetail(event.providerFailureDetail) : undefined;
+        const feedbackId = safeFeedbackId(event.feedbackId);
+        const legacyProfile = (event as unknown as { providerFailureProfile?: unknown }).providerFailureProfile;
+        const providerFailureReason = getAgentProviderFailureMessage(code, event.providerFailureReason ?? normalizeLegacyProviderFailureReason(code, legacyProfile, providerHttpStatus));
         return {
           ...base,
           type: "status",
           status: failedStatus,
-          code: safeErrorCode(event.error) ?? "RUNTIME_ERROR",
-          reason: termination?.reason ? undefined : safeTurnFailureReason(event.error),
+          code,
+          reason: providerFailureReason ?? (termination?.reason ? undefined : safeTurnFailureReason(event.error)),
+          ...(feedbackId ? { feedbackId } : {}),
+          ...(providerHttpStatus !== undefined ? { providerHttpStatus } : {}),
+          ...(providerFailureDetail ? { providerFailureDetail } : {}),
           ...(termination ? { termination } : {}),
         };
       }
@@ -290,7 +334,10 @@ export function reduceCliEvent(previous: CliProjection, envelope: CliEventEnvelo
 /** 生成本地单调 seq 的事件投影器；continue 阶段沿用同一实例，不重置 seq。 */
 export function createCliEventProjector(options: { now?: () => Date; sessionId?: string } = {}): {
   project(event: AgentEvent): { envelope: CliEventEnvelope; projection: CliProjection; added: boolean };
+  observe(envelope: AgentEventEnvelope): { projection: CliProjection; added: boolean };
   getProjection(): CliProjection;
+  invalidateObservedTurn(input: { turnId?: string; status: CliTurnStatus }): CliProjection;
+  syncObservedInteraction(input: { turnId: string; status: CliTurnStatus; approval?: AgentEventEnvelope; requestId?: string }): CliProjection;
   setSessionId(sessionId: string): void;
   restore(view: RecoverableTurnView): CliProjection;
 } {
@@ -314,7 +361,28 @@ export function createCliEventProjector(options: { now?: () => Date; sessionId?:
       projection = reduceCliEvent(projection, envelope);
       return { envelope, projection, added: projection.events.length > previousLength };
     },
+    /** 持久事件按真实 Session/Turn/seq 去重，不生成新的本地身份或执行副作用。 */
+    observe(envelope) {
+      if (envelope.sessionId !== sessionId || envelope.seq <= (nextSeqByTurn.get(envelope.turnId) ?? 0)) return { projection, added: false };
+      nextSeqByTurn.set(envelope.turnId, Math.max(nextSeqByTurn.get(envelope.turnId) ?? 0, envelope.seq));
+      const previousLength = projection.events.length;
+      projection = reduceCliEvent(projection, envelope);
+      return { projection, added: projection.events.length > previousLength };
+    },
     getProjection() {
+      return projection;
+    },
+    /** 权威身份改变时清除旧审批/问答投影，不伪造事件或恢复凭证。 */
+    invalidateObservedTurn(input) {
+      projection = { ...createInitialCliProjection(), turnId: input.turnId, status: input.status };
+      return projection;
+    },
+    /** 当前交互来自独立安全摘要，不推进正文游标或seenKeys，避免跨页审批吞掉历史正文。 */
+    syncObservedInteraction(input) {
+      const envelope = input.approval;
+      const valid = input.status === "waiting_approval" && envelope !== undefined && envelope.sessionId === sessionId && envelope.turnId === input.turnId && envelope.event.type === "approval_required";
+      const interaction = valid ? reduceCliEvent(createInitialCliProjection(), envelope!) : undefined;
+      projection = { ...projection, questionRequestId: input.status === "waiting_user_input" ? input.requestId ?? (projection.turnId === input.turnId ? projection.questionRequestId : undefined) : undefined, turnId: input.turnId, status: input.status, pendingApproval: interaction?.pendingApproval };
       return projection;
     },
     setSessionId(nextSessionId: string) {
@@ -323,6 +391,7 @@ export function createCliEventProjector(options: { now?: () => Date; sessionId?:
     restore(view: RecoverableTurnView) {
       const restored = createInitialCliProjection();
       restored.turnId = view.turnId;
+      if (projection.turnId === view.turnId) restored.presentation = reconcilePresentationApprovals(projection.presentation, view.approval?.approvalId);
       restored.lastSeq = view.lastSeq;
       restored.status = view.status === "awaiting_approval"
         ? "waiting_approval"
@@ -334,7 +403,7 @@ export function createCliEventProjector(options: { now?: () => Date; sessionId?:
         restored.events.push({ type: "status", seq: view.lastSeq ?? 0, turnId: view.turnId, status: restored.status, termination: sanitizeAgentTerminationView(view.termination) });
       }
       restored.activeSkills = view.activeSkills.map(function copySkill(skill) { return { ...skill }; });
-      if (view.approval) restored.pendingApproval = { ...view.approval };
+      if (view.approval && (!view.interactionState || view.interactionState === "pending")) restored.pendingApproval = { ...view.approval };
       projection = restored;
       nextSeqByTurn.set(view.turnId, view.lastSeq ?? 0);
       return projection;

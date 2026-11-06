@@ -10,6 +10,7 @@ import { createAgentTextMessage, createAgentToolResultMessage } from "../../inte
 import { migrateAgentMessages } from "../protocol/migrate-agent-messages";
 import { createFirstPartyModelSampler } from "./first-party-model-sampler";
 import { createAnthropicMessagesRequest } from "./anthropic-messages-adapter";
+import { createDefaultModelSamplerFactory } from "./default-model-sampler-factory";
 import {
   createAdjacentUserConversation,
   createParallelToolResultConversation,
@@ -127,6 +128,206 @@ describe("firstParty Anthropic Messages sampler", function firstPartySamplerSuit
     expect(result.usage).toEqual({ inputTokens: 7, outputTokens: 3, contextTokens: 10 });
   });
 
+  /** 构造带缓存桶的 Messages 完成事件；message_delta 只更新输出量。 */
+  function createCacheUsageEvents(usage: Record<string, unknown>, outputTokens: number): unknown[] {
+    return [
+      { type: "message_start", message: { id: "msg-cache", type: "message", role: "assistant", model: "fixture-model", content: [], stop_reason: null, stop_sequence: null, usage: { output_tokens: 0, ...usage } } },
+      { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+      { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "命中" } },
+      { type: "content_block_stop", index: 0 },
+      { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: outputTokens } },
+      { type: "message_stop" },
+    ];
+  }
+
+  /** 去掉断点标记，只比较协议内容形状。 */
+  function stripCacheControl<T>(value: T): T {
+    return JSON.parse(JSON.stringify(value, function omitCacheControl(key, item) { return key === "cache_control" ? undefined : item; })) as T;
+  }
+
+  it("显式缓存只在 system、末个工具与对话前缀末尾各打一个断点", function marksStablePrefixForExplicitMode() {
+    const tools = [
+      { type: "function" as const, function: { name: "read_file", description: "read", parameters: { type: "object" } } },
+      { type: "function" as const, function: { name: "grep_files", description: "grep", parameters: { type: "object" } } },
+    ];
+    const request = createAnthropicMessagesRequest(
+      "fixture-model",
+      [createAgentTextMessage("system", "system"), createAgentTextMessage("user", "读取文件")],
+      tools,
+      {},
+      100,
+      false,
+      "explicit",
+    );
+    expect(request.system).toEqual([{ type: "text", text: "system", cache_control: { type: "ephemeral" } }]);
+    expect(request.tools).toEqual([
+      { name: "read_file", description: "read", input_schema: { type: "object" } },
+      { name: "grep_files", description: "grep", input_schema: { type: "object" }, cache_control: { type: "ephemeral" } },
+    ]);
+    expect(request.messages).toEqual([{ role: "user", content: [{ type: "text", text: "读取文件", cache_control: { type: "ephemeral" } }] }]);
+    expect(JSON.stringify(request).match(/"cache_control":/gu)).toHaveLength(3);
+
+    // 以 tool_result 结尾的步骤把断点打在末个 tool_result 上，不新增第四条消息级标记。
+    const toolRequest = createAnthropicMessagesRequest("fixture-model", [
+      createAgentTextMessage("user", "读取文件"),
+      { role: "assistant" as const, content: [{ type: "tool-call" as const, id: "call-1", name: "read_file", input: { path: "README.md" } }] },
+      createAgentToolResultMessage({ toolCallId: "call-1", text: "{\"ok\":true}", isError: false }),
+    ], tools, {}, 100, false, "explicit");
+    expect(toolRequest.messages.at(-1)).toEqual({
+      role: "user",
+      content: [{ type: "tool_result", tool_use_id: "call-1", content: [{ type: "text", text: "{\"ok\":true}" }], is_error: false, cache_control: { type: "ephemeral" } }],
+    });
+  });
+
+  it("自动缓存、未知能力与默认调用都不发缓存标记", function neverMarksWithoutExplicitDeclaration() {
+    const messages = [createAgentTextMessage("system", "system"), createAgentTextMessage("user", "读取文件")];
+    const tools = [{ type: "function" as const, function: { name: "read_file", description: "read", parameters: { type: "object" } } }];
+    for (const mode of ["server-auto", "none"] as const) {
+      const request = createAnthropicMessagesRequest("fixture-model", messages, tools, {}, 100, false, mode);
+      expect(request.system).toBe("system");
+      expect(request.messages.at(-1)).toEqual({ role: "user", content: "读取文件" });
+      expect(JSON.stringify(request)).not.toContain("cache_control");
+    }
+    expect(JSON.stringify(createAnthropicMessagesRequest("fixture-model", messages, tools, {}, 100))).not.toContain("cache_control");
+  });
+
+  it("显式缓存下一步复用同一前缀形状，逐步只挪动断点位置", function keepsPrefixShapeStableAcrossSteps() {
+    const tools = [{ type: "function" as const, function: { name: "read_file", description: "read", parameters: { type: "object" } } }];
+    const firstStep = createAnthropicMessagesRequest("fixture-model", [createAgentTextMessage("system", "system"), createAgentTextMessage("user", "第一步")], tools, {}, 100, false, "explicit");
+    const secondStep = createAnthropicMessagesRequest("fixture-model", [
+      createAgentTextMessage("system", "system"),
+      createAgentTextMessage("user", "第一步"),
+      { role: "assistant" as const, content: [{ type: "text" as const, text: "第一答复" }] },
+      createAgentTextMessage("user", "第二步"),
+    ], tools, {}, 100, false, "explicit");
+    // 历史消息在两步骤中形状与内容一致（只是不再携带上一步的断点标记）。
+    expect(secondStep.messages[0]).toEqual(stripCacheControl(firstStep.messages[0]));
+    expect(Array.isArray(secondStep.messages[0].content)).toBe(true);
+    expect(secondStep.messages.at(-1)).toEqual({ role: "user", content: [{ type: "text", text: "第二步", cache_control: { type: "ephemeral" } }] });
+  });
+
+  it("采样器按冻结缓存策略发送断点，能力缺省时保持原请求", async function sendsMarkersOnlyForExplicitSampler() {
+    // 每次调用都返回新的 SSE 响应，避免复用已消费的 body。
+    fetchMock.mockImplementation(function respond() { return Promise.resolve(createMessagesSseResponse(createTextEvents())); });
+    vi.stubGlobal("fetch", fetchMock);
+    const tool = { type: "function" as const, function: { name: "read_file", description: "read", parameters: { type: "object" } } };
+    await createFirstPartyModelSampler({
+      baseUrl: "https://stub.example/anthropic",
+      apiKey: "fixture-secret",
+      sampleOptions: { model: "fixture-model" },
+      promptCacheMode: "explicit",
+    }).sample([createAgentTextMessage("system", "system"), createAgentTextMessage("user", "读取文件")], [tool], {});
+    const marked = JSON.parse(String(fetchMock.mock.calls[0][1].body)) as { system: Array<{ cache_control?: unknown }>; tools: Array<{ cache_control?: unknown }>; messages: Array<{ content: unknown }> };
+    expect(marked.system[0].cache_control).toEqual({ type: "ephemeral" });
+    expect(marked.tools[0].cache_control).toEqual({ type: "ephemeral" });
+    expect(marked.messages[0].content).toEqual([{ type: "text", text: "读取文件", cache_control: { type: "ephemeral" } }]);
+
+    await createSampler().sample([createAgentTextMessage("system", "system"), createAgentTextMessage("user", "读取文件")], [tool], {});
+    expect(String(fetchMock.mock.calls[1][1].body)).not.toContain("cache_control");
+  });
+
+  it("工厂按受信能力目录解析缓存策略，未声明 explicit 的模型不发标记", async function resolvesCacheModeFromCatalog() {
+    fetchMock.mockImplementation(function respond() { return Promise.resolve(createMessagesSseResponse(createTextEvents())); });
+    vi.stubGlobal("fetch", fetchMock);
+    const tool = { type: "function" as const, function: { name: "read_file", description: "read", parameters: { type: "object" } } };
+    // deepseek-flash 经目录别名解析为 server-auto；未登记模型按 none 处理，两者都不发标记。
+    for (const modelId of ["deepseek-flash", "unregistered-model"]) {
+      const sampler = createDefaultModelSamplerFactory().create({
+        ref: { provider: "firstParty", modelId },
+        credential: { apiKey: "fixture-secret" },
+        providerConfig: { provider: "firstParty", apiProtocol: "anthropic-messages", baseUrl: "https://stub.example/anthropic", sampleOptions: { model: modelId } },
+      });
+      await sampler.sample([createAgentTextMessage("system", "system"), createAgentTextMessage("user", "读取文件")], [tool], {});
+    }
+    expect(fetchMock.mock.calls).toHaveLength(2);
+    for (const call of fetchMock.mock.calls) expect(String((call as [string, RequestInit])[1].body)).not.toContain("cache_control");
+  });
+
+  it("Anthropic usage 按协议合并缓存桶，每个 token 只计一次", async function normalizesCacheBuckets() {
+    const cases: Array<[Record<string, unknown>, number, Record<string, number>]> = [
+      [{ input_tokens: 276, cache_read_input_tokens: 5200, cache_creation_input_tokens: 0 }, 20, { inputTokens: 5476, outputTokens: 20, contextTokens: 5496 }],
+      [{ input_tokens: 5476, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, 20, { inputTokens: 5476, outputTokens: 20, contextTokens: 5496 }],
+      [{ input_tokens: 10, cache_read_input_tokens: null, cache_creation_input_tokens: 100 }, 5, { inputTokens: 110, outputTokens: 5, contextTokens: 115 }],
+    ];
+    vi.stubGlobal("fetch", fetchMock);
+    for (const [usage, outputTokens, expected] of cases) {
+      fetchMock.mockResolvedValueOnce(createMessagesSseResponse(createCacheUsageEvents(usage, outputTokens)));
+      const result = await createSampler().sample([createAgentTextMessage("user", "测试")], [], {});
+      expect(result.usage).toEqual(expected);
+    }
+  });
+
+  it("非法缓存桶与不完整流都不产生可信 usage", async function rejectsUntrustedCacheUsage() {
+    vi.stubGlobal("fetch", fetchMock);
+    fetchMock.mockResolvedValueOnce(createMessagesSseResponse(createCacheUsageEvents({ input_tokens: 10, cache_read_input_tokens: -1 }, 5)));
+    const invalidBuckets = await createSampler().sample([createAgentTextMessage("user", "测试")], [], {});
+    expect(invalidBuckets).not.toHaveProperty("usage");
+
+    // 只有 message_start 的不完整流：绝不返回可作锚点的部分用量。
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock.mockResolvedValue(createMessagesSseResponse([
+      { type: "message_start", message: { id: "msg-cut", type: "message", role: "assistant", model: "fixture-model", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 10, cache_read_input_tokens: 900, output_tokens: 0 } } },
+    ])));
+    const truncated = createSampler().sample([createAgentTextMessage("user", "测试")], [], {});
+    await expect(truncated).rejects.toBeInstanceOf(AgentSampleError);
+  });
+
+  it("Anthropic 官方 DeepSeek 端点传递有限状态 profile，兼容网关不套用", async function scopesDeepSeekHttpFailure() {
+    const response = function createHttpErrorResponse(): Response {
+      return new Response(JSON.stringify({ type: "error", error: { type: "authentication_error", message: "synthetic provider body" } }), {
+        status: 402,
+        headers: { "Content-Type": "application/json" },
+      });
+    };
+    vi.stubGlobal("fetch", fetchMock);
+    const officialSampler = createFirstPartyModelSampler({
+      baseUrl: "https://api.deepseek.com/anthropic",
+      apiKey: "fixture-secret",
+      sampleOptions: { model: "fixture-model" },
+    });
+    fetchMock.mockResolvedValueOnce(response());
+    await expect(officialSampler.sample([createAgentTextMessage("user", "合成请求")], [], {})).rejects.toMatchObject({
+      code: "PROVIDER_REQUEST_REJECTED",
+      providerHttpStatus: 402,
+      providerFailureReason: "billing_insufficient",
+    });
+
+    const gatewaySampler = createFirstPartyModelSampler({
+      baseUrl: "https://gateway.example/anthropic",
+      apiKey: "fixture-secret",
+      sampleOptions: { model: "fixture-model" },
+    });
+    fetchMock.mockResolvedValueOnce(response());
+    const gatewayFailure = await gatewaySampler.sample([createAgentTextMessage("user", "合成请求")], [], {}).catch(function captureGatewayFailure(value: unknown) { return value; });
+    expect(gatewayFailure).toMatchObject({ code: "PROVIDER_REQUEST_REJECTED", providerHttpStatus: 402 });
+    expect((gatewayFailure as AgentSampleError).providerFailureReason).toBeUndefined();
+  });
+
+  it("Anthropic 协议读取结构化余额事实并区分限流与未知网关", async function normalizesMessagesBusinessFacts() {
+    vi.stubGlobal("fetch", fetchMock);
+    for (const [baseUrl, businessCode, code, reason] of [
+      ["https://api.z.ai/api/anthropic", "1113", "PROVIDER_REQUEST_REJECTED", "billing_insufficient"],
+      ["https://api.z.ai/api/anthropic", "1302", "PROVIDER_RATE_LIMIT", "rate_limited"],
+      ["https://gateway.example/anthropic", "1113", "PROVIDER_REQUEST_REJECTED", undefined],
+    ] as const) {
+      const sampler = createFirstPartyModelSampler({ baseUrl, apiKey: "fixture", sampleOptions: { model: "fixture" } });
+      fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({ error: { code: businessCode, message: "sk-secret /private/path" } }), { status: 429, headers: { "Content-Type": "application/json" } }));
+      const failure = await sampler.sample([createAgentTextMessage("user", "synthetic")], [], {}).catch(function capture(value: AgentSampleError) { return value; }) as AgentSampleError;
+      expect(failure).toMatchObject({ code, providerHttpStatus: 429 });
+      expect(failure.providerFailureReason).toBe(reason);
+      expect(failure.message).not.toContain("sk-secret");
+      expect(failure.message).not.toContain("/private/path");
+    }
+  });
+
+  it("Anthropic 未知网关保留协议标识且不猜测 429", async function exposesGenericMessagesIdentifier() {
+    vi.stubGlobal("fetch", fetchMock.mockResolvedValue(new Response(JSON.stringify({ type: "error", error: { type: "capacity_exhausted", message: "sk-secret /private/path" } }), { status: 429, headers: { "Content-Type": "application/json" } })));
+    const sampler = createFirstPartyModelSampler({ baseUrl: "https://gateway.example/anthropic", apiKey: "fixture", sampleOptions: { model: "fixture" } });
+    const error = await sampler.sample([createAgentTextMessage("user", "synthetic")], [], {}).catch(function capture(value: AgentSampleError) { return value; });
+    expect(error).toMatchObject({ code: "PROVIDER_REQUEST_REJECTED", providerHttpStatus: 429, providerFailureDetail: "type:capacity_exhausted" });
+    expect(JSON.stringify(error)).not.toContain("sk-secret");
+  });
+
   it("将 tool_use 与下一轮 tool_result 映射为 Messages 内容块", async function mapsToolUseAndResult() {
     fetchMock.mockResolvedValueOnce(createMessagesSseResponse(createToolEvents())).mockResolvedValueOnce(createMessagesSseResponse(createTextEvents()));
     vi.stubGlobal("fetch", fetchMock);
@@ -229,13 +430,13 @@ describe("firstParty Anthropic Messages sampler", function firstPartySamplerSuit
         { type: "tool_use", id: "call-thinking", name: "read_file", input: { path: "README.md" } },
       ],
     });
-    expect(function rejectsUnsignedReasoning() {
+    expect(function safelyProjectsOldUnsignedReasoning() {
       createAnthropicMessagesRequest("fixture-model", [
         createAgentTextMessage("user", "读取文件"),
         { role: "assistant", content: [{ type: "reasoning", text: "没有 signature" }, { type: "tool-call", id: "call-invalid", name: "read_file", input: {} }] },
         createAgentToolResultMessage({ toolCallId: "call-invalid", text: "error", isError: true }),
       ], [], {}, 100);
-    }).toThrow("缺少可重放 signature");
+    }).not.toThrow();
   });
 
   /** 创建 MiMo 式无签名 thinking + tool_use 的完成事件序列，覆盖兼容网关响应形状。 */
@@ -374,7 +575,7 @@ describe("firstParty Anthropic Messages sampler", function firstPartySamplerSuit
     fetchMock.mockResolvedValueOnce(new Response('{"error":{"message":"private detail"}}', { status: 429, headers: { "Content-Type": "application/json" } }));
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(createSampler().sample([createAgentTextMessage("user", "测试")], [], {})).rejects.toMatchObject({ code: "PROVIDER_RATE_LIMIT" } satisfies Partial<AgentSampleError>);
+    await expect(createSampler().sample([createAgentTextMessage("user", "测试")], [], {})).rejects.toMatchObject({ code: "PROVIDER_REQUEST_REJECTED", providerHttpStatus: 429 } satisfies Partial<AgentSampleError>);
 
     const controller = new AbortController();
     controller.abort();

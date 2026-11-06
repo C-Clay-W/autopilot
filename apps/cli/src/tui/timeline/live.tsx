@@ -3,9 +3,10 @@
 import { memo, useRef, type ReactNode } from "react";
 import { Box, Text } from "ink";
 import { TUI_ACCENT_COLOR } from "../../design-tokens.js";
+import { getCliTuiExecutionMs } from "../types.js";
 import type { CliTurnStatus } from "../../types.js";
 import { TUI_AGENT_LABEL } from "../constants.js";
-import { formatTuiDuration, formatTuiInputConsumed, getTuiApprovalDecisionLabel, isTerminalStatus } from "../format.js";
+import { formatTuiInputConsumed, getTuiApprovalDecisionLabel, isTerminalStatus } from "../format.js";
 import { TuiMarkdown } from "../markdown/markdown.js";
 import { TuiPromptLine } from "../transcript.js";
 import type { CliTuiTimelineEvent, CliTuiTurnMetrics } from "../types.js";
@@ -162,11 +163,9 @@ function renderTuiLiveTimelineBlock(block: CliTuiTimelineBlock, useColor: boolea
  */
 export const TuiLiveTimeline = memo(function TuiLiveTimeline(props: { turnId: string; events: CliTuiTimelineEvent[]; status: CliTurnStatus; useColor: boolean; maximumWidth: number; metrics?: CliTuiTurnMetrics }): ReactNode {
   const blocks = useCliTuiTimelineBlocks(props.events);
-  const firstAnswerKey = blocks.find(function findFirstAnswer(block): boolean { return block.kind === "answer"; })?.key;
   function renderBlock(block: CliTuiTimelineBlock): ReactNode {
     return (
       <Box key={block.key} flexDirection="column">
-        {block.key === firstAnswerKey && props.metrics?.firstAnswerAt !== undefined ? <Text dimColor={props.useColor}>Thought for {formatTuiDuration(Math.max(0, props.metrics.firstAnswerAt - props.metrics.startedAt))}</Text> : null}
         {renderTuiLiveTimelineBlock(block, props.useColor, isTerminalStatus(props.status), props.maximumWidth)}
       </Box>
     );

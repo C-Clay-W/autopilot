@@ -6,6 +6,7 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { WebWorkspaceContext } from "./web-workspace-host";
+import type { WebTurnHost } from "./web-turn-host";
 import { getWebWorkspaceHost, WebWorkspaceSessionError } from "./web-workspace-server";
 
 const workspaceRequestContext = new AsyncLocalStorage<WebWorkspaceContext>();
@@ -15,14 +16,24 @@ export function getWorkspaceRequestContext(): WebWorkspaceContext | undefined {
   return workspaceRequestContext.getStore();
 }
 
+/** 普通 Work 的唯一执行入口；未装配时明确失败，不回退到请求内直连执行。 */
+export function requireWorkspaceTurnHost(): WebTurnHost {
+  const context = getWorkspaceRequestContext();
+  if (!context?.turnHost) {
+    // 未装配属于宿主内部错误：沿用 WORK_SESSION 的稳定摘要，不泄露装配细节。
+    throw Object.assign(new Error("WORKSPACE_SESSION_FAILED"), { code: "WORKSPACE_SESSION_FAILED" });
+  }
+  return context.turnHost;
+}
+
 /** 在整个异步 Route 生命周期内固定 Context，避免任何全局 current workspace 状态。 */
 export async function runWithWorkspaceRequestContext<T>(context: WebWorkspaceContext, action: () => Promise<T>): Promise<T> {
   return workspaceRequestContext.run(context, action);
 }
 
 /** 校验 workspaceId、Trust 与 Session 的 projectId；拒绝跨产品和未绑定旧记录，不改写历史。 */
-export async function requireWorkspaceSession(workspaceId: string, sessionId?: string): Promise<WebWorkspaceContext> {
-  const context = await getWebWorkspaceHost().getContext(workspaceId);
+export async function requireWorkspaceSession(workspaceId: string, sessionId?: string, options?: { observeOnly?: boolean }): Promise<WebWorkspaceContext> {
+  const context = await getWebWorkspaceHost().getContext(workspaceId, options);
   if (!sessionId) return context;
   const session = await context.runtime.sessions.get(sessionId);
   if (!session) throw new WebWorkspaceSessionError("WORKSPACE_SESSION_NOT_FOUND");

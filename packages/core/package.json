@@ -1,6 +1,6 @@
 {
   "name": "@autopilot-agent/core",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
@@ -8,6 +8,16 @@
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "failure": [
+        "dist/failure.d.ts"
+      ],
+      "ui": [
+        "dist/ui/index.d.ts"
+      ]
+    }
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -18,6 +28,16 @@
       "types": "./dist/experimental/index.d.ts",
       "import": "./dist/experimental/index.mjs",
       "require": "./dist/experimental/index.js"
+    },
+    "./failure": {
+      "types": "./dist/failure.d.ts",
+      "import": "./dist/failure.mjs",
+      "require": "./dist/failure.js"
+    },
+    "./ui": {
+      "types": "./dist/ui/index.d.ts",
+      "import": "./dist/ui/index.mjs",
+      "require": "./dist/ui/index.js"
     }
   },
   "files": [

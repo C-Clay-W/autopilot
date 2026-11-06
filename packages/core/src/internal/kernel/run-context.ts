@@ -39,7 +39,7 @@ export interface ContextCompactionManager {
     tools: AgentModelToolDefinition[];
   }): boolean;
   /** 复用应用层统一 compact 引擎；返回新投影或抛出稳定失败。 */
-  compact(input: { messages: AgentMessage[]; signal: AbortSignal }): Promise<AgentCompactionResult>;
+  compact(input: { messages: AgentMessage[]; tools?: AgentModelToolDefinition[]; signal: AbortSignal }): Promise<AgentCompactionResult>;
 }
 
 /** 工具权限上下文：模式、持久授权查询、审批校验。 */
@@ -62,6 +62,9 @@ export interface PermissionContext {
  * Kernel 内部不再读取 AGENTS.md、Memory 或 Skill 文件。
  */
 export interface RunContext {
+  /** 经宿主校验的图片读取端口和冻结模型能力。 */
+  sessionImageStore?: import("../../runtime/ports/session-image-store").SessionImageStore;
+  supportsImageInput?: boolean;
   hostMutationProtection?: import("../../runtime/ports/host-mutation-protection").HostMutationProtection;
   capabilityCeiling?: import("../../runtime/domain/product-mode").CapabilityCeiling;
   chat?: import("../tools/chat-tool-runtime").ChatToolRuntime;
@@ -122,6 +125,8 @@ export interface RunContext {
   modelSampleOptions?: ModelSampleOptions;
   /** 从 awaitng_approval 恢复时传入的审批决定。 */
   approval?: { approvalId: string; decision: ToolApprovalDecision };
+  /** 内部恢复标记：只签发当前冻结调用的新审批，不允许工具执行。 */
+  reissueApproval?: boolean;
   /** 从 awaitng_user_input 恢复时注入的可信答案；不得由 Browser 直接构造。 */
   userQuestion?: { requestId: string; answer: import("../../runtime/domain").UserQuestionAnswer };
   /** 完整工具批次结束后的 durable checkpoint 回调；不得在工具执行中间调用。 */

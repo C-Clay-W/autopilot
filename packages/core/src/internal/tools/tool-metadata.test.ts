@@ -1,12 +1,13 @@
 /**
  * Stage 11 工具元数据测试：验证注册校验、调度边界，以及新增工具不依赖 Kernel 名称名单。
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { createAgentKernel } from "../kernel/agent-kernel";
 import { createToolScheduler } from "../tool-scheduler";
 import { ToolRegistry } from "./tool-registry";
-import type { AgentToolDefinition, ToolExecutionResult, ToolMetadata } from "./types";
+import { ToolExecutor } from "./tool-executor";
+import type { AgentToolDefinition, ToolMetadata } from "./types";
 import { createAgentTextMessage } from "../types/agent-message";
 
 const probeSchema = z.object({ group: z.string(), timeoutMs: z.number().int().positive().optional() }).strict();
@@ -25,11 +26,6 @@ function createProbeTool(metadata: ToolMetadata, execute?: AgentToolDefinition<z
     },
     serializeOutput(output) { return output; },
   };
-}
-
-/** 构造最小成功终态，避免调度测试依赖真实文件或 Provider。 */
-function success(callId: string, toolName: string): ToolExecutionResult {
-  return { status: "success", callId, toolName, output: {}, meta: { durationMs: 0, inputHash: "test" } };
 }
 
 /** 等待受控短延迟，以便验证并发上限而不接触真实运行时资源。 */
@@ -55,44 +51,57 @@ describe("Stage 11 Tool Metadata", function toolMetadataSuite() {
   });
 
   it("新增测试工具只凭 metadata 获得资源并发、重试上限与超时范围", async function schedulesFromMetadata() {
+    vi.useFakeTimers();
     const registry = new ToolRegistry();
+    let active = 0;
+    let peak = 0;
+    const timeouts: number[] = [];
+    const attempts = new Map<string, number>();
     registry.register(createProbeTool({
       effect: "none",
       destructive: false,
       concurrency: { max: 2, resourceKey: (input) => `probe:${(input as { group: string }).group}` },
       retry: { safe: true, maxRetries: 1 },
       timeout: { defaultMs: 25, maxMs: 50 },
-    }));
-    let active = 0;
-    let peak = 0;
-    const timeouts: number[] = [];
-    const attempts = new Map<string, number>();
-    const scheduler = createToolScheduler(registry, async function execute(request, options) {
-      timeouts.push(options?.timeoutMs ?? 0);
-      const attempt = (attempts.get(request.callId) ?? 0) + 1;
-      attempts.set(request.callId, attempt);
-      if (request.callId === "retry" && attempt === 1) {
-        return { status: "error", callId: request.callId, toolName: request.toolName, error: { code: "TOOL_EXECUTION_FAILED", message: "transient" }, meta: { durationMs: 0, inputHash: "test" } };
+    }, async function executeProbe(input, context) {
+      const callId = context.toolCallId!;
+      const attempt = (attempts.get(callId) ?? 0) + 1;
+      attempts.set(callId, attempt);
+      if (callId === "retry" && attempt === 1) {
+        throw new Error("transient");
       }
       active++;
       peak = Math.max(peak, active);
-      await wait(15);
+      const startedAt = Date.now();
+      // 观察实际执行 signal 的 deadline，而非调度器向 mock 传入的参数。
+      await new Promise<void>(function waitForDeadline(resolve) {
+        context.signal!.addEventListener("abort", function timedOut() { timeouts.push(Date.now() - startedAt); resolve(); }, { once: true });
+      });
       active--;
-      return success(request.callId, request.toolName);
-    });
+      return { group: input.group };
+    }));
+    const executor = new ToolExecutor(registry, { permissionMode: "auto_approve" });
+    const scheduler = createToolScheduler(registry, function execute(request, options) { return executor.execute(request, options); });
 
-    const results = await scheduler.executeCalls([
-      { id: "retry", name: "metadata_probe", input: { group: "shared", timeoutMs: 500 } },
-      { id: "second", name: "metadata_probe", input: { group: "shared" } },
-      { id: "third", name: "metadata_probe", input: { group: "shared" } },
-    ], { maxRetries: 5 });
+    try {
+      const execution = scheduler.executeCalls([
+        { id: "retry", name: "metadata_probe", input: { group: "shared", timeoutMs: 500 } },
+        { id: "second", name: "metadata_probe", input: { group: "shared" } },
+        { id: "third", name: "metadata_probe", input: { group: "shared" } },
+      ], { maxRetries: 5 });
+      await vi.runAllTimersAsync();
+      const results = await execution;
 
-    expect(results.map((result) => result.call.id)).toEqual(["retry", "second", "third"]);
-    expect(results[0].retryCount).toBe(1);
-    expect(attempts.get("retry")).toBe(2);
-    expect(peak).toBe(2);
-    expect(timeouts).toContain(50);
-    expect(timeouts).toContain(25);
+      expect(results.map(function callId(result) { return result.call.id; })).toEqual(["retry", "second", "third"]);
+      expect(results[0].retryCount).toBe(1);
+      expect(attempts.get("retry")).toBe(2);
+      expect(peak).toBe(2);
+      expect(timeouts).toContain(50);
+      expect(timeouts).toContain(25);
+      expect(results.every(function timedOut(item) { return item.result.status === "timeout"; })).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("Kernel 按新工具的 effect metadata 并发，不维护工具名称名单", async function groupsKernelCallsByMetadata() {

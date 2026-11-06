@@ -13,14 +13,13 @@ export interface CapabilityCeiling {
 
 /** 仅此封闭集合可进入 Chat；能力是否存在还须由受信宿主进一步缩小。 */
 const chatTools = {
-  none: ["chat_attachment_read", "chat_vision_analyze"],
-  web: ["web_search", "web_fetch", "chat_attachment_read", "chat_vision_analyze"],
+  none: ["chat_attachment_read", "chat_vision_analyze", "render_ui"],
+  web: ["web_search", "web_fetch", "chat_attachment_read", "chat_vision_analyze", "render_ui"],
   rag: ["rag_search", "chat_vision_analyze"],
 } as const;
 
-/** 验证 Session 身份；旧记录只在这个兼容读取边界按 Work 解释，不落盘迁移。 */
+/** 验证当前格式的 Session 身份；缺少产品模式时拒绝。 */
 export function readSessionIdentity(session: { productMode?: ProductMode; chatRetrievalMode?: ChatRetrievalMode; projectId?: string }): CapabilityCeiling {
-  if (session.productMode === undefined && session.chatRetrievalMode === undefined) return { productMode: "work" };
   if (session.productMode === "chat" && session.projectId === undefined && Object.prototype.hasOwnProperty.call(chatTools, session.chatRetrievalMode ?? "")) {
     const mode = session.chatRetrievalMode!;
     return { productMode: "chat", chatRetrievalMode: mode, allowedTools: [...chatTools[mode]] };

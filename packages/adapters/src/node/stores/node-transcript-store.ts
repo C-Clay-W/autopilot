@@ -5,8 +5,9 @@
 import fsp from "node:fs/promises";
 import path from "node:path";
 import type { AgentEventEnvelope, TranscriptStore } from "@autopilot-agent/core";
+import { assertSafeNodePath } from "../chat-state";
 import { safeFilePath, withAsyncFileLock } from "../file-utils";
-import { ensureNodeStateRoot, getNodeStatePaths } from "../state-root";
+import { assertNodeStateSchema, ensureNodeStateRoot, getNodeStatePaths } from "../state-root";
 import type { NodeStoreOptions } from "../types";
 
 const transcriptIndexes = new Map<string, TranscriptIndex>();
@@ -14,6 +15,8 @@ const transcriptRootInitializations = new Map<string, Promise<void>>();
 
 interface TranscriptIndex {
   initialized: boolean;
+  identity?: string;
+  signature?: string;
   offset: number;
   pendingBytes: Buffer;
   endsWithNewline: boolean;
@@ -23,6 +26,13 @@ interface TranscriptIndex {
 interface ParsedTranscript {
   values: AgentEventEnvelope[];
   lines: string[];
+}
+
+/** 文件身份按十进制字符串保留64位精度，并兼容旧游标中的安全整数。 */
+function parseTranscriptFileIdentity(value: unknown): string {
+  if (typeof value === "string" && /^\d{1,20}$/.test(value)) return BigInt(value).toString();
+  if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) return String(value);
+  throw new Error("THREAD_CURSOR_INVALID");
 }
 
 /** 返回一个可复用的 Session 增量索引。 */
@@ -142,26 +152,23 @@ async function readTranscriptTail(filePath: string, offset: number): Promise<{ b
 
 /** 在跨进程锁内把当前进程遗漏的文件尾部合并进增量索引。 */
 async function refreshTranscriptIndex(filePath: string, index: TranscriptIndex): Promise<void> {
-  if (!index.initialized) {
-    rebuildTranscriptIndex(filePath, await readTranscriptBuffer(filePath), index);
-    return;
-  }
-  let stats: { size: number };
-  try {
-    stats = await fsp.stat(filePath);
-  } catch (error) {
+  let stats;
+  try { stats = await fsp.stat(filePath, { bigint: true }); }
+  catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-    rebuildTranscriptIndex(filePath, Buffer.alloc(0), index);
-    return;
+    rebuildTranscriptIndex(filePath, Buffer.alloc(0), index); index.identity = undefined; index.signature = undefined; return;
   }
-  if (stats.size < index.offset) {
+  const identity = `${stats.dev}:${stats.ino}:${stats.birthtimeNs}`;
+  const signature = `${identity}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
+  const size = Number(stats.size);
+  if (!index.initialized || index.identity !== identity || size < index.offset || size === index.offset && index.signature !== signature) {
     rebuildTranscriptIndex(filePath, await readTranscriptBuffer(filePath), index);
-    return;
+  } else if (size > index.offset) {
+    const tail = await readTranscriptTail(filePath, index.offset);
+    consumeTranscriptBytes(filePath, tail.bytes, index); index.offset = tail.size;
   }
-  if (stats.size === index.offset) return;
-  const tail = await readTranscriptTail(filePath, index.offset);
-  consumeTranscriptBytes(filePath, tail.bytes, index);
-  index.offset = tail.size;
+  index.identity = identity; index.signature = signature;
+
 }
 
 /** 异步追加一个唯一 Transcript 信封，并在追加成功后更新本地索引。 */
@@ -179,6 +186,9 @@ async function appendTranscriptEnvelope(filePath: string, envelope: AgentEventEn
     index.endsWithNewline = true;
     index.offset += bytes.length;
     index.keys.add(key);
+    const stats = await fsp.stat(filePath, { bigint: true });
+    index.identity = `${stats.dev}:${stats.ino}:${stats.birthtimeNs}`;
+    index.signature = `${index.identity}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
   });
 }
 
@@ -201,7 +211,9 @@ export function createNodeTranscriptStore(options: NodeStoreOptions): Transcript
 
   /** 返回指定 Session transcript 文件的安全路径。 */
   function filePath(sessionId: string): string {
-    return safeFilePath(paths.transcriptsDir, sessionId, ".jsonl");
+    const target = safeFilePath(paths.transcriptsDir, sessionId, ".jsonl");
+    assertSafeNodePath(paths.root, target);
+    return target;
   }
 
   return {
@@ -217,6 +229,67 @@ export function createNodeTranscriptStore(options: NodeStoreOptions): Transcript
       return withAsyncFileLock(target, async function readUnderLock() {
         return removeAdjacentDuplicateEnvelopes(rebuildTranscriptIndex(target, await readTranscriptBuffer(target), index));
       });
+    },
+
+    /** 从字节游标增量读取 JSONL，不初始化目录、不持有写锁。 */
+    async readPage(sessionId: string, options: { cursor?: string; limit: number }): Promise<{ items: AgentEventEnvelope[]; nextCursor?: string; cursor?: string }> {
+      if (!Number.isInteger(options.limit) || options.limit < 1 || options.limit > 100) throw new Error("THREAD_CURSOR_INVALID");
+      assertNodeStateSchema(paths.root);
+      let offset = 0;
+      let identity: { dev: string; ino: string; size?: number; stamp?: string } | undefined;
+      if (options.cursor) {
+        try {
+          const data = JSON.parse(Buffer.from(options.cursor, "base64url").toString("utf8")) as { sessionId: string; offset: number; dev: unknown; ino: unknown; size?: number; stamp?: string };
+          if (data.sessionId !== sessionId || !Number.isSafeInteger(data.offset) || data.offset < 0) throw new Error();
+          offset = data.offset; identity = { dev: parseTranscriptFileIdentity(data.dev), ino: parseTranscriptFileIdentity(data.ino), size: data.size, stamp: data.stamp };
+          if (data.size !== undefined && (!Number.isSafeInteger(data.size) || data.size < offset) || data.stamp !== undefined && typeof data.stamp !== "string") throw new Error();
+        } catch { throw new Error("THREAD_CURSOR_INVALID"); }
+      }
+      let handle: import("node:fs/promises").FileHandle;
+      try { handle = await fsp.open(filePath(sessionId), "r"); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") { if (offset === 0) return { items: [] }; throw new Error("THREAD_CURSOR_EXPIRED"); } throw error; }
+      try {
+        const stats = await handle.stat({ bigint: true });
+        const size = Number(stats.size);
+        const dev = stats.dev.toString(); const ino = stats.ino.toString();
+        if (!Number.isSafeInteger(size)) throw new Error("THREAD_PAYLOAD_TOO_LARGE");
+        const stamp = `${stats.mtimeNs}:${stats.ctimeNs}:${stats.birthtimeNs}`;
+        if (identity && (identity.dev !== dev || identity.ino !== ino || identity.size === size && identity.stamp !== undefined && identity.stamp !== stamp)) throw new Error("THREAD_CURSOR_EXPIRED");
+        if (offset > size) throw new Error("THREAD_CURSOR_EXPIRED");
+        if (offset > 0) {
+          const previous = Buffer.alloc(1);
+          await handle.read(previous, 0, 1, offset - 1);
+          if (previous[0] !== 10) throw new Error("THREAD_CURSOR_INVALID");
+        }
+        const items: AgentEventEnvelope[] = [];
+        let position = offset;
+        let lineStart = offset;
+        let pending = Buffer.alloc(0);
+        const chunk = Buffer.alloc(16 * 1024);
+        while (position < size && items.length < options.limit) {
+          const result = await handle.read(chunk, 0, Math.min(chunk.length, size - position), position);
+          if (!result.bytesRead) break;
+          let start = 0;
+          for (let i = 0; i < result.bytesRead; i++) {
+            if (chunk[i] !== 10) continue;
+            const line = pending.length ? Buffer.concat([pending, chunk.subarray(start, i)]) : chunk.subarray(start, i);
+            if (line.length > 1024 * 1024) throw new Error("THREAD_PAYLOAD_TOO_LARGE");
+            let item: AgentEventEnvelope;
+            try { item = JSON.parse(line.toString("utf8")) as AgentEventEnvelope; } catch { throw new Error("DURABLE_JSONL_CORRUPTED"); }
+            if (item.sessionId !== sessionId) throw new Error("DURABLE_JSONL_CORRUPTED");
+            items.push(item);
+            lineStart = position + i + 1; pending = Buffer.alloc(0); start = i + 1;
+            if (items.length === options.limit) break;
+          }
+          if (items.length === options.limit) { position = lineStart; break; }
+          pending = Buffer.concat([pending, chunk.subarray(start, result.bytesRead)]);
+          if (pending.length > 1024 * 1024) throw new Error("THREAD_PAYLOAD_TOO_LARGE");
+          position += result.bytesRead;
+        }
+        if (position >= size && pending.length > 0) throw new Error("DURABLE_JSONL_CORRUPTED");
+        const cursor = Buffer.from(JSON.stringify({ sessionId, offset: lineStart, dev, ino, size, stamp })).toString("base64url");
+        return { items, cursor, ...(lineStart < size ? { nextCursor: cursor } : {}) };
+      } finally { await handle.close(); }
     },
 
     async deleteBySession(sessionId: string): Promise<void> {

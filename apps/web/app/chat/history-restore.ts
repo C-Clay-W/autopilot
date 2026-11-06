@@ -1,5 +1,5 @@
 /** Web Session History 的消息映射与失败重试策略。 */
-import { getLegacyTurnFailure } from "@/lib/runtime-host/web-turn-failure";
+import { getLegacyTurnFailure, normalizePersistedWebTurnFailure } from "@/lib/runtime-host/web-turn-failure";
 import type { WebSessionMessageDto } from "@/lib/runtime-host/web-ui-dto";
 import type { Message, SessionAgentState } from "./chat-page-types";
 
@@ -12,7 +12,8 @@ export function mapHistoryMessage(message: WebSessionMessageDto, agent: SessionA
     role: message.role === "tool" ? "assistant" : message.role,
     // 持久化投影可能同时包含已完成 segments 和最后一段 content；两者都必须保留。
     content: message.content,
-    failure: message.failure ?? (message.role === "assistant" && message.turnId ? getLegacyTurnFailure(message.content) : undefined),
+    failure: normalizePersistedWebTurnFailure(message.failure, message.id)
+      ?? (message.role === "assistant" && message.turnId ? getLegacyTurnFailure(message.content, message.id) : undefined),
     termination: agent
       && message.role === "assistant"
       && typeof agent.turnId === "string"
@@ -26,6 +27,8 @@ export function mapHistoryMessage(message: WebSessionMessageDto, agent: SessionA
     knowledgeFiles: message.knowledgeFiles,
     knowledgeIngestItems: message.knowledgeIngestItems,
     clientRecordId: message.clientRecordId,
+    origin: message.origin,
+    handoffDisplay: message.handoffDisplay,
     createdAt: message.createdAt,
     turnId: message.turnId,
     sources: message.sources?.map(function mapSource(source) {

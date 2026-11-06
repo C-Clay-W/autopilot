@@ -17,6 +17,7 @@ import { TUI_EVENT_PUBLISH_INTERVAL_MS } from "./constants.js";
 import { isTerminalStatus } from "./format.js";
 import { recordTuiPerformanceDiagnostic } from "./performance-diagnostics.js";
 import { captureTuiInputPosition } from "./timeline/turn-items.js";
+import { getCliTuiExecutionMs } from "./types.js";
 import type { CliTuiSnapshot, CliTuiStore, CliTuiTimelineEvent, CliTuiTurnMetrics } from "./types.js";
 
 /** 创建 TUI 初始快照。 */
@@ -114,10 +115,10 @@ export function createCliTuiStore(): CliTuiStore {
     const metrics = metricsByTurn.get(turnId);
     const thoughtDurationMs = metrics?.firstAnswerAt === undefined
       ? undefined
-      : Math.max(0, metrics.firstAnswerAt - metrics.startedAt);
+      : metrics.firstAnswerDurationMs ?? 0;
     const totalDurationMs = metrics?.completedAt === undefined
       ? undefined
-      : Math.max(0, metrics.completedAt - metrics.startedAt);
+      : getCliTuiExecutionMs(metrics, metrics.completedAt);
     // 终态先保留当前 live Turn，让这一帧同时接住最后的 answer/status block；
     // 立即清空会让外层历史区过滤掉同一 Turn，导致最后一段回答不可见。
     snapshot = {
@@ -234,6 +235,7 @@ export function createCliTuiStore(): CliTuiStore {
       });
     },
     acceptEvent(event: CliPublicEvent, projection: CliProjection): void {
+      if (event.type === "thread_wait") { publish({ ...snapshot, threadWait: projection.threadWait }); return; }
       // 用量变化只刷新动态状态栏事实，不进入 transcript 时间线或 scrollback。
       if (event.type === "context_usage") {
         if (snapshot.contextUsage === event.usage) return;
@@ -242,6 +244,9 @@ export function createCliTuiStore(): CliTuiStore {
       }
       // Esc 后只等待 Runtime 的终态；取消请求之后已经在途的回答/工具尾部事件不再进入可见时间线。
       if (snapshot.cancellationRequested && !(event.type === "status" && isTerminalStatus(event.status))) return;
+      if (event.type === "turn_started" && finalizedTurns.delete(event.turnId)) {
+        snapshot = { ...snapshot, transcript: snapshot.transcript.filter(function previousSegment(item) { return item.kind !== "turn" || item.turnId !== event.turnId; }) };
+      }
       const currentEvents = eventsByTurn.get(event.turnId) ?? [];
       if (currentEvents.some(function hasSequence(item): boolean { return item.type === event.type && item.seq === event.seq; })) return;
       const nextEvents: CliTuiTimelineEvent[] = [...currentEvents, event];
@@ -254,11 +259,14 @@ export function createCliTuiStore(): CliTuiStore {
       const eventTime = Date.now();
       const previousMetrics = metricsByTurn.get(event.turnId);
       const nextMetrics: CliTuiTurnMetrics = {
-        startedAt: event.type === "turn_started" ? eventTime : previousMetrics?.startedAt ?? eventTime,
+        startedAt: previousMetrics?.startedAt ?? eventTime,
+        elapsedMs: projection.presentation?.executionByTurn?.[event.turnId]?.elapsedMs ?? previousMetrics?.elapsedMs,
+        runningSince: projection.presentation?.executionByTurn?.[event.turnId]?.runningSince,
+        firstAnswerDurationMs: previousMetrics?.firstAnswerDurationMs,
         firstAnswerAt: previousMetrics?.firstAnswerAt,
-        completedAt: previousMetrics?.completedAt,
+        completedAt: event.type === "turn_started" ? undefined : previousMetrics?.completedAt,
       };
-      if (event.type === "answer_delta" && nextMetrics.firstAnswerAt === undefined) nextMetrics.firstAnswerAt = eventTime;
+      if (event.type === "answer_delta" && nextMetrics.firstAnswerAt === undefined) { nextMetrics.firstAnswerAt = eventTime; nextMetrics.firstAnswerDurationMs = getCliTuiExecutionMs(nextMetrics, eventTime); }
       // Core 的 reset/discard 表示当前采样的暂定文字不能展示；下一次真正回答重新计时。
       if (event.type === "answer_reset") nextMetrics.firstAnswerAt = undefined;
       if (event.type === "status" && isTerminalStatus(event.status)) nextMetrics.completedAt = eventTime;
@@ -274,6 +282,7 @@ export function createCliTuiStore(): CliTuiStore {
         hasLiveApprovalEvent: isNewTurn ? event.type === "approval_required" : snapshot.hasLiveApprovalEvent || event.type === "approval_required",
         activity: nextActivity,
         status: projection.status,
+        threadWait: projection.threadWait,
         recoverable: projection.recoverable,
         pendingApproval: projection.pendingApproval && !submittedApprovalIds.has(projection.pendingApproval.approvalId)
           ? { ...projection.pendingApproval }
@@ -310,6 +319,12 @@ export function createCliTuiStore(): CliTuiStore {
       }
     },
     syncProjection(projection: CliProjection): void {
+      // Controller已过滤正在提交或已保存的请求，权威pending重现表示保存失败，可重试原请求。
+      if (projection.pendingApproval) submittedApprovalIds.delete(projection.pendingApproval.approvalId);
+      // 身份失效只关闭交互；已打开的旧正文保留为最后观察到的历史，不伪造终态。
+      if (snapshot.liveTurnId && projection.turnId !== snapshot.liveTurnId && snapshot.liveEvents.length && !snapshot.transcript.some(function existing(item) { return item.kind === "turn" && item.turnId === snapshot.liveTurnId; })) {
+        snapshot = { ...snapshot, transcript: [...snapshot.transcript, { kind: "turn", key: "observed:" + snapshot.liveTurnId, turnId: snapshot.liveTurnId, events: snapshot.liveEvents, presentation: snapshot.livePresentation, status: snapshot.status }] };
+      }
       if (projection.turnId && !eventsByTurn.has(projection.turnId) && projection.events.length > 0) eventsByTurn.set(projection.turnId, projection.events.filter(function belongs(event) { return event.turnId === projection.turnId; }));
       const turnIsFinalized = projection.turnId ? finalizedTurns.has(projection.turnId) : false;
       const isNewTurn = projection.turnId !== undefined && projection.turnId !== snapshot.liveTurnId;
@@ -335,6 +350,7 @@ export function createCliTuiStore(): CliTuiStore {
         hasLiveApprovalEvent: Boolean(keepLiveTurn && !isNewTurn && snapshot.hasLiveApprovalEvent),
         activity,
         status: projection.status,
+        threadWait: projection.threadWait,
         recoverable: projection.recoverable,
         pendingApproval: projection.pendingApproval && !submittedApprovalIds.has(projection.pendingApproval.approvalId)
           ? { ...projection.pendingApproval }

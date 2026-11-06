@@ -7,6 +7,7 @@
  */
 
 import type { AgentLoopEvent } from "../../../internal/agent-runtime";
+import { randomUUID } from "node:crypto";
 import { recordPerformanceDiagnostic } from "../../../internal/performance-diagnostics";
 import type { AgentEvent, AgentEventEnvelope } from "../../protocol";
 import { createEventEnvelope } from "../../protocol";
@@ -21,6 +22,8 @@ export interface TurnEventRecordInput {
   /** ephemeral Session 跳过 Transcript 持久化，EventSink 始终写入。 */
   isDurable: boolean;
   event: AgentLoopEvent;
+  /** 已提交安全事件后、外部消费前提交匹配checkpoint及摘要；不让宿主流清理决定业务状态。 */
+  onPersisted?(): Promise<void>;
 }
 
 /** Runtime 事件持久化共享边界的职责。 */
@@ -43,22 +46,33 @@ export function createTurnEventRecorder(ports: RuntimePorts): TurnEventRecorder 
 
   /** 构造脱敏信封并写入 Transcript 与 EventSink；对外只返回安全事件副本。 */
   async function record(input: TurnEventRecordInput): Promise<AgentEvent> {
+    const event = input.event.type === "turn_failed"
+      ? {
+        ...input.event,
+        feedbackId: typeof input.event.feedbackId === "string"
+          && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.event.feedbackId)
+          ? input.event.feedbackId
+          : randomUUID(),
+      }
+      : input.event;
+    const safeEvent = sanitizeEventForExternal(event);
     const envelope: AgentEventEnvelope = createEventEnvelope({
       seq: input.seq,
       sessionId: input.sessionId,
       turnId: input.turnId,
       timestamp: ports.clock.timestamp(),
-      event: sanitizeEventForExternal(input.event),
+      event: safeEvent,
     });
     if (input.isDurable) {
       const transcriptStartedAt = performance.now();
       await ports.transcriptStore.append(input.sessionId, envelope);
       recordPerformanceDiagnostic("transcript_completed", input.event.type, performance.now() - transcriptStartedAt);
     }
+    await input.onPersisted?.();
     const eventSinkStartedAt = performance.now();
     await ports.eventSink.write(envelope);
     recordPerformanceDiagnostic("event_sink_completed", input.event.type, performance.now() - eventSinkStartedAt);
-    return sanitizeEventForExternal(input.event);
+    return safeEvent;
   }
 
   return { nextSeq, record };

@@ -8,6 +8,8 @@ import ActivityIndicator from "./ActivityIndicator";
 import KnowledgeIngestCard from "./KnowledgeIngestCard";
 import KnowledgeIngestProgress from "./KnowledgeIngestProgress";
 import TurnPresentation from "./TurnPresentation";
+import PromptMessage from "./PromptMessage";
+import type { UiContinuation } from "./interactive-ui/continue-chat";
 import type { UserQuestionAnswerDraft } from "./AskUserQuestionCard";
 import { selectAssistantAnswers, type AgentPresentationState, type ApprovalItem, type UserQuestionItem } from "@autopilot-agent/presentation";
 import type { ChatRetrievalMode } from "@autopilot-agent/core";
@@ -19,7 +21,9 @@ import type { WebActivityState } from "@/lib/runtime-host/web-activity";
 import type { WorkspaceSummary } from "../session-task-context";
 
 interface ChatMessageItemProps {
+  uiContinuation?: UiContinuation;
   msg: Message;
+  showTurnPresentation?: boolean;
   workspaceId: string;
   workspace: WorkspaceSummary | undefined;
   sessionId: string;
@@ -50,22 +54,30 @@ interface ChatMessageItemProps {
   workPreview?: WorkPreviewViewProps;
 }
 
+/** 用户正文走共享Prompt气泡，助手正文保留现有无边框容器。 */
+function MessageBody({ user, fromThread, fullWidth, children }: { user: boolean; fromThread: boolean; fullWidth: boolean; children: ReactNode }) {
+  return user ? <PromptMessage fromThread={fromThread}>{children}</PromptMessage> : <div className={`group relative break-words ${fullWidth ? "py-3" : "px-4 py-3"} text-sm leading-relaxed text-ink`}>{children}</div>;
+}
+
 /** 渲染单条消息气泡；展示顺序、条件分支和回调接线与原页面保持一致。 */
-function ChatMessageItem({ msg, workspaceId, workspace, sessionId, isChat, currentRetrieval, presentation, showProcess, renderEvidence, loading, canWrite, readOnlyReason, activity, setRequestedJobId, handleApproval, handleUserQuestion, cancelCurrentTurn, handleContinueTurn, stopping, editingPrompt, setEditingPrompt, handleResendEditedPrompt, handleCopyMessage, copiedMessageId, handleEditPrompt, setSelectedImage, workPreview }: ChatMessageItemProps) {
+function ChatMessageItem({ msg, showTurnPresentation = true, workspaceId, workspace, sessionId, isChat, currentRetrieval, presentation, showProcess, renderEvidence, loading, canWrite, readOnlyReason, activity, setRequestedJobId, handleApproval, handleUserQuestion, cancelCurrentTurn, handleContinueTurn, stopping, editingPrompt, setEditingPrompt, handleResendEditedPrompt, handleCopyMessage, copiedMessageId, handleEditPrompt, setSelectedImage, workPreview, uiContinuation }: ChatMessageItemProps) {
+  // Work时间线内包含右对齐Prompt，父容器需共享完整消息列，避免二次限宽与内缩。
+  const fullWidth = msg.role === "assistant" && Boolean(msg.turnId) && !isChat;
   const assistantAnswers = msg.role === "assistant" && msg.turnId ? selectAssistantAnswers(presentation, msg.turnId) : [];
   const assistantReplyContent = assistantAnswers[assistantAnswers.length - 1]?.content ?? (msg.role === "assistant" && !msg.turnId ? msg.content : undefined);
+  const turnSummary = presentation.items.find(function summary(item) { return item.kind === "turn_summary" && item.turnId === msg.turnId; });
+  const replyFinished = msg.turnId
+    ? turnSummary?.kind === "turn_summary" && (turnSummary.state === "completed" || turnSummary.state === "failed" || (turnSummary.state === "interrupted" && msg.termination?.recoverable === false)) && !msg.canContinue && msg.termination?.recoverable !== true && !msg.activity && msg.stopState !== "requesting" && msg.stopState !== "pending" && !presentation.items.some(function waiting(item) { return "turnId" in item && item.turnId === msg.turnId && (item.kind === "approval" || item.kind === "user_question") && item.state === "required"; })
+    : !msg.activity && !msg.canContinue;
+  if (msg.role === "assistant" && msg.turnId && !showTurnPresentation) return null;
 
   return (
     <div
       className={`flex ${msg.role === "user" ? "justify-end" : "justify-start"}`}
     >
-      <div
-        className={`max-w-[80%] px-4 py-3 text-sm leading-relaxed ${
-          msg.role === "user"
-            ? "group relative bg-card border-2 border-ink text-ink"
-            : "group relative text-ink"
-        }`}
-      >
+      {/* Work时间线使用整列，普通Prompt仍在各自容器内限宽并右对齐。 */}
+      <div className={fullWidth ? "w-full" : msg.role === "assistant" ? "w-fit min-w-[min(32rem,100%)] max-w-[80%]" : "max-w-[80%]"}>
+        <MessageBody user={msg.role === "user"} fromThread={msg.origin?.kind === "thread"} fullWidth={fullWidth}>
         {msg.role === "assistant" && (
           <span className="inline-flex items-center justify-center w-5 h-5 text-ink-on-dark text-xs mr-2"></span>
         )}
@@ -100,6 +112,8 @@ function ChatMessageItem({ msg, workspaceId, workspace, sessionId, isChat, curre
         {msg.diagnostics?.map((diagnostic, index) => <div key={`${diagnostic}-${index}`} className="mt-2 border-l-4 border-accent bg-accent/10 px-3 py-2 text-xs">{diagnostic}</div>)}
         {msg.role === "assistant" && msg.turnId && (
           <TurnPresentation
+            uiContinuation={uiContinuation}
+            workspaceId={workspaceId}
             state={presentation}
             turnId={msg.turnId}
             showThinking={showProcess}
@@ -111,7 +125,7 @@ function ChatMessageItem({ msg, workspaceId, workspace, sessionId, isChat, curre
             productMode={isChat ? "chat" : "work"}
             workPreview={workPreview}
             ragEvidence={isChat && currentRetrieval === "rag"}
-            disabled={loading || !canWrite}
+            disabled={loading || !canWrite || stopping}
             isResuming={msg.activity === "answer"}
             activity={activity}
             onOpenBackgroundJob={function openBackgroundJob(jobId) { setRequestedJobId(jobId); }}
@@ -128,6 +142,7 @@ function ChatMessageItem({ msg, workspaceId, workspace, sessionId, isChat, curre
         {msg.content && msg.role === "assistant" && !msg.turnId && (
           <MarkdownRenderer content={msg.content} ragEvidence={isChat && currentRetrieval === "rag"} onOpenInPreview={workPreview?.onOpenInPreview} />
         )}
+        {!isChat && msg.role === "assistant" && msg.stopState && <p role="status" className="mt-3 text-xs text-muted">{msg.stopState === "requesting" ? "正在请求停止，等待执行宿主确认。" : msg.stopState === "pending" ? "停止待确认，可刷新状态或重试停止。" : "任务已停止。"}</p>}
         {/* 继续/停止的失败原因在当前消息内结构化展示，不依赖不可见的普通 content（H2）。 */}
         {!isChat && !readOnlyReason && msg.role === "assistant" && msg.recoveryError && (
           <p role="alert" className="mt-3 border-l-4 border-error bg-error/10 px-3 py-2 text-xs text-ink">{msg.recoveryError}</p>
@@ -143,8 +158,8 @@ function ChatMessageItem({ msg, workspaceId, workspace, sessionId, isChat, curre
             {stopping ? "正在停止…" : "继续执行"}
           </button>
         )}
-        {msg.role === "assistant" && assistantReplyContent && (
-          <div className="absolute left-4 top-full z-10 hidden pt-1 group-hover:block group-focus-within:block">
+        {msg.role === "assistant" && assistantReplyContent && replyFinished && (
+          <div className="absolute left-4 top-full z-10 pt-1 opacity-0 pointer-events-none group-hover:opacity-100 group-hover:pointer-events-auto group-focus-within:opacity-100 group-focus-within:pointer-events-auto">
             <button
               type="button"
               onClick={() => void handleCopyMessage(msg.id, assistantReplyContent, "回复")}
@@ -195,6 +210,12 @@ function ChatMessageItem({ msg, workspaceId, workspace, sessionId, isChat, curre
           ) : (
             <>
               <span className="whitespace-pre-wrap">{msg.content}</span>
+              {msg.origin?.kind === "thread" && msg.handoffDisplay && (
+                <details className="mt-3 border-t border-ink/20 pt-2">
+                  <summary className="cursor-pointer text-xs font-semibold">交接摘要</summary>
+                  <p className="mt-2 whitespace-pre-wrap">{msg.handoffDisplay.summary}</p>
+                </details>
+              )}
               <div className="absolute right-0 top-full z-10 hidden pt-1 group-hover:block group-focus-within:block">
                 <div className="flex gap-1">
                   <button
@@ -220,6 +241,7 @@ function ChatMessageItem({ msg, workspaceId, workspace, sessionId, isChat, curre
             </>
           )
         )}
+      </MessageBody>
       </div>
     </div>
   );
@@ -247,7 +269,8 @@ function areChatMessageItemPropsEqual(previous: ChatMessageItemProps, next: Chat
     && activityUnchanged
   && previous.editingPrompt === next.editingPrompt
   && previous.copiedMessageId === next.copiedMessageId
-  && previous.workPreview === next.workPreview;
+  && previous.workPreview === next.workPreview
+  && previous.uiContinuation === next.uiContinuation;
 }
 
 export default memo(ChatMessageItem, areChatMessageItemPropsEqual);

@@ -4,6 +4,7 @@
 import { useCallback, useState, useEffect } from "react";
 import type { RefObject } from "react";
 import type { AgentStorageQuotaView } from "../components/StorageQuotaPanel";
+import type { ToolPermissionMode } from "@autopilot-agent/core";
 import { getStoredToggle } from "../chat-page-helpers";
 import type {
   SkillCatalogEntry,
@@ -23,6 +24,8 @@ export function useWorkControls({ isChat, workspaceId, canWriteRef, hasWorkspace
   const [showSources, setShowSources] = useState(false);
   const [showProcess, setShowProcess] = useState(true);
   const [databaseEnabled, setDatabaseEnabled] = useState(false);
+  /** 会话级工具权限模式；默认每次询问，选择随下一个 POST 持久化为该会话的缺省。 */
+  const [permissionMode, setPermissionMode] = useState<ToolPermissionMode>("ask");
   const [databaseSyncing, setDatabaseSyncing] = useState(false);
   const [databaseSyncMessage, setDatabaseSyncMessage] = useState("");
   const [databaseSyncElapsedSeconds, setDatabaseSyncElapsedSeconds] = useState(0);
@@ -171,6 +174,7 @@ export function useWorkControls({ isChat, workspaceId, canWriteRef, hasWorkspace
     showSources, setShowSources,
     showProcess, setShowProcess,
     databaseEnabled, setDatabaseEnabled,
+    permissionMode, setPermissionMode,
     databaseSyncing,
     databaseSyncMessage,
     databaseSyncElapsedSeconds,

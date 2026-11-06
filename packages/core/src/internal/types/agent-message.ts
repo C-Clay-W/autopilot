@@ -11,12 +11,16 @@ export type AgentMessageRole = "system" | "user" | "assistant";
 /** V2 内容块使用的 JSON 对象输入。 */
 export type AgentJsonObject = Record<string, unknown>;
 
+/** 用户附件与工具截图共用的受信图片引用，不携带编码或宿主路径。 */
+export interface AgentImageReference { type: "image-ref"; id: string; sha256: string; width: number; height: number }
+
 /** V2 canonical 的 Provider 中立内容块。 */
 export type AgentContentBlock =
   | { type: "text"; text: string }
+  | AgentImageReference
   | { type: "reasoning"; text: string }
   | { type: "tool-call"; id: string; name: string; input: AgentJsonObject }
-  | { type: "tool-result"; toolCallId: string; content: Array<{ type: "text"; text: string }>; isError: boolean };
+  | { type: "tool-result"; toolCallId: string; content: Array<{ type: "text"; text: string }>; isError: boolean; images?: AgentImageReference[] };
 
 /** V2 canonical 消息；replay state 只允许同协议 Adapter 在私有边界读取。 */
 export interface AgentMessage {
@@ -122,6 +126,12 @@ function normalizeContentBlock(value: unknown, messageIndex: number, blockIndex:
     }
     return value.text.length > 0 ? { type: value.type, text: value.text } : undefined;
   }
+  if (value.type === "image-ref") {
+    if (!hasExactKeys(value, ["type", "id", "sha256", "width", "height"]) || typeof value.id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value.id) || typeof value.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(value.sha256) || !Number.isSafeInteger(value.width) || !Number.isSafeInteger(value.height) || (value.width as number) < 1 || (value.height as number) < 1 || (value.width as number) > 2000 || (value.height as number) > 2000) {
+      failCanonical(`第 ${messageIndex} 条消息包含非法图片引用`);
+    }
+    return { type: "image-ref", id: value.id, sha256: value.sha256, width: value.width as number, height: value.height as number };
+  }
   if (value.type === "tool-call") {
     if (!hasExactKeys(value, ["type", "id", "name", "input"])
       || !isNonEmptyString(value.id)
@@ -132,7 +142,7 @@ function normalizeContentBlock(value: unknown, messageIndex: number, blockIndex:
     return { type: "tool-call", id: value.id, name: value.name, input: value.input };
   }
   if (value.type === "tool-result") {
-    if (!hasExactKeys(value, ["type", "toolCallId", "content", "isError"])
+    if (!hasAllowedKeys(value, ["type", "toolCallId", "content", "isError"], ["images"])
       || !isNonEmptyString(value.toolCallId)
       || typeof value.isError !== "boolean"
       || !Array.isArray(value.content)) {
@@ -144,7 +154,14 @@ function normalizeContentBlock(value: unknown, messageIndex: number, blockIndex:
       }
       return result.text.length > 0 ? [{ type: "text", text: result.text }] : [];
     });
-    return { type: "tool-result", toolCallId: value.toolCallId, content, isError: value.isError };
+    if (value.images !== undefined && (!Array.isArray(value.images) || value.images.length > 10)) failCanonical("工具图片引用数量非法");
+    const images = (value.images as unknown[] | undefined)?.map(function normalizeToolImage(image) {
+      if (!isPlainRecord(image) || image.type !== "image-ref") failCanonical("工具图片必须为受信引用");
+      const block = normalizeContentBlock(image, messageIndex, blockIndex);
+      if (block?.type !== "image-ref") failCanonical("工具图片必须为受信引用");
+      return block;
+    });
+    return { type: "tool-result", toolCallId: value.toolCallId, content, isError: value.isError, ...(images?.length ? { images } : {}) };
   }
   failCanonical(`第 ${messageIndex} 条消息包含未知内容块类型`);
 }
@@ -168,6 +185,7 @@ function validateMessageShape(message: AgentMessage, index: number): void {
       if (typeof block.text !== "string") failCanonical(`第 ${index} 条消息包含非法文本块`);
       if (block.type === "reasoning" && message.role !== "assistant") failCanonical(`第 ${index} 条消息的 reasoning 角色非法`);
     }
+    if (block.type === "image-ref" && (message.role !== "user" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(block.id))) failCanonical(`第 ${index} 条消息包含非法图片引用`);
     if (block.type === "tool-call") {
       if (message.role !== "assistant" || !isNonEmptyString(block.id) || !isNonEmptyString(block.name) || !isJsonObject(block.input)) {
         failCanonical(`第 ${index} 条消息包含非法工具调用`);
@@ -186,7 +204,7 @@ function validateMessageShape(message: AgentMessage, index: number): void {
   }
   if (message.role === "system" && message.content.some(function isNotText(block) { return block.type !== "text"; })) failCanonical(`第 ${index} 条 system 消息只能包含文本`);
   if (message.role === "user" && hasToolResult && (message.content.length !== 1 || message.content[0]?.type !== "tool-result")) failCanonical(`第 ${index} 条工具结果消息必须独占一个 block`);
-  if (message.role === "user" && !hasToolResult && message.content.some(function isNotText(block) { return block.type !== "text"; })) failCanonical(`第 ${index} 条普通 user 消息只能包含文本`);
+  if (message.role === "user" && !hasToolResult && message.content.some(function isNotUserContent(block) { return block.type !== "text" && block.type !== "image-ref"; })) failCanonical(`第 ${index} 条普通 user 消息只能包含文本或图片引用`);
   if (message.role === "assistant" && message.content.some(function isToolResultBlock(block) { return block.type === "tool-result"; })) failCanonical(`第 ${index} 条 assistant 消息不能包含工具结果`);
 }
 
@@ -230,6 +248,11 @@ export function getAgentMessageText(message: AgentMessage): string {
   }).join("");
 }
 
+/** 统一收集普通附件与工具结果中的图片，供预算、回退和恢复使用。 */
+export function getAgentImageReferences(message: AgentMessage): AgentImageReference[] {
+  return message.content.flatMap(function collectImages(block) { return block.type === "image-ref" ? [block] : block.type === "tool-result" ? block.images ?? [] : []; });
+}
+
 /** 创建只含普通文本的 canonical 消息。 */
 export function createAgentTextMessage(role: AgentMessageRole, text: string): AgentMessage {
   return { role, content: [{ type: "text", text }] };
@@ -240,10 +263,11 @@ export function createAgentToolResultMessage(input: {
   toolCallId: string;
   text: string;
   isError: boolean;
+  images?: AgentImageReference[];
 }): AgentMessage {
   return {
     role: "user",
-    content: [{ type: "tool-result", toolCallId: input.toolCallId, content: [{ type: "text", text: input.text }], isError: input.isError }],
+    content: [{ type: "tool-result", toolCallId: input.toolCallId, content: [{ type: "text", text: input.text }], isError: input.isError, ...(input.images?.length ? { images: input.images } : {}) }],
   };
 }
 

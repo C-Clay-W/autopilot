@@ -7,6 +7,8 @@
 
 import type { AgentEventEnvelope } from "@autopilot-agent/core";
 import { toWebAgentEventDto } from "./web-ui-dto";
+import { toWebTurnFailure } from "./web-turn-failure";
+import { recordWebTurnFailureDiagnostic } from "./web-performance-diagnostics";
 
 export interface SseLineOptions {
   /** 当前 turn 标识；会注入到每条 SSE 事件。 */
@@ -44,7 +46,9 @@ export function encodeSseStream(lines: AsyncIterable<string>): ReadableStream<Ui
         }
         controller.close();
       } catch (error) {
-        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "turn_failed", error: "任务执行失败，请稍后重新发送；如果持续失败，请检查模型配置。" })}\n\n`));
+        const failure = toWebTurnFailure(error, undefined, { failureStage: "web_stream", diagnosticCode: "WEB_STREAM_FAILED" });
+        recordWebTurnFailureDiagnostic(failure);
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "turn_failed", error: failure.message, feedbackId: failure.feedbackId, failure })}\n\n`));
         controller.enqueue(encoder.encode("data: [DONE]\n\n"));
         controller.close();
       }

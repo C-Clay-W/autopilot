@@ -51,8 +51,10 @@ function renderTextEvent(event: CliPublicEvent): string {
     case "context_compact_circuit_open": return "context compact circuit open";
     // 用量变化只属于动态状态栏；text 输出空行跳过，JSONL 仍输出结构化安全 DTO。
     case "context_usage": return "";
+    // 关联等待只刷新交互状态；JSONL继续输出结构化事实。
+    case "thread_wait": return "";
     case "active_skills": return `active skills: ${event.skills.map(function skillId(skill) { return skill.skillId; }).join(", ") || "none"}`;
-    case "status": return `status: ${event.status}${event.code ? ` (${event.code})` : ""}${event.reason ? ` · ${event.reason}` : ""}${event.termination ? ` · ${formatAgentTermination(event.termination)}` : ""}`;
+    case "status": return `status: ${event.status}${event.code ? ` (${event.code})` : ""}${event.reason ? ` · ${event.reason}` : ""}${event.providerHttpStatus !== undefined ? ` · HTTP 状态：${event.providerHttpStatus}` : ""}${event.providerFailureDetail ? ` · 上游标识：${event.providerFailureDetail}` : ""}${event.feedbackId ? ` · 反馈 ID：${event.feedbackId}` : ""}${event.termination ? ` · ${formatAgentTermination(event.termination)}` : ""}`;
   }
 }
 

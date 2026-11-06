@@ -31,10 +31,11 @@ export async function resolveTurnCapabilities(input: {
   if (identity.productMode === "work") {
     // Work 预览能力只从受信宿主 runtimeDefault 装配；override 不可注入或替换，
     // 旧 Turn（冻结缺失/禁用）不开新能力，禁用或宿主移除时明确不可用且不换 OS opener。
-    const capabilities: TurnCapabilities = { ...runtimeDefault, ...override, rag: undefined, chatLoader: undefined, ragSourcePolicy: undefined, rerankPolicy: undefined, focusedPdfFileName: undefined, workPreview: undefined, workPreviewLoader: undefined };
+    // 协作能力只从受信宿主默认值装配；Turn/Project/Session override 不能注入或替换它。
+    const capabilities: TurnCapabilities = { ...runtimeDefault, ...override, rag: undefined, chatLoader: undefined, ragSourcePolicy: undefined, rerankPolicy: undefined, focusedPdfFileName: undefined, workPreview: undefined, workPreviewLoader: undefined, threads: continuing && input.frozen.threadsEnabled !== true ? undefined : runtimeDefault.threads };
     if (capabilities.webLoader) capabilities.web = await capabilities.webLoader();
     if (input.frozen.workPreviewEnabled === true) capabilities.workPreview = await runtimeDefault.workPreviewLoader?.();
-    return { capabilities, frozen: { ...input.frozen, workContextVersion: 1, ragSourcePolicy: undefined, rerankPolicy: undefined, capabilityCeiling: ceiling } };
+    return { capabilities, frozen: { ...input.frozen, threadsEnabled: continuing ? input.frozen.threadsEnabled === true : Boolean(runtimeDefault.threads), workContextVersion: 1, ragSourcePolicy: undefined, rerankPolicy: undefined, capabilityCeiling: ceiling } };
   }
   const binding: ChatCapabilityBinding = { sessionId: session.id, turnId, retrievalMode: identity.chatRetrievalMode! };
   const loaded = await runtimeDefault.chatLoader?.(binding);

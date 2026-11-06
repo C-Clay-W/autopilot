@@ -33,6 +33,8 @@ export interface FrozenProviderConfig {
   sampleOptions?: ModelSampleOptions;
   /** 当前 Turn 选中模型的完整上下文窗口；由 Context Usage 投影与 auto compact 共用。 */
   contextWindowTokens?: number;
+  /** 从受信模型目录冻结；旧 Turn 未声明时按不支持处理。 */
+  supportsImageInput?: boolean;
   /** settings 指定的保守 auto-compact 阈值；未指定时沿用模型窗口推导。 */
   compactThresholdTokens?: number;
   /** 本次 Provider 请求的超时上限；只存在于私有 Turn 快照。 */

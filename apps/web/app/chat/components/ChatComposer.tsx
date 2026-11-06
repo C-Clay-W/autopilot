@@ -3,9 +3,10 @@
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from "react";
 import SelectedSkillChip from "./SelectedSkillChip";
+import ChatImagePreview from "./ChatImagePreview";
 import { ChatRetrievalControls } from "./ChatModeControls";
 import type { UserQuestionItem } from "@autopilot-agent/presentation";
-import type { ChatRetrievalMode } from "@autopilot-agent/core";
+import type { ChatRetrievalMode, ToolPermissionMode } from "@autopilot-agent/core";
 import { CHAT_SCOPE, sessionApiUrl } from "../conversation-target";
 import { formatSize, formatSyncElapsed } from "../chat-page-helpers";
 import type { ChatAttachmentView, ComposerInputActions, InputDeliveryNotice, PendingAgentInput, SelectedFile, SelectedSkill } from "../chat-page-types";
@@ -53,6 +54,8 @@ interface ChatComposerProps {
   setShowProcess: Dispatch<SetStateAction<boolean>>;
   databaseEnabled: boolean;
   setDatabaseEnabled: Dispatch<SetStateAction<boolean>>;
+  permissionMode: ToolPermissionMode;
+  setPermissionMode: Dispatch<SetStateAction<ToolPermissionMode>>;
   onRetrievalChange: (mode: ChatRetrievalMode) => void;
   hasWorkspace: boolean;
   fileInputRef: RefObject<HTMLInputElement | null>;
@@ -79,11 +82,32 @@ interface ChatComposerProps {
 }
 
 /** 渲染输入区完整 UI；条件分支、事件回调与原页面保持一致。 */
-export default function ChatComposer({ pendingInputs, cancelPendingInput, setInputDelivery, textareaRef, inputRef, inputActionsRef, inputDeliveryNotice, readOnlyReason, isChat, loading, submissionActivity, currentRetrieval, requestAbortRef, chatAttachments, sessionId, selectedFiles, setSelectedFiles, onOpenWorkspacePicker, workspace, setSkillPickerOpen, selectedSkills, getSkillDisplayName, toggleSelectedSkill, togglePinnedSkill, showSources, setShowSources, showProcess, setShowProcess, databaseEnabled, setDatabaseEnabled, onRetrievalChange, hasWorkspace, fileInputRef, handleFileSelect, handleDragEnter, handleDragOver, handleDragLeave, handleDrop, pendingUserQuestion, canWrite, handleKeyDown, activeTurnId, handleSend, handleContinueTurn, resumableMessageId, stopping, cancelCurrentTurn, databaseSyncMessage, databaseSyncing, databaseSyncElapsedSeconds, inputDelivery }: ChatComposerProps) {
+export default function ChatComposer({ pendingInputs, cancelPendingInput, setInputDelivery, textareaRef, inputRef, inputActionsRef, inputDeliveryNotice, readOnlyReason, isChat, loading, submissionActivity, currentRetrieval, requestAbortRef, chatAttachments, sessionId, selectedFiles, setSelectedFiles, onOpenWorkspacePicker, workspace, setSkillPickerOpen, selectedSkills, getSkillDisplayName, toggleSelectedSkill, togglePinnedSkill, showSources, setShowSources, showProcess, setShowProcess, databaseEnabled, setDatabaseEnabled, permissionMode, setPermissionMode, onRetrievalChange, hasWorkspace, fileInputRef, handleFileSelect, handleDragEnter, handleDragOver, handleDragLeave, handleDrop, pendingUserQuestion, canWrite, handleKeyDown, activeTurnId, handleSend, handleContinueTurn, resumableMessageId, stopping, cancelCurrentTurn, databaseSyncMessage, databaseSyncing, databaseSyncElapsedSeconds, inputDelivery }: ChatComposerProps) {
   const [input, setInputState] = useState("");
+  const [previews, setPreviews] = useState<Array<{ url: string; alt: string; file: File }>>([]);
+  const [previewIndex, setPreviewIndex] = useState<number | null>(null);
+  /** 待确认的放宽目标；null 表示无待确认项，收紧回每次询问不弹确认。 */
+  const [fullAccessConfirmOpen, setFullAccessConfirmOpen] = useState(false);
+  const permissionCancelRef = useRef<HTMLButtonElement>(null);
+
+  /** 弹窗打开时聚焦取消按钮，关闭后焦点回到触发按钮（同 WorkspaceTrustDialog 范式）。 */
+  useEffect(function focusPermissionCancelButton() {
+    if (!fullAccessConfirmOpen) return;
+    const trigger = document.activeElement as HTMLElement | null;
+    window.requestAnimationFrame(function focusCancelButton() { permissionCancelRef.current?.focus(); });
+    return function restorePermissionTrigger() { if (trigger?.isConnected) trigger.focus(); };
+  }, [fullAccessConfirmOpen]);
   const previousInputRef = useRef(input);
   /** 空输入、非运行中且存在结构化可恢复 Turn 时，右侧按钮改为继续入口。 */
   const continueReady = !isChat && !loading && !stopping && canWrite && Boolean(resumableMessageId) && !input.trim() && selectedFiles.length === 0;
+
+  /** 为待发送图片维护临时地址，文件变化或卸载时释放并关闭预览。 */
+  useEffect(function createDraftPreviews() {
+    const images = isChat ? [] : selectedFiles.map(function createPreview(item) { return { url: URL.createObjectURL(item.file), alt: item.name, file: item.file }; });
+    setPreviews(images);
+    setPreviewIndex(null);
+    return function releasePreviews() { images.forEach(function release(image) { URL.revokeObjectURL(image.url); }); };
+  }, [isChat, selectedFiles]);
 
   /** 只在 Composer 子树内更新文本，并同步提交时读取的 ref。 */
   const updateInput = useCallback(function updateInput(value: string): void {
@@ -97,6 +121,13 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
     previousInputRef.current = input;
     recordWebPerformanceDiagnostic("composer_commit", "input");
   }, [input]);
+
+  /** 循环切换权限模式；仅切到完全访问时弹确认，自动审批与收紧回每次询问直接生效。 */
+  function cyclePermissionMode(): void {
+    const next: ToolPermissionMode = permissionMode === "ask" ? "auto_approve" : permissionMode === "auto_approve" ? "full_access" : "ask";
+    if (next === "full_access") setFullAccessConfirmOpen(true);
+    else setPermissionMode(next);
+  }
 
   useEffect(function exposeComposerInputActions() {
     inputActionsRef.current = { setInput: updateInput };
@@ -151,9 +182,12 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
           <div className="flex flex-wrap gap-2 mb-2">
             {selectedFiles.map((sf, idx) => (
               <div key={idx} className="flex items-center gap-2 px-3 py-2 border border-ink bg-card text-xs">
+                {!isChat && previews[idx]?.file === sf.file && <button type="button" onClick={function openDraftPreview() { setPreviewIndex(idx); }} aria-label={`查看 ${sf.name} 大图`} className="border border-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"><img src={previews[idx].url} alt="" className="h-12 w-12 object-cover" /></button>}
                 {sf.name}
                 <span className="text-muted">{formatSize(sf.size)}</span>
                 <button
+                  type="button"
+                  aria-label={`删除 ${sf.name}`}
                   onClick={() => setSelectedFiles((prev) => prev.filter((_, i) => i !== idx))}
                   className="ml-1 text-muted hover:text-ink"
                 >
@@ -193,6 +227,14 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
           >
             深度搜索 {databaseEnabled ? "开" : "关"}
           </button>
+          <button
+            type="button"
+            onClick={cyclePermissionMode}
+            className={`border-2 border-ink px-2 py-1 text-xs font-semibold transition-colors ${permissionMode === "ask" ? "bg-card text-ink hover:bg-ink/10" : "bg-accent text-ink-on-dark"}`}
+            title="工具权限：每次询问需逐条审批；为我审批自动放行低风险操作；完全访问仅建议在受信任工作区使用"
+          >
+            权限 {permissionMode === "ask" ? "每次询问" : permissionMode === "auto_approve" ? "为我审批" : "完全访问"}
+          </button>
           </>}
           {isChat && <ChatRetrievalControls mode={currentRetrieval} persisted={Boolean(sessionId || loading || chatAttachments.length)} onChange={onRetrievalChange} />}
         </div>
@@ -203,7 +245,7 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
           </p>
         )}
 
-        {!isChat && loading && activeTurnId && input.trim() && (
+        {!isChat && loading && activeTurnId && (input.trim() || selectedFiles.length > 0) && (
           <div className="mb-2 flex items-center gap-2 text-xs">
             <span>发送方式：</span>
             <button type="button" onClick={() => setInputDelivery("steer")} className={`border-2 border-ink px-2 py-1 ${inputDelivery === "steer" ? "bg-ink text-ink-on-dark" : "bg-card hover:bg-ink/10"}`} title="在当前任务的下一安全边界合并，用于调整正在执行任务的方向">引导当前任务</button>
@@ -238,6 +280,23 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
               updateInput(e.target.value);
             }}
             onKeyDown={handleKeyDown}
+            onPaste={function pasteWorkImages(event) {
+              if (isChat || !canWrite) return;
+              const images = Array.from(event.clipboardData.items).filter(function isImage(item) { return item.kind === "file" && /^image\/(png|jpeg|webp|gif)$/.test(item.type); }).map(function getImage(item) { return item.getAsFile(); }).filter(function hasImage(file): file is File { return file !== null; });
+              if (images.length === 0) return;
+              event.preventDefault();
+              setSelectedFiles(function appendImages(previous) { return [...previous, ...images.map(function toSelectedFile(file, index) {
+                const extension = file.type === "image/jpeg" ? "jpg" : file.type.slice("image/".length);
+                const named = /\.(png|jpe?g|webp|gif)$/i.test(file.name) ? file : new File([file], `clipboard-${Date.now()}-${index}.${extension}`, { type: file.type });
+                return { name: named.name, size: named.size, file: named };
+              })]; });
+              const text = event.clipboardData.getData("text/plain");
+              if (text) {
+                const start = event.currentTarget.selectionStart;
+                const end = event.currentTarget.selectionEnd;
+                updateInput(input.slice(0, start) + text + input.slice(end));
+              }
+            }}
             placeholder={!hasWorkspace ? "请先选择并信任工作区" : !canWrite ? "当前会话暂不可发送" : isChat ? "聊天、讨论或头脑风暴…" : "描述需要完成的任务…"}
             aria-label={isChat ? "Chat 消息" : "Work 任务"}
             className="w-full resize-none px-12 py-3 pr-12 outline-none text-sm bg-transparent"
@@ -252,7 +311,7 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
             type="button"
             onClick={() => {
               if (pendingUserQuestion || stopping) return;
-              if (!isChat && loading && activeTurnId && input.trim()) {
+              if (!isChat && loading && activeTurnId && (input.trim() || selectedFiles.length > 0)) {
                 void handleSend();
                 return;
               }
@@ -271,7 +330,7 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
             className={`absolute right-2 top-1/2 h-9 w-9 -translate-y-1/2 flex items-center justify-center transition ${
               stopping
                 ? "bg-muted text-ink-on-dark cursor-not-allowed"
-                : !isChat && loading && activeTurnId && input.trim()
+                : !isChat && loading && activeTurnId && (input.trim() || selectedFiles.length > 0)
                 ? "bg-accent text-ink-on-dark hover:bg-ink"
                 : loading && activeTurnId
                 ? "bg-accent text-ink-on-dark hover:bg-ink"
@@ -279,10 +338,10 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
                 ? "bg-accent text-ink-on-dark hover:bg-ink"
                 : "bg-muted text-ink-on-dark cursor-not-allowed"
             }`}
-            aria-label={stopping ? "正在停止任务" : continueReady ? "继续执行未完成的任务" : !isChat && loading && activeTurnId && input.trim() ? (inputDelivery === "steer" ? "发送引导任务" : "发送排队任务") : loading && activeTurnId ? "停止当前任务" : loading ? (submissionActivity === "upload" ? "正在上传附件" : "任务正在启动") : "发送消息"}
-            title={stopping ? "正在停止任务，等待服务端确认后才能继续" : continueReady ? "继续执行未完成的任务" : !isChat && loading && activeTurnId && input.trim() ? (inputDelivery === "steer" ? "发送引导任务" : "发送排队任务") : loading ? (activeTurnId ? "停止当前任务" : submissionActivity === "upload" ? "正在上传附件" : "任务正在启动") : "发送消息"}
+            aria-label={stopping ? "正在停止任务" : continueReady ? "继续执行未完成的任务" : !isChat && loading && activeTurnId && (input.trim() || selectedFiles.length > 0) ? (inputDelivery === "steer" ? "发送引导任务" : "发送排队任务") : loading && activeTurnId ? "停止当前任务" : loading ? (submissionActivity === "upload" ? "正在上传附件" : "任务正在启动") : "发送消息"}
+            title={stopping ? "正在停止任务，等待服务端确认后才能继续" : continueReady ? "继续执行未完成的任务" : !isChat && loading && activeTurnId && (input.trim() || selectedFiles.length > 0) ? (inputDelivery === "steer" ? "发送引导任务" : "发送排队任务") : loading ? (activeTurnId ? "停止当前任务" : submissionActivity === "upload" ? "正在上传附件" : "任务正在启动") : "发送消息"}
           >
-            {stopping ? <StopTaskIcon /> : continueReady ? "↻" : !isChat && loading && activeTurnId && input.trim() ? <QueueDeliveryIcon delivery={inputDelivery} /> : loading ? <StopTaskIcon /> : "➤"}
+            {stopping ? <StopTaskIcon /> : continueReady ? "↻" : !isChat && loading && activeTurnId && (input.trim() || selectedFiles.length > 0) ? <QueueDeliveryIcon delivery={inputDelivery} /> : loading ? <StopTaskIcon /> : "➤"}
           </button>
         </div>
         {!isChat && (databaseEnabled || databaseSyncMessage) && (
@@ -305,7 +364,32 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
         <p className="text-center text-xs text-muted mt-2">
           AI 可能会出错，请核实重要信息。
         </p>
+        <ChatImagePreview
+          selectedImage={previewIndex === null ? null : previews[previewIndex] ?? null}
+          setSelectedImage={function closeDraftPreview() { setPreviewIndex(null); }}
+          position={previewIndex === null ? undefined : `${previewIndex + 1} / ${previews.length}`}
+          onPrevious={previews.length > 1 ? function previousDraftImage() { setPreviewIndex(function previous(index) { return index === null ? null : (index + previews.length - 1) % previews.length; }); } : undefined}
+          onNext={previews.length > 1 ? function nextDraftImage() { setPreviewIndex(function next(index) { return index === null ? null : (index + 1) % previews.length; }); } : undefined}
+        />
       </div>
+      {fullAccessConfirmOpen && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-ink/80 p-6" role="dialog" aria-modal="true" aria-labelledby="permission-confirm-title" onKeyDown={function confirmEscape(event: React.KeyboardEvent<HTMLElement>) { if (event.key === "Escape") { event.preventDefault(); setFullAccessConfirmOpen(false); } }}>
+          <section className="w-full max-w-md border-[3px] border-ink bg-card p-5 shadow-[6px_6px_0_var(--ink)]">
+            <p className="text-[10px] uppercase tracking-widest text-error">工具权限</p>
+            <h2 id="permission-confirm-title" className="mt-1 text-lg font-bold">确认开启完全访问</h2>
+            <ol className="mt-3 list-decimal space-y-1.5 pl-5 text-sm leading-6">
+              <li>Agent 可以读取、修改或删除计算机中的任何文件，不限于当前工作区目录。</li>
+              <li>Agent 可以执行任意命令与脚本，包括联网下载、安装软件或对外发送数据。</li>
+              <li>除少量硬拒绝安全规则外，所有工具操作不再逐条请求你的确认。</li>
+              <li>请仅在完全信任的本地工作区开启；随时可切回「每次询问」收紧权限。</li>
+            </ol>
+            <div className="mt-5 flex justify-end gap-2">
+              <button ref={permissionCancelRef} type="button" onClick={function cancelPermission() { setFullAccessConfirmOpen(false); }} className="border-2 border-ink px-3 py-2 text-sm hover:bg-ink hover:text-ink-on-dark">取消</button>
+              <button type="button" onClick={function confirmPermission() { setPermissionMode("full_access"); setFullAccessConfirmOpen(false); }} className="border-2 border-accent bg-accent px-3 py-2 text-sm font-semibold text-ink-on-dark hover:border-ink hover:bg-ink">开启完全访问</button>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

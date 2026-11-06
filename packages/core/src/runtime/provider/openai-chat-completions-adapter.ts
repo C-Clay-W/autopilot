@@ -14,6 +14,7 @@ import { CanonicalMessageError, getAgentMessageText, type AgentContentBlock, typ
 import type { OpenAiChatCompletionsProtocolProfile } from "./api-protocol";
 import type { ModelBehaviorProfile } from "./model-behavior-profile";
 import { createDefaultModelBehaviorProfile } from "./model-behavior-profile";
+import { normalizeProviderHttpFailure, parseRetryAfterMs } from "./provider-failure-normalization";
 
 /** 单次 OpenAI Chat Completions 采样所需的冻结参数。 */
 export interface CreateOpenAiChatCompletionsSamplerInput {
@@ -33,6 +34,7 @@ export interface OpenAiChatCompletionsRequestInput {
   sampleOptions: ModelSampleOptions;
   maxTokens: number;
   protocolProfile: OpenAiChatCompletionsProtocolProfile;
+  imageData?: import("../../internal/kernel/model-sampler").ModelImageData;
 }
 
 /** Chat Completions 流式调用的默认超时；用户取消仍由调用方 signal 独立控制。 */
@@ -58,10 +60,29 @@ function getToolResultContent(block: Extract<AgentContentBlock, { type: "tool-re
 export function createOpenAiChatCompletionsMessages(
   messages: AgentMessage[],
   protocolProfile: OpenAiChatCompletionsProtocolProfile,
+  imageData?: import("../../internal/kernel/model-sampler").ModelImageData,
 ): Array<Record<string, unknown>> {
-  return validateAgentMessages(messages).map(function mapMessage(message) {
+  const pendingImages: Array<Record<string, unknown>> = [];
+  return validateAgentMessages(messages).flatMap<Record<string, unknown>>(function mapMessage(message, index, all): Record<string, unknown> | Array<Record<string, unknown>> {
     if (message.role === "user" && message.content[0]?.type === "tool-result") {
-      return { role: "tool", tool_call_id: message.content[0].toolCallId, content: getToolResultContent(message.content[0]) };
+      const block = message.content[0];
+      const result = { role: "tool", tool_call_id: block.toolCallId, content: getToolResultContent(block) };
+      for (const reference of block.images ?? []) {
+        const image = imageData?.[reference.id];
+        if (!image) throw new Error("会话图片不可用");
+        pendingImages.push({ type: "text", text: `工具 ${block.toolCallId} 返回的图片` }, { type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.data}` } });
+      }
+      // Chat 的 tool 消息只能放文本；同批所有 tool 结果闭合后才补图片 user 消息。
+      if (all[index + 1]?.content[0]?.type === "tool-result" || !pendingImages.length) return result;
+      return [result, { role: "user", content: pendingImages.splice(0) }];
+    }
+    if (message.role === "user" && message.content.some(function isImage(block) { return block.type === "image-ref"; })) {
+      return { role: "user", content: message.content.map(function mapBlock(block) {
+        if (block.type === "text") return { type: "text", text: block.text };
+        if (block.type !== "image-ref" || !imageData?.[block.id]) throw new Error("会话图片不可用");
+        const image = imageData[block.id];
+        return { type: "image_url", image_url: { url: `data:${image.mimeType};base64,${image.data}` } };
+      }) };
     }
     if (message.role !== "assistant") return { role: message.role, content: getAgentMessageText(message) };
 
@@ -83,7 +104,7 @@ export function createOpenAiChatCompletionsMessages(
         return { id: call.id, type: "function", function: { name: call.name, arguments: JSON.stringify(call.input) } };
       });
     }
-    if (protocolProfile.supportsReasoningContent && reasoning) result.reasoning_content = reasoning;
+    if (protocolProfile.supportsReasoningContent && reasoning && message.adapterReplayState?.apiProtocol !== "anthropic-messages") result.reasoning_content = reasoning;
     return result;
   });
 }
@@ -92,7 +113,7 @@ export function createOpenAiChatCompletionsMessages(
 export function createOpenAiChatCompletionsRequest(input: OpenAiChatCompletionsRequestInput): Record<string, unknown> {
   const body: Record<string, unknown> = {
     model: input.model,
-    messages: createOpenAiChatCompletionsMessages(input.messages, input.protocolProfile),
+    messages: createOpenAiChatCompletionsMessages(input.messages, input.protocolProfile, input.imageData),
     tools: input.tools,
     tool_choice: input.sampleOptions.toolChoice ? { type: "function", function: { name: input.sampleOptions.toolChoice.name } } : "auto",
     temperature: input.sampleOptions.toolChoice ? 0 : input.sampleOptions.temperature ?? 0.2,
@@ -106,7 +127,11 @@ export function createOpenAiChatCompletionsRequest(input: OpenAiChatCompletionsR
   return body;
 }
 
-/** 校验并归一化 Chat Completions 流式 usage；异常数据绝不成为可信锚点。 */
+/**
+ * 校验并归一化 Chat Completions 流式 usage；异常数据绝不成为可信锚点。
+ * 兼容协议的 prompt_tokens 已包含缓存命中部分（如 DeepSeek prompt_cache_hit_tokens），
+ * 缓存字段只是它的子集，不得再次相加；本协议也不支持 Anthropic 式显式 cache_control。
+ */
 function normalizeStreamUsage(usage: unknown): AgentSampleUsage | undefined {
   if (!usage || typeof usage !== "object") return undefined;
   const candidate = usage as Record<string, unknown>;
@@ -155,15 +180,18 @@ export function createOpenAiChatCompletionsSampler(input: CreateOpenAiChatComple
         const response = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-          body: JSON.stringify(createOpenAiChatCompletionsRequest({ model, messages, tools, sampleOptions: { ...sampleOptions, toolChoice: options.toolChoice }, maxTokens: options.maxTokens ?? sampleOptions.maxTokens ?? 8_192, protocolProfile })),
+          body: JSON.stringify(createOpenAiChatCompletionsRequest({ model, messages, tools, sampleOptions: { ...sampleOptions, toolChoice: options.toolChoice }, maxTokens: options.maxTokens ?? sampleOptions.maxTokens ?? 8_192, protocolProfile, imageData: options.imageData })),
           signal: requestController.signal,
         });
         if (!response.ok) {
           const errorBody = await response.text().catch(function ignoreProviderErrorBody() { return ""; });
+          if (options.signal?.aborted) throw new DOMException("aborted", "AbortError");
+          if (requestTimedOut) throw new AgentSampleError("供应商请求超时", "PROVIDER_TIMEOUT");
           if (isContextOverflowResponse(response.status, errorBody)) throw new AgentSampleError("模型上下文超过供应商窗口", "CONTEXT_OVERFLOW");
-          if (response.status === 429) throw new AgentSampleError("供应商请求被限流", "PROVIDER_RATE_LIMIT");
-          if (response.status >= 500) throw new AgentSampleError(`供应商服务暂时不可用 (${response.status})`, "PROVIDER_SERVER_ERROR");
-          throw new AgentSampleError(`供应商拒绝请求（HTTP ${response.status}）`, "PROVIDER_REQUEST_REJECTED");
+          const providerHttpStatus = Number.isInteger(response.status) && response.status >= 400 && response.status <= 599 ? response.status : undefined;
+          const failure = normalizeProviderHttpFailure(baseUrl, providerHttpStatus, errorBody);
+          const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+          throw new AgentSampleError("供应商请求失败", failure.code, undefined, providerHttpStatus, failure.reason, failure.detail, retryAfterMs);
         }
         const reader = response.body?.getReader();
         if (!reader) throw new Error("OpenAI Chat Completions 流式响应 body 不可读");

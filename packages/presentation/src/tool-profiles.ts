@@ -23,6 +23,15 @@ const PROFILES: Record<string, ToolPresentationProfile> = {
   list_background_jobs: { key: "list_background_jobs", category: "process", runningTitleKey: "tool.job.list.running", completedTitleKey: "tool.job.list.completed", explorationGroup: false },
   read_background_job: { key: "read_background_job", category: "process", runningTitleKey: "tool.job.read.running", completedTitleKey: "tool.job.read.completed", explorationGroup: false },
   stop_background_job: { key: "stop_background_job", category: "process", runningTitleKey: "tool.job.stop.running", completedTitleKey: "tool.job.stop.completed", explorationGroup: false },
+  // 会话协作工具只展示协作语义：不显示消息全文、共享板原始 JSON、会话分组标识或宿主路径。
+  create_thread: { key: "create_thread", category: "other", runningTitleKey: "tool.thread.write.running", completedTitleKey: "tool.thread.write.completed", explorationGroup: false },
+  list_threads: { key: "list_threads", category: "other", runningTitleKey: "tool.thread.read.running", completedTitleKey: "tool.thread.read.completed", explorationGroup: false },
+  read_thread: { key: "read_thread", category: "other", runningTitleKey: "tool.thread.read.running", completedTitleKey: "tool.thread.read.completed", explorationGroup: false },
+  send_thread: { key: "send_thread", category: "other", runningTitleKey: "tool.thread.write.running", completedTitleKey: "tool.thread.write.completed", explorationGroup: false },
+  wait_threads: { key: "wait_threads", category: "other", runningTitleKey: "tool.thread.read.running", completedTitleKey: "tool.thread.read.completed", explorationGroup: false },
+  read_shared_state: { key: "read_shared_state", category: "other", runningTitleKey: "tool.thread.read.running", completedTitleKey: "tool.thread.read.completed", explorationGroup: false },
+  update_shared_state: { key: "update_shared_state", category: "other", runningTitleKey: "tool.thread.write.running", completedTitleKey: "tool.thread.write.completed", explorationGroup: false },
+  interrupt_thread: { key: "interrupt_thread", category: "other", runningTitleKey: "tool.thread.write.running", completedTitleKey: "tool.thread.write.completed", explorationGroup: false },
 };
 
 const MCP_PROFILE: ToolPresentationProfile = { key: "mcp", category: "external", runningTitleKey: "tool.external.running", completedTitleKey: "tool.external.completed", explorationGroup: false };

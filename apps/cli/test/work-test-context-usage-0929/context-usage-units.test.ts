@@ -1,7 +1,7 @@
 /** Stage 4 /context 单元回归：parser、projector、renderer、报告格式化与 TUI store。 */
 
 import { describe, expect, it } from "vitest";
-import { formatContextReportLines, formatPlainContextReport, formatTuiContextStatus } from "../../src/context-report.js";
+import { formatContextReportLines, formatPlainContextReport, formatTuiContextStatus, formatTuiTurnUsageStatus } from "../../src/context-report.js";
 import { createCliEventProjector, createInitialCliProjection } from "../../src/event-projector.js";
 import { createPlainRenderer } from "../../src/renderer.js";
 import { getSlashCommandSuggestions, parseSlashAction } from "../../src/parser.js";
@@ -102,6 +102,14 @@ describe("Stage 4 /context 单元回归", function contextUsageSuite() {
     expect(formatTuiContextStatus(createUsageFixture({ measurement: "estimated" }))).toBe("84%");
     expect(formatTuiContextStatus(createUsageFixture({ usageRatio: 1.3 }))).toBe("0%");
     expect(formatContextReportLines(createUsageFixture({ measurement: "estimated" }), true, { grid: false, columns: 120 })).toContain("overall measurement: estimated");
+  });
+
+  it("状态栏累计用量行优先分项，缺分项或未知时按总量/unknown 降级", function formatsTurnUsageLabels() {
+    expect(formatTuiTurnUsageStatus(null)).toBe("unknown");
+    expect(formatTuiTurnUsageStatus(undefined)).toBe("unknown");
+    expect(formatTuiTurnUsageStatus({ turnId: "turn-1", inputTokens: 12_345, outputTokens: 6_789, totalTokens: 19_134, elapsedMs: 125_000 })).toBe("12,345 in / 6,789 out");
+    // 旧 checkpoint 缺分项时降级为总量；用量行不重复展示耗时。
+    expect(formatTuiTurnUsageStatus({ turnId: "turn-1", totalTokens: 500, elapsedMs: 0 })).toBe("500 total");
   });
 
   it("store 对 context_usage 事件只刷新状态事实，不进入时间线", function storesContextUsage() {

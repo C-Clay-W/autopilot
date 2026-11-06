@@ -9,7 +9,7 @@ import { isSandboxAvailabilityFailureCode } from "../../runtime/domain/sandbox-p
 import { applyWebFetchRedirect } from "../tools/web-fetch-redirect";
 import { randomUUID } from "node:crypto";
 import type { AgentToolCall, ModelSampleOptions } from "../types";
-import { createAgentTextMessage, createAgentToolResultMessage, getAgentMessageText, getAgentToolCalls, type AgentMessage, validateAgentMessages } from "../types/agent-message";
+import { createAgentTextMessage, createAgentToolResultMessage, getAgentMessageText, getAgentImageReferences, getAgentToolCalls, type AgentMessage, validateAgentMessages } from "../types/agent-message";
 import type {
   AgentCheckpoint,
   AgentLoopEvent,
@@ -24,13 +24,16 @@ import type { AgentContextSnapshot } from "../agent-context";
 import type { AgentModelToolDefinition, AgentSampleErrorCode, AgentSampleResult } from "../lib/llm";
 import { AgentSampleError } from "../lib/llm";
 import type { ModelSampler } from "./model-sampler";
+import { prepareSessionImages, SessionImageError, SessionImageBudgetError } from "./session-images";
 import type { RunContext } from "./run-context";
 import { getToolSignature, projectContextUsage, type ContextUsageCategoryKind, type ContextUsageContribution, type ContextUsageView } from "./context-budget";
+import { buildTurnUsageSummary } from "./turn-usage";
 import { estimateMessageTokens, serializeCanonicalMessagesForSignature } from "./compact";
 import { createMutationCompletionPolicy } from "./completion-policy";
 import { resolveAgentRuntimeLimits } from "../../runtime/config/runtime-limits";
 import { AGENT_REPETITION_GUARDRAIL, getToolProgressFingerprint } from "./runtime-safety";
 import { CHAT_RAG_ANSWER_TOOL, CHAT_RAG_ANSWER_CORRECTION_MESSAGE } from "../tools/chat-tool-runtime";
+import { isBuiltInRenderUiDefinition, UI_INPUT_FALLBACK_MESSAGE } from "../tools/builtins/render-ui-tool";
 
 /** 将 P4 模型定义转换为 OpenAI tools 结构。 */
 function toModelTools(definitions: ReturnType<import("../tools/tool-registry").ToolRegistry["getModelDefinitions"]>): AgentModelToolDefinition[] {
@@ -39,7 +42,7 @@ function toModelTools(definitions: ReturnType<import("../tools/tool-registry").T
 
 /** 构造模型可见的工具结果消息，审计细节不进入上下文。 */
 function toToolMessage(call: AgentToolCall, result: ToolExecutionResult): AgentMessage {
-  return createAgentToolResultMessage({ toolCallId: call.id, text: serializeToolResultForModel(result), isError: result.status !== "success" });
+  return createAgentToolResultMessage({ toolCallId: call.id, text: serializeToolResultForModel(result), isError: result.status !== "success", ...(result.status === "success" && result.images?.length ? { images: result.images } : {}) });
 }
 
 /** 将采样结果一次性写成 canonical assistant 内容块，调度 DTO 只从该消息投影。 */
@@ -125,6 +128,15 @@ function readPositiveIntEnv(name: string, defaultValue: number): number {
   return parsed;
 }
 
+/** 提取并校验环境变量中的 0~1 比例配置；非法或缺失时回退到默认值。 */
+function readRatioEnv(name: string, defaultValue: number): number {
+  const raw = process.env[name];
+  if (!raw) return defaultValue;
+  const parsed = Number.parseFloat(raw);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) return defaultValue;
+  return parsed;
+}
+
 /** 模型输出截断恢复上限：output_limit 最多 3 次，stream_incomplete 最多 1 次。 */
 const MAX_OUTPUT_RECOVERY_ATTEMPTS = 3;
 /**
@@ -136,11 +148,19 @@ const DEFAULT_OUTPUT_RECOVERY_MAX_TOKENS = readPositiveIntEnv("AGENT_OUTPUT_RECO
 const MAX_INVALID_JSON_RETRIES = 1;
 /** 空响应最多允许 1 次附带恢复指令的重采样。 */
 const MAX_EMPTY_RESPONSE_RECOVERY_ATTEMPTS = 1;
-/** 连接、超时、限流、5xx 或流中断共用一次瞬时故障恢复预算。 */
-const MAX_PROVIDER_RECOVERY_ATTEMPTS = 1;
+/** 瞬时 Provider 故障默认最多重试 5 次（对齐 DSH 默认）；可通过 AGENT_PROVIDER_RECOVERY_MAX_ATTEMPTS 覆盖，硬上限 10 次。 */
+const MAX_PROVIDER_RECOVERY_ATTEMPTS = Math.min(readPositiveIntEnv("AGENT_PROVIDER_RECOVERY_MAX_ATTEMPTS", 5), 10);
+/** 指数退避基数（对齐 DSH 默认 500ms）；可通过 AGENT_PROVIDER_RECOVERY_BASE_DELAY_MS 覆盖。 */
+const PROVIDER_RECOVERY_BASE_DELAY_MS = readPositiveIntEnv("AGENT_PROVIDER_RECOVERY_BASE_DELAY_MS", 500);
+/** 单次退避上限；Retry-After 超过该值时不等待（对齐 DSH 语义）；可通过 AGENT_PROVIDER_RECOVERY_MAX_DELAY_MS 覆盖。 */
+const PROVIDER_RECOVERY_MAX_DELAY_MS = readPositiveIntEnv("AGENT_PROVIDER_RECOVERY_MAX_DELAY_MS", 10_000);
+/** 对称抖动比例，避免并发会话同时重试；可通过 AGENT_PROVIDER_RECOVERY_JITTER_RATIO 覆盖（0~1）。 */
+const PROVIDER_RECOVERY_JITTER_RATIO = readRatioEnv("AGENT_PROVIDER_RECOVERY_JITTER_RATIO", 0.1);
 /** 写入型任务未实际执行或未完成写后验证时，只允许一次模型自我修正。 */
 // 未写入场景的提醒耗尽后交由模型终审（接受答案），写后未验证仍硬失败；见 mutation gate 判定处。
 const MAX_MUTATION_GATE_RECOVERY_ATTEMPTS = 1;
+/** 原生图片重试耗尽后持久保留的回退标记，恢复不得重新消耗原生预算。 */
+const IMAGE_FALLBACK_MARKER = "【图片视觉回退】当前 Turn 已转入受控视觉工具路径。";
 
 /** 模型输出恢复 meta message：仅服务端注入，不携带工具参数。 */
 const RECOVERY_META_MESSAGE = "上一轮输出在工具参数完成前被截断。直接继续当前任务，不要道歉或复述；把剩余文件修改拆成更小的 edit_file 调用。已有文件优先 edit_file，write_file 只用于新建小文件或明确的完整重写。";
@@ -168,6 +188,51 @@ function getRecoveryLimitMessage(code: AgentSampleErrorCode): string {
   if (code === "TOOL_CALL_INVALID_JSON") return "模型返回非法工具参数 JSON，格式修复后仍失败";
   if (code === "EMPTY_RESPONSE") return "模型连续返回空响应，未执行工具或产生可显示答复";
   return "模型输出连续截断，已达到最大恢复次数";
+}
+
+/** 已向展示端输出正文后失败，不再重放同一次采样，避免重复内容；错误码仍保留稳定分类。 */
+function getStreamedProviderFailureMessage(): string {
+  return "供应商在已输出部分正文后失败，已停止自动恢复";
+}
+
+/** 供应商要求等待时间超过单次退避上限时不再重试，避免 Turn 被长时间挂起。 */
+function getRetryAfterExceededMessage(): string {
+  return "供应商要求等待时间超过单次退避上限，已停止自动恢复";
+}
+
+/**
+ * 计算下一次瞬时故障重试等待（对齐 DSH 语义）：
+ * Retry-After 优先，否则按指数退避 + 对称抖动计算，并统一按单次上限截断。
+ */
+function resolveProviderRetryDelay(retryAfterMs: number | undefined, retry: number): number {
+  if (retryAfterMs !== undefined && retryAfterMs > 0) return Math.min(retryAfterMs, PROVIDER_RECOVERY_MAX_DELAY_MS);
+  const exponent = Math.min(retry - 1, 1024);
+  const exponential = Math.min(PROVIDER_RECOVERY_BASE_DELAY_MS * 2 ** exponent, PROVIDER_RECOVERY_MAX_DELAY_MS);
+  const jitter = 1 - PROVIDER_RECOVERY_JITTER_RATIO + 2 * PROVIDER_RECOVERY_JITTER_RATIO * Math.random();
+  return Math.min(Math.round(exponential * jitter), PROVIDER_RECOVERY_MAX_DELAY_MS);
+}
+
+/** 在退避窗口内等待；可被用户取消提前唤醒（对齐 DSH 的可取消等待），取消语义由调用方统一落终态。 */
+function waitForProviderRetry(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise<void>(function waitForRetry(resolve) {
+    const timer = setTimeout(function finishRetryWait() {
+      cleanup();
+      resolve();
+    }, delayMs);
+    timer.unref?.();
+    /** 移除计时器与取消监听，保证等待只结束一次。 */
+    function cleanup(): void {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    }
+    /** 取消优先唤醒等待，交由调用方统一落 interrupted 终态。 */
+    function onAbort(): void {
+      cleanup();
+      resolve();
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /** 从受控文件工具的输入或成功输出中提取相对路径。 */
@@ -324,6 +389,7 @@ async function* streamModelSample(
   signal: AbortSignal,
   maxTokens?: number,
   modelSampleOptions?: ModelSampleOptions,
+  imageData?: import("./model-sampler").ModelImageData,
 ): AsyncGenerator<{ delta: string } | { sampled: AgentSampleResult }> {
   const deltas: string[] = [];
   let notify: () => void = () => undefined;
@@ -331,8 +397,9 @@ async function* streamModelSample(
   let sampled: AgentSampleResult | undefined;
   let failure: unknown;
   // Kernel 只透传已解析的 Provider 采样选项（model/thinking/reasoningEffort），不在此处猜测 Provider。
-  const sampleOptions: { signal?: AbortSignal; maxTokens?: number } & ModelSampleOptions = {
+  const sampleOptions: { signal?: AbortSignal; maxTokens?: number; imageData?: import("./model-sampler").ModelImageData } & ModelSampleOptions = {
     signal,
+    ...(imageData ? { imageData } : {}),
     ...(modelSampleOptions ?? {}),
   };
   if (maxTokens !== undefined) sampleOptions.maxTokens = maxTokens;
@@ -479,6 +546,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
       ? { store: context.fileMutationStore, sessionId: context.sessionId, turnId: context.checkpoint?.turnId ?? context.turnId ?? "" }
       : undefined,
     fileReadStates,
+    getVisibleMessages: function getVisibleMessages() { return messages; },
     resolvePersistentGrant: context.permissionContext.resolvePersistentGrant,
     validateApproval: context.permissionContext.validateApproval,
     resolveExternalRestriction: context.permissionContext.resolveExternalRestriction,
@@ -504,9 +572,85 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
   }
   const completionPolicy = context.completionPolicy ?? createMutationCompletionPolicy();
   const initialIntent = completionPolicy.initialSignal(messages);
+  let threadObservation = context.checkpoint?.threadObservation ? structuredClone(context.checkpoint.threadObservation) : undefined;
+  let lastThreadWaitFact: string | undefined;
+  /** 只在真实观察阶段/计数变化时产生有界事实，不把150ms复查写成进展事件。 */
+  function threadWaitEvent(phase: "waiting" | "processing" | "none"): AgentLoopEvent | undefined {
+    const targets = phase === "none" ? [] : threadObservation?.targets.filter(function pending(target) { return !target.terminal; }) ?? [];
+    const running = targets.filter(function running(target) { return target.turnStatus === "running"; }).length;
+    const approvals = targets.filter(function approval(target) { return target.turnStatus === "waiting_approval" && target.interactionState === "pending"; }).length;
+    const fact = { phase, pending: targets.length, running, approvals };
+    const key = JSON.stringify(fact);
+    if (key === lastThreadWaitFact) return undefined;
+    lastThreadWaitFact = key;
+    return { type: "thread_wait", turnId, ...fact };
+  }
+  /** 模型显式结构化合同是观察启停/约定更新的唯一入口，不从用户正文推断意图。 */
+  function observeThreadWait(call: AgentToolCall, result: ToolExecutionResult): void {
+    if (call.name !== "wait_threads" || result.status !== "success") return;
+    const input = call.input as { groupId?: string; followUntilTerminal?: boolean; timeoutMs?: number; reportingInstructions?: string; targets?: Array<{ threadId: string; taskId?: string; cursor?: string }> };
+    const output = result.output as { results?: Array<{ threadId: string; taskId?: string; cursor: string; reason: string; summary?: { turnId?: string; turnStatus?: string; interactionState?: string; continuationState?: string } }> };
+    const requested = input.targets?.filter(function precise(target) { return Boolean(target.taskId); });
+    if (!requested?.length || !output.results) return;
+    if (input.followUntilTerminal === false) {
+      const remaining = threadObservation?.targets.filter(function keep(old) { return !requested.some(function same(item) { return item.threadId === old.threadId && item.taskId === old.taskId; }); }) ?? [];
+      threadObservation = remaining.length ? { ...threadObservation!, targets: remaining } : undefined;
+      return;
+    }
+    const targets = requested.filter(function observed(item) { return input.followUntilTerminal === true || (input.followUntilTerminal === undefined && (input.timeoutMs ?? 0) > 0) || threadObservation?.targets.some(function same(old) { return old.threadId === item.threadId && old.taskId === item.taskId; }); });
+    if (!targets.length) return;
+    const preserved = threadObservation?.targets.filter(function other(old) { return !targets.some(function same(item) { return item.threadId === old.threadId && item.taskId === old.taskId; }); }) ?? [];
+    threadObservation = { groupId: input.groupId ?? threadObservation?.groupId, targets: [...preserved, ...targets.map(function target(item) {
+      const state = output.results!.find(function same(result) { return result.threadId === item.threadId && result.taskId === item.taskId; });
+      const old = threadObservation?.targets.find(function same(target) { return target.threadId === item.threadId && target.taskId === item.taskId; });
+      return { threadId: item.threadId, taskId: item.taskId!, turnId: state?.summary?.turnId, turnStatus: state?.summary?.turnStatus, interactionState: state?.summary?.interactionState, continuationState: state?.summary?.continuationState, reportingInstructions: input.reportingInstructions ?? old?.reportingInstructions, agreementPending: (input.reportingInstructions !== undefined && input.reportingInstructions !== old?.reportingInstructions) || (old?.agreementPending ?? true), progressCursor: old?.progressCursor, cursor: state?.cursor ?? item.cursor, terminal: state?.reason === "terminal" || ["completed", "failed", "interrupted"].includes(state?.summary?.turnStatus ?? "") || ["failed", "cancelled"].includes((state?.summary as { deliveryStatus?: string } | undefined)?.deliveryStatus ?? "") };
+    })] };
+  }
+  /** 把明确观察责任下的汇报约定投递到精确运行Turn；审批暂停时保留待投递，不能冒充已消费。 */
+  async function* updateObservedAgreement(stepId: string): AsyncGenerator<AgentLoopEvent> {
+    if (!threadObservation || !getVisibleToolDefinitions().some(function visible(tool) { return tool.name === "send_thread"; })) return;
+    for (const target of threadObservation.targets) {
+      if (!target.agreementPending || !target.turnId || target.turnStatus !== "running") continue;
+      const call: AgentToolCall = { id: `agreement-${randomUUID()}`, name: "send_thread", input: { ...(threadObservation.groupId ? { groupId: threadObservation.groupId } : {}), threadId: target.threadId, mode: "steer", expectedTurnId: target.turnId, content: `【本次任务汇报约定更新】\n${target.reportingInstructions ?? "请依据已收到的用户约定汇报；未指定时，在真实阶段、阻塞和完成/失败时用report_progress提供有界累计摘要，不逐工具或逐token汇报。"}` } };
+      const result = await executor.execute({ callId: call.id, toolName: call.name, input: call.input }, { signal: currentSignal, reportingAgreement: { taskId: target.taskId, explicit: target.reportingInstructions !== undefined } });
+      if (result.status === "success") target.agreementPending = false;
+      pushMessage(toAssistantMessage({ content: "", toolCalls: [call], reasoningSummary: "更新执行目标汇报约定" }), "conversation");
+      pushMessage(toToolMessage(call, result), "conversation");
+      completedCallIds.add(call.id);
+      yield { type: "tool_result", turnId, stepId, callId: call.id, toolName: call.name, result, retryCount: 0, summary: "协作任务观察" };
+    }
+  }
+
+  /** 从真实Todo阶段转换和审批入口发布有界事实，仍经既有工具策略与任务归属校验。 */
+  async function publishThreadStage(id: string, kind: "milestone" | "blocked", summary: string): Promise<void> {
+    if (!getVisibleToolDefinitions().some(function visible(tool) { return tool.name === "report_progress"; })) return;
+    await executor.execute({ callId: `stage-${id}`, toolName: "report_progress", input: { kind, summary: Array.from(summary).slice(0, 480).join("") } }, { signal: currentSignal });
+  }
+
+  /** 持续观察只读取目标自己的增量摘要；等待游标和进展游标分别保存。 */
+  async function* consumeObservedProgress(result: ToolExecutionResult, stepId: string): AsyncGenerator<AgentLoopEvent> {
+    if (!threadObservation || result.status !== "success" || !getVisibleToolDefinitions().some(function visible(tool) { return tool.name === "read_progress"; })) return;
+    const output = result.output as { results?: Array<{ threadId: string; taskId?: string; pendingProgress: number }> };
+    for (const target of threadObservation.targets) {
+      if (!output.results?.some(function hasProgress(item) { return item.threadId === target.threadId && item.taskId === target.taskId && item.pendingProgress > 0; })) continue;
+      const call: AgentToolCall = { id: `progress-${randomUUID()}`, name: "read_progress", input: { ...(threadObservation.groupId ? { groupId: threadObservation.groupId } : {}), threadId: target.threadId, taskId: target.taskId, ...(target.progressCursor ? { cursor: target.progressCursor } : {}), limit: 50 } };
+      const page = await executor.execute({ callId: call.id, toolName: call.name, input: call.input }, { signal: currentSignal });
+      pushMessage(toAssistantMessage({ content: "", toolCalls: [call], reasoningSummary: "读取协作阶段摘要" }), "conversation");
+      pushMessage(toToolMessage(call, page), "conversation");
+      completedCallIds.add(call.id);
+      if (page.status === "success") target.progressCursor = (page.output as { cursor: string }).cursor;
+      yield { type: "tool_result", turnId, stepId, callId: call.id, toolName: call.name, result: page, retryCount: 0, summary: "读取协作阶段摘要" };
+    }
+  }
+
+  /** 所有既有安全检查点附带观察责任，不引入新持久调度格式。 */
+  function threadObservationSnapshot() { return threadObservation ? { threadObservation } : {}; }
   const completedCallIds = new Set(context.checkpoint?.completedCallIds ?? []);
   const consumedInputIds = new Set(context.checkpoint?.consumedInputIds ?? []);
+  let samplingTools = context.checkpoint?.samplingTools;
   const changedPaths = new Set(context.checkpoint?.mutationGate?.changedPaths ?? []);
+  const verificationVersions = new Map((context.checkpoint?.mutationGate?.verificationTargets ?? context.checkpoint?.fileReadStates ?? []).map(function version(state) { return [state.path, state.sha256]; }));
+  const verificationReads = new Map<string, Array<{ startLine: number; endLine: number }>>((context.checkpoint?.mutationGate?.verificationTargets ?? []).map(function ranges(target) { return [target.path, target.observedRanges]; }));
   const verifiedPaths = new Set(context.checkpoint?.mutationGate?.verifiedPaths ?? []);
   let mutationRequired = changedPaths.size > 0 || initialIntent.required;
   let mutationStrong = changedPaths.size > 0 ? false : initialIntent.strong;
@@ -514,13 +658,15 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
   let stepCount = context.checkpoint?.stepCount ?? 0;
   const runStepLimit = maxSteps === undefined ? undefined : stepCount + maxSteps;
   let pendingCalls = context.checkpoint?.pendingCalls;
+  let uiTextFallbackOnly = context.checkpoint?.uiTextFallbackOnly === true;
   let pendingUserQuestion = context.checkpoint?.pendingUserQuestion;
   let emptyReplyRetries = 0;
   let resumeApprovalAvailable = Boolean(context.approval);
   let needsResumeApproval = context.checkpoint?.status === "awaiting_approval";
   let outputRecoveryAttempts = 0;
   let invalidJsonRetries = 0;
-  let providerRecoveryAttempts = 0;
+  let providerRecoveryAttempts = Number.isSafeInteger(context.checkpoint?.imageProviderRecoveryAttempts) && (context.checkpoint?.imageProviderRecoveryAttempts ?? -1) >= 0
+    ? Math.min(context.checkpoint!.imageProviderRecoveryAttempts!, MAX_PROVIDER_RECOVERY_ATTEMPTS) : 0;
   let injectedSinceSample = false;
   let usageAnchor = context.checkpoint?.usageAnchor ?? context.inheritedUsageAnchor;
   /** 最近一次安全边界生成的上下文用量快照；恢复时以私有 checkpoint 的快照为初始值。 */
@@ -585,13 +731,15 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
   /**
    * 构造 context_usage_updated 事件：与上次发射完全相同则省略，避免每个循环产生 transcript 噪音；
    * 投影 fail closed 为空时以 usage=null 明确清空旧状态；未注入冻结窗口配置时保持沉默。
+   * Turn 累计用量与 usage 共用同一事件节奏，去重键同时覆盖两者，仅在真正变化时发射。
    */
   function contextUsageUpdatedEvent(): AgentLoopEvent | undefined {
     if (!context.contextUsageProjection) return undefined;
-    const json = latestContextUsage ? JSON.stringify(latestContextUsage) : null;
+    const turnUsage = buildTurnUsageSummary({ turnId, runtimeBudget });
+    const json = JSON.stringify({ usage: latestContextUsage ?? null, turnUsage: turnUsage ?? null });
     if (emittedContextUsageJson === json) return undefined;
     emittedContextUsageJson = json;
-    return { type: "context_usage_updated", turnId, usage: latestContextUsage ?? null };
+    return { type: "context_usage_updated", turnId, usage: latestContextUsage ?? null, turnUsage: turnUsage ?? null };
   }
 
   /** 在安全边界生成当前请求的上下文用量投影；未注入冻结窗口配置时保持缺失，投影失败时清除旧快照。 */
@@ -631,8 +779,8 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
   }
 
   /** 保存当前执行段起点与跨 Continue 保留的累计 token；不把 Provider 原始响应写入 checkpoint。 */
-  function runtimeBudgetSnapshot(): Pick<AgentCheckpoint, "runtimeBudget" | "safetyBudgetVersion"> {
-    return { runtimeBudget: { ...runtimeBudget, executionSegmentVersion: 1 }, safetyBudgetVersion: 2 };
+  function runtimeBudgetSnapshot(): Pick<AgentCheckpoint, "runtimeBudget" | "safetyBudgetVersion" | "imageProviderRecoveryAttempts"> {
+    return { runtimeBudget: { ...runtimeBudget, updatedAt: clock(), executionSegmentVersion: 1 }, safetyBudgetVersion: 2, ...(messages.some(function hasImage(message) { return getAgentImageReferences(message).length > 0; }) ? { imageProviderRecoveryAttempts: providerRecoveryAttempts } : {}) };
   }
 
   /** 生成连续重复调用的脱敏状态；只保留哈希与次数。 */
@@ -663,15 +811,19 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
       ...runtimeBudgetSnapshot(),
       ...contextUsageSnapshot(),
       ...toolGuardrailSnapshot(),
-      ...todoSnapshotSnapshot(),
+      ...todoSnapshotSnapshot(), ...threadObservationSnapshot(),
       ...checkpointContext(context.contextSnapshot, activeSkills),
     };
     await context.onSafeToolBatch(checkpoint);
   }
 
-  /** 将一次完整模型采样的 usage 累加到当前 Turn 的 token 安全预算。 */
+  /** 将一次完整模型采样的 usage 累加到当前 Turn 的 token 安全预算与累计分项。 */
   function recordSampleUsage(sampled: AgentSampleResult): void {
-    if (sampled.usage) runtimeBudget.totalTokens += sampled.usage.contextTokens;
+    if (!sampled.usage) return;
+    runtimeBudget.totalTokens += sampled.usage.contextTokens;
+    runtimeBudget.inputTokens = (runtimeBudget.inputTokens ?? 0) + sampled.usage.inputTokens;
+    runtimeBudget.outputTokens = (runtimeBudget.outputTokens ?? 0) + sampled.usage.outputTokens;
+    runtimeBudget.updatedAt = clock();
   }
 
   /** 将当前采样 usage 绑定到已写入的 canonical 消息边界。 */
@@ -737,8 +889,10 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
   }
 
   /** 保存真实文件写入的读回验证状态与只读视觉预算，恢复时保留客观事实。 */
-  function mutationGateSnapshot(): Pick<AgentCheckpoint, "mutationGate" | "fileReadStates" | "chatBudget"> {
+  function mutationGateSnapshot(): Pick<AgentCheckpoint, "mutationGate" | "fileReadStates" | "chatBudget" | "uiTextFallbackOnly" | "samplingTools"> {
     return {
+      ...(samplingTools ? { samplingTools } : {}),
+      ...(uiTextFallbackOnly ? { uiTextFallbackOnly: true as const } : {}),
       ...(context.chat ? { chatBudget: context.chat.budgetSnapshot() } : {}),
       mutationGate: {
         required: mutationRequired,
@@ -747,6 +901,10 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
         verifiedPaths: [...verifiedPaths],
         recoveryAttempts: mutationGateRecoveryAttempts,
         ...(verificationOnly ? { verificationOnly: true } : {}),
+        verificationTargets: [...changedPaths].filter(function pending(path) { return !verifiedPaths.has(path); }).flatMap(function target(path) {
+          const sha256 = verificationVersions.get(path) ?? verificationVersions.get(`ext:${path}`);
+          return sha256 ? [{ path, sha256, observedRanges: verificationReads.get(path) ?? [] }] : [];
+        }),
       },
       ...fileReadStatesSnapshot(),
     };
@@ -765,12 +923,32 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
     if (isMutation) {
       changedPaths.add(path);
       verifiedPaths.delete(path);
+      if ((result.output as { diskVerified?: boolean })?.diskVerified === true) verifiedPaths.add(path);
     }
-    if (call.name === "read_file" && changedPaths.has(path)) verifiedPaths.add(path);
+    if (call.name === "read_file" && changedPaths.has(path)) {
+      const output = result.output as { versionSha256?: string; startLine: number; endLine: number; totalLines: number };
+      let expected = verificationVersions.get(path) ?? verificationVersions.get(`ext:${path}`);
+      // 极旧快照缺少写入版本时，首次实际读回固定当前版本；后续必须同版本完整覆盖。
+      if (!expected && output.versionSha256) {
+        expected = output.versionSha256;
+        verificationVersions.set(path, expected);
+      }
+      if (expected && output.versionSha256 === expected) {
+        const ranges = [...(verificationReads.get(path) ?? []), { startLine: output.startLine, endLine: output.endLine }].sort(function byLine(left, right) { return left.startLine - right.startLine; });
+        verificationReads.set(path, ranges);
+        let covered = 0;
+        for (const range of ranges) {
+          if (range.startLine > covered + 1) break;
+          covered = Math.max(covered, range.endLine);
+        }
+        if (covered >= output.totalLines) verifiedPaths.add(path);
+      }
+    }
   }
 
   /** Skill allowed-tools 只能收窄模型可见集合；没有声明时不额外收窄宿主能力。 */
   function getVisibleToolDefinitions() {
+    if (uiTextFallbackOnly) return [];
     const definitions = context.toolRegistry.getModelDefinitions();
     if (!policyAllowedTools) return definitions;
     return definitions.filter((definition) => policyAllowedTools.includes(definition.name));
@@ -783,11 +961,16 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
     for (const injected of inputs) {
       if (consumedInputIds.has(injected.inputId)) continue;
       context.chat?.invalidateEvidence();
-      pushMessage(createAgentTextMessage("user", injected.content), "conversation");
-      resetToolGuardrail();
-      const injectedIntent = completionPolicy.observeInput(injected.content);
-      mutationRequired = mutationRequired || injectedIntent.required;
-      mutationStrong = mutationStrong || injectedIntent.strong;
+      // 另一会话消息仍以 user 载体进入模型，但必须带可信来源标注，不能伪装成当前用户直接指令。
+      const internalAgreement = injected.origin?.kind === "thread" && injected.origin.purpose === "reporting_agreement";
+      const injectedText = internalAgreement ? `【协作内部上下文：汇报约定】\n${injected.content}` : injected.origin?.kind === "thread" ? `【来自协作会话 ${injected.origin.threadId} 的消息】\n${injected.content}` : injected.content;
+      pushMessage({ role: "user", content: [{ type: "text", text: injectedText }, ...(injected.images ?? [])] }, "conversation");
+      if (!internalAgreement) {
+        resetToolGuardrail();
+        const injectedIntent = completionPolicy.observeInput(injected.content);
+        mutationRequired = mutationRequired || injectedIntent.required;
+        mutationStrong = mutationStrong || injectedIntent.strong;
+      }
       consumedInputIds.add(injected.inputId);
       if (boundary !== "before_sample") injectedSinceSample = true;
       const checkpoint: AgentCheckpoint = {
@@ -803,7 +986,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
         ...runtimeBudgetSnapshot(),
         ...contextUsageSnapshot(),
         ...toolGuardrailSnapshot(),
-        ...todoSnapshotSnapshot(),
+        ...todoSnapshotSnapshot(), ...threadObservationSnapshot(),
         ...checkpointContext(context.contextSnapshot, activeSkills),
       };
       yield { type: "input_joined", turnId, inputId: injected.inputId, checkpoint };
@@ -811,25 +994,52 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
     }
   }
 
-  /** 在首个执行展示前检查整批调用；任何越权或无效 ref 都阻止本批全部 handler。 */
-  async function* rejectInvalidCalls(calls: AgentToolCall[], stepId: string): AsyncGenerator<AgentLoopEvent, boolean> {
+  /** 只有当前 Chat none/web 实际暴露的真实内置 UI 定义才有文字收口资格。 */
+  function isTrustedUiCall(call: AgentToolCall): boolean {
+    const ceilingMode = context.capabilityCeiling?.chatRetrievalMode;
+    if (context.capabilityCeiling?.productMode !== "chat" || (ceilingMode !== "none" && ceilingMode !== "web")
+      || context.chat?.retrievalMode !== ceilingMode || call.name !== "render_ui"
+      || !isToolWithinCeiling(context.capabilityCeiling, call.name)
+      || !getVisibleToolDefinitions().some(function visible(definition) { return definition.name === call.name; })) return false;
+    const definition = context.toolRegistry.get(call.name);
+    return isBuiltInRenderUiDefinition(definition) && definition.validateInput === undefined;
+  }
+
+  /** 固定本 Turn 后续只输出文字；私有状态随既有安全快照保存，不增加预算。 */
+  function beginUiTextFallback(): void {
+    uiTextFallbackOnly = true;
+    pushMessage(createAgentTextMessage("system", "交互内容已被安全拒绝。本轮只能改用普通文字说明，不得调用任何工具或修复、重新生成交互块。"), "system");
+  }
+
+  /** 预检拒绝默认终止整批；仅单个内置 UI 的结构错误可切到无工具文字收口。 */
+  async function* rejectInvalidCalls(calls: AgentToolCall[], stepId: string): AsyncGenerator<AgentLoopEvent, "none" | "failed" | "ui-fallback"> {
     for (const call of calls) {
       if (context.capabilityCeiling?.productMode !== "chat" && isToolWithinCeiling(context.capabilityCeiling, call.name)) continue;
-      const rejected = await executor.preflight({ callId: call.id, toolName: call.name, input: call.input }, currentSignal);
+      let rejected: Extract<ToolExecutionResult, { status: "error" }> | undefined = uiTextFallbackOnly
+        ? { status: "error", callId: call.id, toolName: call.name, error: { code: "CHAT_TOOL_FORBIDDEN", message: "本轮已进入普通文字收口，不再执行工具" } }
+        : await executor.preflight({ callId: call.id, toolName: call.name, input: call.input }, currentSignal);
       if (!rejected) continue;
+      // 必须证明错误来自内置输入 schema；同码权限/validateInput 错误不能进入恢复。
+      const recoverUi = !currentSignal.aborted && calls.length === 1 && rejected.error.code === "INVALID_INPUT"
+        && isTrustedUiCall(call) && !context.toolRegistry.get(call.name).inputSchema.safeParse(call.input).success;
+      if (recoverUi) rejected = { ...rejected, error: { code: "INVALID_INPUT", message: UI_INPUT_FALLBACK_MESSAGE } };
       for (const item of calls) {
         const result = item.id === call.id ? rejected : createSyntheticToolErrorResult(item, "TOOL_ABORTED_BEFORE_DISPATCH", "同批工具未通过权限校验，本次未执行");
         pushMessage(toToolMessage(item, result), "conversation");
         completedCallIds.add(item.id);
+        if (recoverUi) beginUiTextFallback();
         projectContextUsageSnapshot();
         const rejectedUsageEvent = contextUsageUpdatedEvent();
         if (rejectedUsageEvent) yield rejectedUsageEvent;
         yield { type: "tool_result", turnId, stepId, callId: item.id, toolName: item.name, result, retryCount: 0, summary: result.error.code };
       }
-      yield { type: "turn_failed", turnId, error: rejected.error.code, errorCode: isSandboxAvailabilityFailureCode(rejected.error.code) ? rejected.error.code : undefined, checkpoint: { turnId, status: "failed", stepCount, messages, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) } };
-      return true;
+      if (recoverUi) {
+        return "ui-fallback";
+      }
+      yield { type: "turn_failed", turnId, error: rejected.error.code, errorCode: isSandboxAvailabilityFailureCode(rejected.error.code) ? rejected.error.code : "TOOL_CALL_REJECTED", failureStage: "tool_preflight", checkpoint: { turnId, status: "failed", stepCount, messages, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) } };
+      return "failed";
     }
-    return false;
+    return "none";
   }
 
   restoreTodoSnapshotIfNeeded();
@@ -842,24 +1052,26 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
     let lastYieldedReasoningSummary = "";
     while (runStepLimit === undefined || stepCount < runStepLimit) {
       if (currentSignal.aborted) {
-        const checkpoint: AgentCheckpoint = { turnId, status: "interrupted", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+        const checkpoint: AgentCheckpoint = { turnId, status: "interrupted", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
         yield { type: "turn_interrupted", turnId, checkpoint };
         return;
       }
       const safetyBudgetReason = getSafetyBudgetReason();
       if (safetyBudgetReason) {
         if (safetyBudgetReason === "token_budget") {
-          const checkpoint: AgentCheckpoint = { turnId, status: "failed", interruptionReason: "token_budget", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          const checkpoint: AgentCheckpoint = { turnId, status: "failed", interruptionReason: "token_budget", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
           yield {
             type: "turn_failed",
             turnId,
             checkpoint,
             error: getSafetyBudgetMessage(safetyBudgetReason),
+            errorCode: "TOKEN_BUDGET_EXCEEDED",
+            failureStage: "runtime_budget",
             termination: { reason: "token_budget", budget: { used: runtimeBudget.totalTokens, limit: maxTotalTokens!, unit: "tokens" } },
           };
           return;
         }
-        const checkpoint: AgentCheckpoint = { turnId, status: "interrupted_recoverable", interruptionReason: safetyBudgetReason, stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+        const checkpoint: AgentCheckpoint = { turnId, status: "interrupted_recoverable", interruptionReason: safetyBudgetReason, stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
         yield {
           type: "turn_interrupted",
           turnId,
@@ -873,11 +1085,18 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
       if (pendingCalls?.length) {
         yield { type: "reasoning_summary", turnId, stepId, summary: "正在根据已保存的审批决定恢复工具调用" };
         const calls = pendingCalls;
-        if (yield* rejectInvalidCalls(calls, stepId)) return;
+        const rejection = yield* rejectInvalidCalls(calls, stepId);
+        if (rejection === "failed") return;
+        if (rejection === "ui-fallback") {
+          pendingCalls = undefined;
+          stepCount++;
+          await persistSafeToolBatchCheckpoint();
+          continue;
+        }
         pendingCalls = undefined;
         const pendingCall = calls[0];
-        if (needsResumeApproval && !resumeApprovalAvailable) {
-          const checkpoint: AgentCheckpoint = { turnId, status: "awaiting_approval", stepCount, messages, pendingCalls: calls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+        if (needsResumeApproval && !resumeApprovalAvailable && !context.reissueApproval) {
+          const checkpoint: AgentCheckpoint = { turnId, status: "awaiting_approval", stepCount, messages, pendingCalls: calls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
           yield { type: "turn_paused", turnId, checkpoint };
           return;
         }
@@ -900,7 +1119,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
           if (context.approval?.decision === "deny") {
             const deniedMessage = getPermissionDeniedMessage();
             yield { type: "answer_delta", turnId, stepId, delta: deniedMessage };
-            yield { type: "turn_failed", turnId, error: deniedMessage, checkpoint: { turnId, status: "failed", stepCount, messages: [...messages, createAgentTextMessage("assistant", deniedMessage)], completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) } };
+            yield { type: "turn_failed", turnId, error: deniedMessage, errorCode: "TOOL_DENIED", failureStage: "tool_execution", checkpoint: { turnId, status: "failed", stepCount, messages: [...messages, createAgentTextMessage("assistant", deniedMessage)], completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) } };
             return;
           }
           resumeApprovalAvailable = false;
@@ -915,17 +1134,37 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
         const questionAnswer = pendingCall.name === "ask_user_question" ? context.userQuestion : undefined;
         if (pendingCall.name === "ask_user_question" && !questionAnswer) {
           if (!pendingUserQuestion || pendingUserQuestion.callId !== pendingCall.id) throw new Error("等待用户回答的 Turn 缺少问题请求绑定");
-          const checkpoint: AgentCheckpoint = { turnId, status: "awaiting_user_input", stepCount, messages, pendingCalls: calls, pendingUserQuestion, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          const checkpoint: AgentCheckpoint = { turnId, status: "awaiting_user_input", stepCount, messages, pendingCalls: calls, pendingUserQuestion, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
           yield { type: "question_required", turnId, stepId, callId: pendingCall.id, requestId: pendingUserQuestion.requestId, questions: pendingUserQuestion.questions };
           yield { type: "turn_paused", turnId, checkpoint };
           return;
         }
-        const result = questionAnswer
-          ? createUserQuestionAnswerResult(pendingCall, questionAnswer.answer, questionAnswer.requestId)
-          : await executor.execute({ callId: pendingCall.id, toolName: pendingCall.name, input: pendingCall.input, approval: needsResumeApproval && resumeApprovalAvailable ? context.approval : undefined }, { signal: currentSignal });
+        let result: ToolExecutionResult;
+        if (questionAnswer) result = createUserQuestionAnswerResult(pendingCall, questionAnswer.answer, questionAnswer.requestId);
+        else {
+          // 恢复审批也沿用普通工具的进度队列/race-drain；查看进度不启动第二次执行。
+          const progressQueue: string[] = [];
+          let wakeProgress: (() => void) | undefined;
+          let settled = false;
+          const execution = executor.execute({ callId: pendingCall.id, toolName: pendingCall.name, input: pendingCall.input, approval: needsResumeApproval && resumeApprovalAvailable ? context.approval : undefined }, {
+            signal: currentSignal,
+            approvalOnly: needsResumeApproval && !resumeApprovalAvailable && context.reissueApproval === true,
+            /** 恢复期间把工具安全进度唤醒到当前同一 Turn 事件流。 */
+            onProgress: function queueResumeProgress(_callId, tail) { progressQueue.push(tail); wakeProgress?.(); },
+          }).then(function completed(value) { settled = true; return value; });
+          while (!settled || progressQueue.length > 0) {
+            if (progressQueue.length > 0) {
+              for (const tail of progressQueue.splice(0)) yield { type: "tool_progress", turnId, stepId, callId: pendingCall.id, toolName: pendingCall.name, tail };
+              continue;
+            }
+            const progressWaiter = new Promise<void>(function waitProgress(resolve) { wakeProgress = resolve; });
+            await Promise.race([execution, progressWaiter]);
+          }
+          result = await execution;
+        }
         if (result.status === "approval_required") {
           applyWebFetchRedirect(pendingCall, result, messages);
-          const checkpoint: AgentCheckpoint = { turnId, status: "awaiting_approval", stepCount, messages, pendingCalls: calls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          const checkpoint: AgentCheckpoint = { turnId, status: "awaiting_approval", stepCount, messages, pendingCalls: calls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
           yield { type: "approval_required", turnId, stepId, callId: pendingCall.id, toolName: pendingCall.name, result };
           yield { type: "turn_paused", turnId, checkpoint };
           return;
@@ -943,6 +1182,11 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
         const resumeErrorCode = result.status === "error" ? (result as { error: { code: string } }).error.code : undefined;
         const resumeDisplay = buildToolDisplayInfo(pendingCall.name, pendingCall.input, "output" in result ? (result as Record<string, unknown>).output : undefined, resumeErrorCode);
         yield { type: "tool_result", turnId, stepId, callId: pendingCall.id, toolName: pendingCall.name, result, retryCount: 0, ...resumeDisplay };
+        if (pendingCall.id.startsWith("image-fallback-") && result.status === "error") {
+          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          yield { type: "turn_failed", turnId, checkpoint, error: "图片视觉分析失败，无法继续处理", errorCode: "IMAGE_VISION_FAILED", failureStage: "tool_execution" };
+          return;
+        }
         const pendingGuardrailAction = observeToolProgress(pendingCall, result);
         if (pendingGuardrailAction) {
           const guardrailMessage = getToolGuardrailMessage(pendingGuardrailAction);
@@ -952,7 +1196,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
             pendingCalls = calls.slice(1);
             stepCount++;
             await persistSafeToolBatchCheckpoint(pendingCalls);
-            const checkpoint: AgentCheckpoint = { turnId, status: "interrupted_recoverable", interruptionReason: "repeated_tool_calls", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+            const checkpoint: AgentCheckpoint = { turnId, status: "interrupted_recoverable", interruptionReason: "repeated_tool_calls", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
             yield { type: "turn_interrupted", turnId, checkpoint, error: guardrailMessage, termination: { reason: "repeated_tool_calls" } };
             return;
           }
@@ -972,8 +1216,8 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
           const resumeDeniedCode = result.status === "denied" ? result.error.code : undefined;
           const deniedMessage = getDeniedTerminalMessage(resumeDeniedCode);
           yield { type: "answer_delta", turnId, stepId, delta: deniedMessage };
-          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages: [...messages, createAgentTextMessage("assistant", deniedMessage)], completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
-          yield { type: "turn_failed", turnId, error: deniedMessage, errorCode: isSandboxAvailabilityFailureCode(resumeDeniedCode ?? "") ? resumeDeniedCode : undefined, checkpoint };
+          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages: [...messages, createAgentTextMessage("assistant", deniedMessage)], completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          yield { type: "turn_failed", turnId, error: deniedMessage, errorCode: isSandboxAvailabilityFailureCode(resumeDeniedCode ?? "") ? resumeDeniedCode : "TOOL_DENIED", failureStage: "tool_execution", checkpoint };
           return;
         }
         resumeApprovalAvailable = false;
@@ -989,7 +1233,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
       if (context.contextCompaction?.shouldCompact({ messages, usageAnchor, tools: visibleTools })) {
         yield { type: "context_compact_started", turnId, trigger: "auto" };
         try {
-          const compacted = await context.contextCompaction.compact({ messages: [...messages], signal: currentSignal });
+          const compacted = await context.contextCompaction.compact({ messages: [...messages], tools: visibleTools, signal: currentSignal });
           rebuildLedgerAfterCompact(compacted.messages);
           restoreTodoSnapshotIfNeeded();
           usageAnchor = undefined;
@@ -1007,7 +1251,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
             ...runtimeBudgetSnapshot(),
             ...contextUsageSnapshot(),
             ...toolGuardrailSnapshot(),
-            ...todoSnapshotSnapshot(),
+            ...todoSnapshotSnapshot(), ...threadObservationSnapshot(),
             ...checkpointContext(context.contextSnapshot, activeSkills),
           };
           yield {
@@ -1038,11 +1282,11 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
             ...runtimeBudgetSnapshot(),
             ...contextUsageSnapshot(),
             ...toolGuardrailSnapshot(),
-            ...todoSnapshotSnapshot(),
+            ...todoSnapshotSnapshot(), ...threadObservationSnapshot(),
             ...checkpointContext(context.contextSnapshot, activeSkills),
           };
           yield { type: "context_compact_failed", turnId, trigger: "auto", error: message };
-          yield { type: "turn_failed", turnId, checkpoint, error: message };
+          yield { type: "turn_failed", turnId, checkpoint, error: message, errorCode: "CONTEXT_COMPACTION_FAILED", failureStage: "context_compaction" };
           return;
         }
       }
@@ -1055,6 +1299,8 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
       injectedSinceSample = false;
       let sampled: AgentSampleResult | undefined;
       let streamedContent = "";
+      // 只统计真正投影给展示端的正文；RAG 模式下的内部流不构成"已输出内容"。
+      let streamedAnswerEmitted = false;
       // 输出截断或空响应恢复时扩大输出预算，避免模型把预算耗尽在隐藏推理上后仍无法发起工具调用。
       const recoveryMaxTokens = outputRecoveryAttempts > 0 || emptyReplyRetries > 0
         ? DEFAULT_OUTPUT_RECOVERY_MAX_TOKENS
@@ -1062,15 +1308,41 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
 
       // ── 采样段：捕获 AgentSampleError 并进入有界恢复 ──
       try {
-        const sampleMessages = context.chat?.projectEvidenceMessages(messages) ?? messages;
+        const fallbackMode = !context.supportsImageInput || messages.some(function hasFallback(message) { return message.role === "system" && getAgentMessageText(message) === `${IMAGE_FALLBACK_MARKER}${turnId}`; });
+        const completedImageIds = new Set<string>();
+        for (const message of messages) {
+          const block = message.content[0];
+          if (block?.type !== "tool-result" || block.isError) continue;
+          const match = /^image-fallback-([0-9a-f-]{36})-/i.exec(block.toolCallId);
+          if (match) completedImageIds.add(match[1]);
+        }
+        const preparedImages = await prepareSessionImages(messages, context.sessionImageStore, context.sessionId, fallbackMode, completedImageIds);
+        const pendingImage = preparedImages.pendingImage;
+        if (pendingImage) {
+          if (!getVisibleToolDefinitions().some(function isVision(tool) { return tool.name === "vision_analyze"; })) {
+            const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, completedCallIds: [...completedCallIds], ...runtimeBudgetSnapshot(), ...contextUsageSnapshot() };
+            yield { type: "turn_failed", turnId, checkpoint, error: "视觉分析工具不可用，无法处理图片", errorCode: "IMAGE_VISION_UNAVAILABLE", failureStage: "tool_execution" };
+            return;
+          }
+          const question = (getLatestUserTask(messages) ?? "").replace(/\[Image \d+\]/g, "").trim().slice(0, 4000) || "请描述图片内容";
+          sampled = { content: "", toolCalls: [{ id: `image-fallback-${pendingImage.reference.id}-${randomUUID()}`, name: "vision_analyze", input: { path: pendingImage.image.relativePath, prompt: question, expectedSha256: pendingImage.reference.sha256 } }], reasoningSummary: "正在分析图片" };
+        }
+        const projectedMessages = preparedImages.messages;
+        const sampleMessages = context.chat?.projectEvidenceMessages(projectedMessages) ?? projectedMessages;
         const answerAvailable = context.chat?.retrievalMode === "rag" && context.chat.hasAnswerEvidence();
         const forceAnswer = answerAvailable && (hasAnswerMarker(answerFinalizeMarker) || hasAnswerMarker(answerCorrectionMarker));
         const sampleTools = forceAnswer ? [CHAT_RAG_ANSWER_TOOL] : answerAvailable ? [...visibleTools, CHAT_RAG_ANSWER_TOOL] : visibleTools;
-        const sampleOptions = forceAnswer ? { ...context.modelSampleOptions, toolChoice: { name: CHAT_RAG_ANSWER_TOOL.function.name } } : context.modelSampleOptions;
-        for await (const event of streamModelSample(context.modelSampler, sampleMessages, sampleTools, currentSignal, recoveryMaxTokens, sampleOptions)) {
+        samplingTools = sampleTools;
+        const sampleOptions = uiTextFallbackOnly ? { ...context.modelSampleOptions, toolChoice: undefined }
+          : forceAnswer ? { ...context.modelSampleOptions, toolChoice: { name: CHAT_RAG_ANSWER_TOOL.function.name } } : context.modelSampleOptions;
+        const imageData = preparedImages.imageData;
+        if (!sampled) for await (const event of streamModelSample(context.modelSampler, sampleMessages, sampleTools, currentSignal, recoveryMaxTokens, sampleOptions, imageData)) {
           if ("delta" in event) {
             streamedContent += event.delta;
-            if (context.chat?.retrievalMode !== "rag") yield { type: "answer_delta", turnId, stepId, delta: event.delta };
+            if (context.chat?.retrievalMode !== "rag") {
+              streamedAnswerEmitted = true;
+              yield { type: "answer_delta", turnId, stepId, delta: event.delta };
+            }
           } else {
             sampled = event.sampled;
           }
@@ -1078,26 +1350,38 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
       } catch (sampleError) {
         // 用户取消优先级最高
         if (currentSignal.aborted) {
-          const checkpoint: AgentCheckpoint = { turnId, status: "interrupted", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          const checkpoint: AgentCheckpoint = { turnId, status: "interrupted", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
           yield { type: "turn_interrupted", turnId, checkpoint, error: "用户已取消当前任务" };
+          return;
+        }
+        if (sampleError instanceof SessionImageError) {
+          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          yield { type: "turn_failed", turnId, checkpoint, error: sampleError.message, errorCode: sampleError instanceof SessionImageBudgetError ? "IMAGE_REQUEST_BUDGET_EXCEEDED" : "IMAGE_INPUT_UNAVAILABLE", failureStage: "provider_sampling" };
           return;
         }
         if (!(sampleError instanceof AgentSampleError)) throw sampleError;
 
         const code = sampleError.code;
         if (code === "CONTEXT_OVERFLOW") {
-          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
           yield { type: "context_overflow", turnId, stepId, checkpoint };
           return;
         }
         // 4xx 配置/协议/模型错误不会因追加“输出截断”提示而恢复，必须立即保留准确的安全诊断。
-        if (code === "PROVIDER_REQUEST_REJECTED") {
+        if (code === "PROVIDER_REQUEST_REJECTED" || uiTextFallbackOnly) {
           if (streamedContent) yield { type: "answer_discard", turnId, stepId };
-          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
-          yield { type: "turn_failed", turnId, checkpoint, error: sampleError.message };
+          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          yield { type: "turn_failed", turnId, checkpoint, error: sampleError.message, errorCode: code, failureStage: "provider_sampling", providerHttpStatus: sampleError.providerHttpStatus, ...(sampleError.providerFailureReason ? { providerFailureReason: sampleError.providerFailureReason } : {}), ...(sampleError.providerFailureDetail ? { providerFailureDetail: sampleError.providerFailureDetail } : {}) };
           return;
         }
         const transientProviderError = isTransientProviderError(code);
+        // 已向展示端输出正文的流失败不重放：重发会让客户端重复收到同一段回答。
+        if (transientProviderError && streamedAnswerEmitted) {
+          yield { type: "answer_discard", turnId, stepId };
+          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          yield { type: "turn_failed", turnId, checkpoint, error: getStreamedProviderFailureMessage(), errorCode: code, failureStage: "provider_recovery", providerHttpStatus: sampleError.providerHttpStatus, ...(sampleError.providerFailureReason ? { providerFailureReason: sampleError.providerFailureReason } : {}), ...(sampleError.providerFailureDetail ? { providerFailureDetail: sampleError.providerFailureDetail } : {}) };
+          return;
+        }
         const maxAttempts = transientProviderError ? MAX_PROVIDER_RECOVERY_ATTEMPTS
           : code === "TOOL_CALL_INVALID_JSON" ? MAX_INVALID_JSON_RETRIES
           : code === "EMPTY_RESPONSE" ? MAX_EMPTY_RESPONSE_RECOVERY_ATTEMPTS
@@ -1106,16 +1390,26 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
           : code === "TOOL_CALL_INVALID_JSON" ? invalidJsonRetries
           : code === "EMPTY_RESPONSE" ? emptyReplyRetries
           : outputRecoveryAttempts;
+        // 供应商要求的等待超过单次退避上限时直接终止，避免 Turn 被长时间挂起。
+        const retryAfterExceeded = transientProviderError
+          && sampleError.retryAfterMs !== undefined
+          && sampleError.retryAfterMs > PROVIDER_RECOVERY_MAX_DELAY_MS;
 
-        if (attempts >= maxAttempts) {
+        if (attempts >= maxAttempts || retryAfterExceeded) {
+          if (transientProviderError && !retryAfterExceeded && context.supportsImageInput && messages.some(function hasImage(message) { return getAgentImageReferences(message).length > 0; }) && !messages.some(function hasFallback(message) { return message.role === "system" && getAgentMessageText(message) === `${IMAGE_FALLBACK_MARKER}${turnId}`; })) {
+            pushMessage(createAgentTextMessage("system", `${IMAGE_FALLBACK_MARKER}${turnId}`), "system");
+            await persistSafeToolBatchCheckpoint();
+            continue;
+          }
           if (streamedContent) yield { type: "answer_discard", turnId, stepId };
-          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
-          yield { type: "turn_failed", turnId, checkpoint, error: getRecoveryLimitMessage(code) };
+          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          yield { type: "turn_failed", turnId, checkpoint, error: retryAfterExceeded ? getRetryAfterExceededMessage() : getRecoveryLimitMessage(code), errorCode: code, failureStage: "provider_recovery", providerHttpStatus: sampleError.providerHttpStatus, ...(sampleError.providerFailureReason ? { providerFailureReason: sampleError.providerFailureReason } : {}), ...(sampleError.providerFailureDetail ? { providerFailureDetail: sampleError.providerFailureDetail } : {}) };
           return;
         }
 
         if (transientProviderError) {
           providerRecoveryAttempts++;
+          if (messages.some(function hasImage(message) { return getAgentImageReferences(message).length > 0; })) await persistSafeToolBatchCheckpoint();
         } else if (code === "TOOL_CALL_INVALID_JSON") {
           invalidJsonRetries++;
         } else if (code === "EMPTY_RESPONSE") {
@@ -1132,6 +1426,14 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
         yield { type: "model_recovery", turnId, stepId, reason: code, attempt: currentAttempts, maxAttempts };
         if (!transientProviderError) {
           pushMessage(createAgentTextMessage("system", code === "EMPTY_RESPONSE" ? EMPTY_RESPONSE_RECOVERY_MESSAGE : RECOVERY_META_MESSAGE), "system");
+        } else {
+          // 限流/5xx 等按退避策略等待后再采样；等待可被用户取消立即打断。
+          await waitForProviderRetry(resolveProviderRetryDelay(sampleError.retryAfterMs, currentAttempts), currentSignal);
+          if (currentSignal.aborted) {
+            const checkpoint: AgentCheckpoint = { turnId, status: "interrupted", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+            yield { type: "turn_interrupted", turnId, checkpoint, error: "用户已取消当前任务" };
+            return;
+          }
         }
         stepCount++;
         continue;
@@ -1163,7 +1465,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
         sampled = { ...sampled, content, ...(finalizing ? { toolCalls: [], finishReason: "stop", usage: undefined } : {}), reasoningSummary: "正在核验本地知识证据", reasoningContent: undefined, adapterReplayState: undefined };
         streamedContent = "";
         if (currentSignal.aborted) {
-          yield { type: "turn_interrupted", turnId, error: "用户已取消当前任务", checkpoint: { turnId, status: "interrupted", stepCount, messages, completedCallIds: [...completedCallIds], ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot() } };
+          yield { type: "turn_interrupted", turnId, error: "用户已取消当前任务", checkpoint: { turnId, status: "interrupted", stepCount, messages, completedCallIds: [...completedCallIds], ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot() } };
           return;
         }
       }
@@ -1177,6 +1479,11 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
       }
       if (!sampled.toolCalls.length) {
         for await (const inputEvent of drainSteer("after_sample")) yield inputEvent;
+        if (injectedSinceSample) {
+          if (streamedContent) yield { type: "answer_reset", turnId, stepId };
+          stepCount++;
+          continue;
+        }
         if (!sampled.content.trim()) {
           if (emptyReplyRetries < 1) {
             emptyReplyRetries++;
@@ -1185,9 +1492,66 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
             stepCount++;
             continue;
           }
-          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
-          yield { type: "turn_failed", turnId, checkpoint, error: "模型连续返回空响应，未执行工具或产生可显示答复" };
+          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          yield { type: "turn_failed", turnId, checkpoint, error: "模型连续返回空响应，未执行工具或产生可显示答复", errorCode: "EMPTY_RESPONSE", failureStage: "provider_sampling" };
           return;
+        }
+        // 明确持续观察时，阶段正文可交付，但不能将仍活动的原任务变成completed。
+        for await (const event of updateObservedAgreement(stepId)) yield event;
+        if (threadObservation?.targets.some(function pending(target) { return !target.terminal; })) {
+          if (sampled.content.slice(streamedContent.length)) yield { type: "answer_delta", turnId, stepId, delta: sampled.content.slice(streamedContent.length) };
+          pushMessage(toAssistantMessage(sampled), "conversation");
+          yield { type: "reasoning_summary", turnId, stepId, summary: "正在持续观察协作任务；可取消或补充要求" };
+          const waitingFact = threadWaitEvent("waiting"); if (waitingFact) yield waitingFact;
+          while (threadObservation?.targets.some(function pending(target) { return !target.terminal; }) && !currentSignal.aborted && !getSafetyBudgetReason()) {
+            const call: AgentToolCall = { id: `observe-${randomUUID()}`, name: "wait_threads", input: { ...(threadObservation.groupId ? { groupId: threadObservation.groupId } : {}), targets: threadObservation.targets.filter(function pending(target) { return !target.terminal; }).map(function target(item) { return { threadId: item.threadId, taskId: item.taskId, ...(item.cursor ? { cursor: item.cursor } : {}) }; }), timeoutMs: Math.min(30_000, maxDurationMs === undefined ? 30_000 : Math.max(0, maxDurationMs - (clock() - runtimeBudget.startedAt))) } };
+            const wake = new AbortController();
+            const signal = AbortSignal.any([currentSignal, wake.signal]);
+            const waiting = executor.execute({ callId: call.id, toolName: call.name, input: call.input }, { signal });
+            // 持有同一个协作wait；空输入唤醒只做有界复查，不取消/重建等待或重新采样。
+            if (context.inputInbox) {
+              let settled = false;
+              const taskSettled = waiting.then(function settledTask() { settled = true; return false; });
+              while (!settled && !currentSignal.aborted && !injectedSinceSample) {
+                const inputWoke = await Promise.race([taskSettled, Promise.resolve(context.inputInbox.waitForInput?.({ turnId, timeoutMs: 150 })).then(function inputSettled() { return true; })]);
+                if (!inputWoke) break;
+                for await (const event of drainSteer("before_complete")) yield event;
+                if (injectedSinceSample) { wake.abort(); break; }
+                await Promise.race([taskSettled, new Promise<void>(function inputRecheck(resolve) { setTimeout(resolve, 150); })]);
+              }
+            }
+            const result = await waiting;
+            for await (const event of drainSteer("before_complete")) yield event;
+            if (injectedSinceSample) break;
+            if (result.status === "cancelled" && !currentSignal.aborted) continue;
+            if (currentSignal.aborted) break;
+            const timeout = result.status === "success" && (result.output as { timedOut?: boolean }).timedOut === true;
+            const updates = result.status === "success" ? (result.output as { results?: Array<{ threadId: string; taskId?: string; cursor: string; pendingProgress: number; summary?: { turnStatus?: string; deliveryStatus?: string } }> })?.results : undefined;
+            // 超时仍携带新快照：先比较再更新游标，进展/终态不能被静默消费。
+            const changed = updates?.some(function newFact(item) {
+              const prior = threadObservation?.targets.find(function same(target) { return target.threadId === item.threadId && target.taskId === item.taskId; });
+              return item.pendingProgress > 0 || item.cursor !== prior?.cursor || ["completed", "failed", "interrupted"].includes(item.summary?.turnStatus ?? "") || ["failed", "cancelled"].includes(item.summary?.deliveryStatus ?? "");
+            });
+            observeThreadWait(call, result);
+            if (timeout && !changed) continue;
+            pushMessage(toAssistantMessage({ ...sampled, content: "", toolCalls: [call] }), "conversation");
+            pushMessage(toToolMessage(call, result), "conversation");
+            completedCallIds.add(call.id);
+            for await (const event of updateObservedAgreement(stepId)) yield event;
+            for await (const event of consumeObservedProgress(result, stepId)) yield event;
+            yield { type: "tool_result", turnId, stepId, callId: call.id, toolName: call.name, result, retryCount: 0, summary: "协作任务观察" };
+            if (result.status !== "success") {
+              const checkpoint: AgentCheckpoint = { turnId, status: "interrupted_recoverable", stepCount, messages, completedCallIds: [...completedCallIds], consumedInputIds: [...consumedInputIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+              yield { type: "turn_interrupted", turnId, checkpoint, error: "持续观察暂时不可用；可继续当前会话或明确停止观察" };
+              return;
+            }
+            // 新事实交回模型读取差量摘要和阶段报告；没有新事实则继续等待，不消耗采样预算。
+            break;
+          }
+          const resumedFact = threadWaitEvent(injectedSinceSample || currentSignal.aborted ? "none" : "processing"); if (resumedFact) yield resumedFact;
+          await persistSafeToolBatchCheckpoint();
+          stepCount++;
+          continue;
         }
         const remainingContent = sampled.content.slice(streamedContent.length);
         if (remainingContent) yield { type: "answer_delta", turnId, stepId, delta: remainingContent };
@@ -1205,14 +1569,14 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
           verificationOnly = true;
           if (streamedContent) yield { type: "answer_discard", turnId, stepId };
           pushMessage(createAgentTextMessage("system", completionDecision.message), "system");
-          const checkpoint: AgentCheckpoint = { turnId, status: "interrupted_recoverable", interruptionReason: "write_verification", stepCount, messages, completedCallIds: [...completedCallIds], consumedInputIds: [...consumedInputIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          const checkpoint: AgentCheckpoint = { turnId, status: "interrupted_recoverable", interruptionReason: "write_verification", stepCount, messages, completedCallIds: [...completedCallIds], consumedInputIds: [...consumedInputIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
           yield { type: "turn_interrupted", turnId, checkpoint, error: completionDecision.reason };
           return;
         }
         if (completionDecision.action === "fail") {
           if (streamedContent) yield { type: "answer_discard", turnId, stepId };
-          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, completedCallIds: [...completedCallIds], consumedInputIds: [...consumedInputIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
-          yield { type: "turn_failed", turnId, checkpoint, error: completionDecision.reason };
+          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, completedCallIds: [...completedCallIds], consumedInputIds: [...consumedInputIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          yield { type: "turn_failed", turnId, checkpoint, error: completionDecision.reason, errorCode: "TURN_COMPLETION_REJECTED", failureStage: "completion_policy" };
           return;
         }
         if (completionDecision.action === "retry") {
@@ -1230,7 +1594,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
         // Plan 12.2：measured 事件先于 terminal 边界对外发布。
         const completionUsageEvent = contextUsageUpdatedEvent();
         if (completionUsageEvent) yield completionUsageEvent;
-        const checkpoint: AgentCheckpoint = { turnId, status: "completed", stepCount, messages: completedMessages, completedCallIds: [...completedCallIds], consumedInputIds: [...consumedInputIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+        const checkpoint: AgentCheckpoint = { turnId, status: "completed", stepCount, messages: completedMessages, completedCallIds: [...completedCallIds], consumedInputIds: [...consumedInputIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
         yield { type: "turn_completed", turnId, checkpoint };
         return;
       }
@@ -1243,7 +1607,14 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
       const sampledMessage = toAssistantMessage(sampled);
       pushMessage(sampledMessage, "conversation");
       const sampledToolCalls = getAgentToolCalls(sampledMessage);
-      if (yield* rejectInvalidCalls(sampledToolCalls, stepId)) return;
+      const rejection = yield* rejectInvalidCalls(sampledToolCalls, stepId);
+      if (rejection === "failed") return;
+      if (rejection === "ui-fallback") {
+        pendingCalls = undefined;
+        stepCount++;
+        await persistSafeToolBatchCheckpoint();
+        continue;
+      }
       updateUsageAnchor(sampled, messages.length);
       // 完整 Provider usage 到达：立即以最新锚点刷新为 measured 投影，先于工具边界对外发布。
       projectContextUsageSnapshot();
@@ -1325,6 +1696,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
               const toolUsageEvent = contextUsageUpdatedEvent();
               if (toolUsageEvent) yield toolUsageEvent;
               const resultErrorCode = item.result.status === "error" ? item.result.error.code : undefined;
+              if (sampledToolCalls.length === 1 && resultErrorCode === "INVALID_INPUT" && isTrustedUiCall(item.call)) beginUiTextFallback();
               const resultDisplay = buildToolDisplayInfo(item.call.name, item.call.input, "output" in item.result ? item.result.output : undefined, resultErrorCode);
               yield { type: "tool_result", turnId, stepId, callId: item.call.id, toolName: item.call.name, result: item.result, retryCount: item.retryCount, ...resultDisplay };
             }
@@ -1338,21 +1710,31 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
         let guardrailAction: "reminder" | "strong" | "pause" | undefined;
         for (const item of results) {
           if (item.result.status === "question_required") {
+            await publishThreadStage(item.call.id, "blocked", "等待用户回答；请进入执行会话处理，回答后将继续原任务");
             pendingUserQuestion = { callId: item.call.id, requestId: item.result.request.requestId, questions: item.result.request.questions };
-            const checkpoint: AgentCheckpoint = { turnId, status: "awaiting_user_input", stepCount, messages, pendingCalls: [item.call], pendingUserQuestion, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+            const checkpoint: AgentCheckpoint = { turnId, status: "awaiting_user_input", stepCount, messages, pendingCalls: [item.call], pendingUserQuestion, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
             yield { type: "question_required", turnId, stepId, callId: item.call.id, requestId: item.result.request.requestId, questions: item.result.request.questions };
             yield { type: "turn_paused", turnId, checkpoint };
             return;
           }
           if (item.result.status === "approval_required") {
+            await publishThreadStage(item.call.id, "blocked", `等待工具 ${item.call.name} 审批；请进入执行会话处理，批准后将继续原任务`);
             applyWebFetchRedirect(item.call, item.result, messages);
             const remainingCalls = sampledToolCalls.filter(function isUncompleted(call) { return !completedCallIds.has(call.id); });
-            const checkpoint: AgentCheckpoint = { turnId, status: "awaiting_approval", stepCount, messages, pendingCalls: remainingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+            const checkpoint: AgentCheckpoint = { turnId, status: "awaiting_approval", stepCount, messages, pendingCalls: remainingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
             yield { type: "approval_required", turnId, stepId, callId: item.call.id, toolName: item.call.name, result: item.result };
             yield { type: "turn_paused", turnId, checkpoint };
             return;
           }
+          if (item.call.id.startsWith("image-fallback-") && item.result.status === "error") {
+            const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+            yield { type: "turn_failed", turnId, checkpoint, error: "图片视觉分析失败，无法继续处理", errorCode: "IMAGE_VISION_FAILED", failureStage: "tool_execution" };
+            return;
+          }
           completedCallIds.add(item.call.id);
+          observeThreadWait(item.call, item.result);
+          if (item.call.name === "wait_threads") for await (const event of updateObservedAgreement(stepId)) yield event;
+          if (item.call.name === "wait_threads") for await (const event of consumeObservedProgress(item.result, stepId)) yield event;
           const todoOutput = item.call.name === "todo_write" && item.result.status === "success"
             ? item.result.output as TodoWriteResult
             : undefined;
@@ -1364,6 +1746,11 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
           if (observedGuardrailAction && (!guardrailAction || getToolGuardrailPriority(observedGuardrailAction) > getToolGuardrailPriority(guardrailAction))) guardrailAction = observedGuardrailAction;
           // todo_write 仅在成功终态后落 todo_updated；失败、拒绝或取消不替换当前列表。
           if (todoOutput) {
+            if (todoProgressed) {
+              const completed = todoOutput.todos.filter(function done(todo) { return todo.status === "completed"; }).map(function title(todo) { return todo.content; });
+              const active = todoOutput.todos.find(function active(todo) { return todo.status === "in_progress"; })?.content;
+              await publishThreadStage(item.call.id, "milestone", `任务阶段状态：当前 ${active ?? "待收尾核验"}；已完成 ${completed.length}/${todoOutput.todos.length}：${completed.length ? completed.join("；") : "暂无"}`);
+            }
             todoSnapshot = { todoChainId, todos: todoOutput.todos, counts: todoOutput.counts };
             if (todoProgressed) {
               resetToolGuardrail();
@@ -1393,8 +1780,8 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
           await persistSafeToolBatchCheckpoint();
           const deniedMessage = getDeniedTerminalMessage(deniedErrorCode);
           yield { type: "answer_delta", turnId, stepId, delta: deniedMessage };
-          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages: [...messages, createAgentTextMessage("assistant", deniedMessage)], completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
-          yield { type: "turn_failed", turnId, error: deniedMessage, errorCode: isSandboxAvailabilityFailureCode(deniedErrorCode ?? "") ? deniedErrorCode : undefined, checkpoint };
+          const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages: [...messages, createAgentTextMessage("assistant", deniedMessage)], completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+          yield { type: "turn_failed", turnId, error: deniedMessage, errorCode: isSandboxAvailabilityFailureCode(deniedErrorCode ?? "") ? deniedErrorCode : "TOOL_DENIED", failureStage: "tool_execution", checkpoint };
           return;
         }
         if (guardrailAction) {
@@ -1404,7 +1791,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
           if (guardrailAction === "pause") {
             stepCount++;
             await persistSafeToolBatchCheckpoint(pendingCalls);
-            const checkpoint: AgentCheckpoint = { turnId, status: "interrupted_recoverable", interruptionReason: "repeated_tool_calls", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+            const checkpoint: AgentCheckpoint = { turnId, status: "interrupted_recoverable", interruptionReason: "repeated_tool_calls", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
             yield { type: "turn_interrupted", turnId, checkpoint, error: guardrailMessage, termination: { reason: "repeated_tool_calls" } };
             return;
           }
@@ -1415,16 +1802,16 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
       stepCount++;
     }
     if (maxSteps !== undefined) {
-      const checkpoint: AgentCheckpoint = { turnId, status: "limit_reached", stepCount, messages, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+      const checkpoint: AgentCheckpoint = { turnId, status: "limit_reached", stepCount, messages, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
       yield { type: "turn_limit_reached", turnId, checkpoint, termination: { reason: "turn_limit_reached" } };
     }
   } catch (error) {
     if (currentSignal.aborted || (error instanceof Error && error.name === "AbortError")) {
-      const checkpoint: AgentCheckpoint = { turnId, status: "interrupted", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+      const checkpoint: AgentCheckpoint = { turnId, status: "interrupted", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
       yield { type: "turn_interrupted", turnId, checkpoint, error: "用户已取消当前任务" };
       return;
     }
-    const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
-    yield { type: "turn_failed", turnId, checkpoint, error: error instanceof Error ? error.message : "Agent Loop 执行失败" };
+    const checkpoint: AgentCheckpoint = { turnId, status: "failed", stepCount, messages, pendingCalls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
+    yield { type: "turn_failed", turnId, checkpoint, error: error instanceof Error ? error.message : "Agent Loop 执行失败", errorCode: "TURN_EXECUTION_FAILED", failureStage: "agent_loop" };
   }
 }

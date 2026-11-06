@@ -25,6 +25,7 @@ import { AgentRuntimeError } from "../../protocol/error-code";
 import { isExternalFileConstraint } from "../../domain/external-permissions";
 import { isNoSandboxExecConstraint } from "../../domain/sandbox-policy";
 import { createVisionAnalyzer } from "../../provider/vision-analyzer";
+import { createThreadsToolBinding } from "../thread-tool-binding";
 import type { UserQuestionService } from "../user-question-service";
 
 /** Turn 运行配置解析器对依赖组合的内部输入。 */
@@ -135,6 +136,7 @@ export function createTurnRuntimeConfigResolver(
         ...(primarySettings?.topP !== undefined ? { topP: primarySettings.topP } : {}),
       },
       ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
+      supportsImageInput: getModelCapabilityForRef(frozen.modelRef)?.inputModalities.includes("image") === true,
       compactThresholdTokens: primarySettings?.compactThresholdTokens,
       timeoutMs: primarySettings?.timeoutMs,
       subagentModelId: primarySettings?.subagentModelId,
@@ -161,8 +163,19 @@ export function createTurnRuntimeConfigResolver(
       ?? (frozen.modelRef?.provider === "firstParty"
         ? resolveFirstPartyModelSampleOptions(frozen.modelRef, frozen.reasoningProfile).sampleOptions
         : resolveModelSampleOptions(frozen.modelRef, frozen.reasoningProfile));
+    const threadCapability = capabilities.threads
+      ? {
+          ...capabilities.threads,
+          // 新组与子会话权限只能继承宿主目录和当前 Turn 冻结上限的交集。
+          allowedTools: capabilities.threads.allowedTools.filter(function withinTurn(name) {
+            return !frozen.capabilityCeiling?.allowedTools || frozen.capabilityCeiling.allowedTools.includes(name);
+          }),
+        }
+      : undefined;
     return {
       capabilityCeiling: frozen.capabilityCeiling,
+      sessionImageStore: isChat ? undefined : ports.sessionImageStore,
+      supportsImageInput: !isChat && providerConfig?.supportsImageInput === true,
       chatCapability: chatCapability && visionAnalyzer && chatCapability.visionAnalyzer ? { ...chatCapability, visionAnalyzer } : chatCapability,
       chatAttachmentGrants: frozen.chatAttachmentGrants,
       /** 使用宿主时钟判断引用有效期，便于确定性测试。 */
@@ -173,11 +186,15 @@ export function createTurnRuntimeConfigResolver(
       web: isChat && frozen.capabilityCeiling?.chatRetrievalMode !== "web" ? undefined : capabilities.web,
       // Work 内置预览能力仅在 Work Turn 由能力上限解析阶段装配；Chat 恒为 undefined。
       workPreview: isChat ? undefined : (capabilities as TurnCapabilities).workPreview,
+      // 会话协作（Talk-Plan1028 S3）：actor、父会话与组来自本 Turn 的可信绑定，Chat 不装配。
+      threads: isChat || !threadCapability
+        ? undefined
+        : createThreadsToolBinding(ports, threadCapability, { threadId: sessionId, turnId }),
       databaseSearch: !isChat && frozen.databaseSearchPolicy?.enabled === true ? capabilities.databaseSearch : undefined,
       context: isChat ? undefined : capabilities.context,
       skills: isChat ? undefined : capabilities.skills,
       inputInbox: inputInboxService
-        ? createAgentInputInboxCapability(ports.inputInbox, sessionId, turnId)
+        ? createAgentInputInboxCapability(ports.inputInbox, sessionId, turnId, isChat ? undefined : ports.sessionImageStore)
         : undefined,
       // ModelRef 实际选 sampler：优先走 modelSamplerFactory.create(modelRef, credential)，
       // 无 factory 或未配置 ModelRef 时回退兼容字段 modelSampler。

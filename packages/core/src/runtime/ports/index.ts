@@ -2,6 +2,7 @@
  * runtime/ports — Runtime 层 Port 统一出口
  */
 
+import type { ThreadStore } from "./thread-store";
 import type { SessionStore } from "./session-store";
 import type { CheckpointStore } from "./checkpoint-store";
 import type { TranscriptStore } from "./transcript-store";
@@ -18,6 +19,8 @@ import type { JobStore } from "./job-store";
 import type { JobOwnerProbe } from "./job-owner-probe";
 import type { FileMutationStore } from "./file-mutation-store";
 import type { SessionResourceStore } from "./session-resource-store";
+import type { SessionImageStore } from "./session-image-store";
+export type { SessionImageStore, SessionImageRef } from "./session-image-store";
 import type { UserQuestionStore } from "./user-question-store";
 import type { SandboxPort } from "./sandbox-port";
 import type { ExternalPermissionProjector } from "./external-permission-projector";
@@ -25,6 +28,7 @@ import type { HostMutationProtection } from "./host-mutation-protection";
 export type { HostMutationProtection, ProtectedMutationTarget } from "./host-mutation-protection";
 
 export type { SessionStore, CheckpointStore, TranscriptStore, CredentialStore, ProjectStore, EventSink, Clock, WorkspaceAdapter, WorkspaceInfo, TurnStore, ApprovalStore, InputInbox, LeaseStore, JobStore, JobOwnerProbe, FileMutationStore, SessionResourceStore, UserQuestionStore, ExternalPermissionProjector };
+export type { SessionDirectoryPage, SessionDirectoryQuery, SessionDirectoryEntry } from "./session-store";
 export type { ExternalPermissionSnapshot } from "./external-permission-projector";
 export type { JobStoreWriteCondition } from "./job-store";
 export type { GetUserQuestionInput, SaveUserQuestionAnswerInput, SaveUserQuestionAnswerResult } from "./user-question-store";
@@ -36,6 +40,7 @@ export interface RuntimePorts {
   /** Native宿主权威/配置位置保护；缺省仅兼容不持有文件权威的旧/Memory宿主。 */
   hostMutationProtection?: HostMutationProtection;
   sessionStore: SessionStore;
+  threadStore: ThreadStore;
   checkpointStore: CheckpointStore;
   transcriptStore: TranscriptStore;
   credentialStore: CredentialStore;
@@ -69,6 +74,9 @@ export interface RuntimePorts {
 
   /** Session 删除时必须同步清理的宿主外围资源，例如 Web 图片附件。 */
   sessionResourceStore: SessionResourceStore;
+
+  /** Work 图片受信存储；未装配时图片能力不可用。 */
+  sessionImageStore?: SessionImageStore;
 
   /** AskUserQuestion 的问题与私有答案 Store；Browser 不得绕过对应 Service。 */
   userQuestionStore: UserQuestionStore;

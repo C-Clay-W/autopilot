@@ -6,6 +6,7 @@ import { POST as continueTurn } from "@/app/api/sessions/[id]/continue/route";
 import { POST as cancel } from "@/app/api/sessions/[id]/cancel/route";
 import { GET as readSession } from "@/app/api/sessions/[id]/route";
 import type { WebCompositionRoot } from "@/lib/composition-root";
+import { createWebTurnHost, type WebTurnHost } from "@/lib/workspace-host/web-turn-host";
 import type { WebWorkspaceContext } from "@/lib/workspace-host/web-workspace-host";
 import { runWithWorkspaceRequestContext } from "@/lib/workspace-host/web-workspace-session";
 
@@ -24,14 +25,17 @@ function createContext(web: WebCapability, modelSampler: ModelSampler, maxTotalT
     return createAgentRuntime({ ports, defaultRunConfig: { workspaceTrusted: true, permissionMode: "ask", web, modelSampler, ...(maxTotalTokens === undefined ? {} : { maxTotalTokens }), ...(workspaceRoot ? { workspaceRoot } : {}) } });
   }
   const runtime = bootstrap();
+  // 与生产 Workspace Context 一致：普通 Work 的执行统一交给 TurnHost。
+  const turnHost = createWebTurnHost({ runtime, ports });
   const context: WebWorkspaceContext = {
     workspaceId: "fixture-workspace",
     workspaceRoot: "/private/tmp/web-runtime-continuation",
     projectId: "fixture-project",
     runtime,
+    turnHost,
     compositionRoot: { bootstrap: async function createFreshRuntime() { return bootstrap(); } } as WebCompositionRoot,
   };
-  return { ports, runtime, context };
+  return { ports, runtime, context, turnHost };
 }
 
 /** 只发送浏览器允许的请求 DTO，原始工具 URL 不经过审批/恢复请求体。 */
@@ -49,7 +53,7 @@ describe("Web Runtime continuity", function runtimeContinuitySuite() {
       return { url: input.url, finalUrl: input.url, content: "PRIVATE_PAGE_BODY", contentType: "text/plain", truncated: false };
     });
     let samples = 0;
-    const { runtime, context, ports } = createContext({ fetch: { fetch } }, {
+    const { runtime, context, ports, turnHost } = createContext({ fetch: { fetch } }, {
       /** 首轮申请 Fetch，恢复收到结果后完成，不以模型服务掩盖宿主恢复行为。 */
       async sample() {
         return ++samples === 1
@@ -69,15 +73,19 @@ describe("Web Runtime continuity", function runtimeContinuitySuite() {
     expect(JSON.stringify(await ports.checkpointStore.getLatest(session.id))).not.toContain("PRIVATE_URL");
     const approved = await runWithWorkspaceRequestContext(context, () => approve(request({ ...body, decision: "allow_once" }), params));
     expect(approved.status).toBe(200);
+    // Continue 只提交恢复意图：宿主异步续跑，页面用观察流读取持久事件。
     const resumed = await runWithWorkspaceRequestContext(context, () => continueTurn(request(body), params));
-    const sse = await resumed.text();
-    expect(resumed.status).toBe(200);
+    expect(resumed.status).toBe(202);
+    const receipt = await resumed.json() as { accepted: boolean; turnId: string };
+    expect(receipt).toMatchObject({ accepted: true, turnId: "approval-turn" });
+    expect(await turnHost.waitSettled(receipt.turnId, 10_000)).toBe(true);
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(fetch.mock.calls[0]?.[0].url).toBe(url);
-    expect(sse).toContain('"type":"turn_completed"');
-    expect(sse).not.toContain("WEB_INPUT_UNAVAILABLE");
-    expect(sse).not.toContain("PRIVATE_URL");
-    expect(sse).not.toContain("PRIVATE_PAGE_BODY");
+    const resumedEvents = await collect(runtime.turns.getState({ sessionId: session.id, turnId: receipt.turnId }).then(function events(state) { return state.events; }));
+    expect(resumedEvents.some(function terminal(event) { return event.type === "turn_completed"; })).toBe(true);
+    expect(JSON.stringify(resumedEvents)).not.toContain("WEB_INPUT_UNAVAILABLE");
+    expect(JSON.stringify(resumedEvents)).not.toContain("PRIVATE_URL");
+    expect(JSON.stringify(resumedEvents)).not.toContain("PRIVATE_PAGE_BODY");
   });
 
   it("历史返回不可恢复预算终态，Continue Route 按 Core 判定拒绝", async function rejectsNonRecoverableBudgetContinue() {

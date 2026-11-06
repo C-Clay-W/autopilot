@@ -14,6 +14,17 @@ export type InboxStatus = "pending" | "claimed" | "consumed" | "cancelled";
 /** 安全边界；与 AgentInputInboxCapability 对齐。 */
 export type InboxBoundary = "before_sample" | "after_sample" | "after_tools" | "before_complete";
 
+/**
+ * 输入的受信来源；缺省表示当前用户。
+ * 另一会话消息只保留稳定身份，不能携带审批、路径或自报权限。
+ */
+export type InboxOrigin = { kind: "human"; principalId?: string } | { kind: "thread"; threadId: string; turnId?: string; purpose?: "reporting_agreement" };
+
+/** 来源比较键：缺省按当前用户处理，另一会话保留稳定身份。 */
+export function inboxOriginKey(origin?: InboxOrigin): string {
+  return origin === undefined || origin.kind === "human" ? "human" : JSON.stringify(["thread", origin.threadId, origin.turnId ?? null, origin.purpose ?? null]);
+}
+
 /** 一条收件箱输入。 */
 export interface InboxInput {
   /** 输入唯一标识。 */
@@ -34,6 +45,8 @@ export interface InboxInput {
   attachments: InboxAttachmentRef[];
   /** 已选择的 Skill 引用；正文不进入 inbox。 */
   selectedSkills: InboxSkillRef[];
+  /** 由受信宿主绑定的来源；缺省按当前用户处理。 */
+  origin?: InboxOrigin;
   /** 创建时间（ISO 8601）。 */
   createdAt: string;
 }
@@ -44,6 +57,11 @@ export interface InboxAttachmentRef {
   name: string;
   mimeType: string;
   relativePath?: string;
+  /** 发送副本的不可变身份；旧收件箱记录可缺省。 */
+  sha256?: string;
+  width?: number;
+  height?: number;
+  bytes?: number;
 }
 
 /** 已由服务端 catalog 解析的 Skill 引用；正文不进入 inbox。 */
@@ -66,6 +84,8 @@ export interface PostInboxInput {
   content: string;
   attachments?: InboxAttachmentRef[];
   selectedSkills?: InboxSkillRef[];
+  /** 只能由受信宿主填写；普通正文不能伪造人类批准或其他来源。 */
+  origin?: InboxOrigin;
 }
 
 /** InboxService.drain 的查询条件。 */

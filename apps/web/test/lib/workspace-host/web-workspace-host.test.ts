@@ -76,6 +76,24 @@ describe("WebWorkspaceHost", function webWorkspaceHostSuite() {
     expect(createContext).toHaveBeenCalledTimes(2);
   });
 
+  it("冷观察不创建 Context 且仍检查 Trust", async function observesWithoutBootstrap() {
+    const globalStateRoot = createTemporaryRoot("observe-global");
+    const workspaceRoot = createTemporaryRoot("observe-workspace");
+    const trust = createNodeTrustPolicy({ stateRoot: resolveNodeStateRoot({ workspaceRoot, globalStateRoot }) });
+    await trust.grantTrust(workspaceRoot);
+    const createContext = vi.fn(async function createFixture(input: { workspaceId: string }) { return createTestContext(input.workspaceId); });
+    const host = createWebWorkspaceHost({ globalStateRoot, directoryPicker: async function pick() { return workspaceRoot; }, createContext });
+    const selection = await host.beginDirectorySelection();
+    const summary = await host.inspectSelection(selection!.selectionToken) as { workspaceId: string };
+    await expect(host.getContext(summary.workspaceId, { observeOnly: true })).rejects.toMatchObject({ code: "THREADS_UNAVAILABLE" });
+    expect(createContext).not.toHaveBeenCalled();
+    const context = await host.getContext(summary.workspaceId);
+    expect(await host.getContext(summary.workspaceId, { observeOnly: true })).toBe(context);
+    await trust.revokeTrust(workspaceRoot);
+    await expect(host.getContext(summary.workspaceId, { observeOnly: true })).rejects.toMatchObject({ code: "WORKSPACE_NOT_TRUSTED" });
+    expect(createContext).toHaveBeenCalledOnce();
+  });
+
   it("不同 workspace 具有不同稳定 stateRoot 与 Runtime Context", async function isolatesWorkspaceContexts() {
     const globalStateRoot = createTemporaryRoot("global");
     const firstRoot = createTemporaryRoot("first");

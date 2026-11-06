@@ -13,6 +13,7 @@ import type {
   ListInboxInput,
   PostInboxInput,
 } from "@autopilot-agent/core";
+import { inboxOriginKey } from "@autopilot-agent/core";
 import { atomicReplace, readJsonLines, safeFilePath, withFileLock } from "../file-utils";
 import { ensureNodeStateRoot, getNodeStatePaths } from "../state-root";
 import type { NodeStoreOptions } from "../types";
@@ -56,7 +57,11 @@ export function createNodeInputInbox(options: NodeStoreOptions): InputInbox {
         const inputs = readInbox(input.sessionId);
         if (input.clientMessageId) {
           const existing = inputs.find((candidate) => candidate.clientMessageId === input.clientMessageId);
-          if (existing) return existing;
+          if (existing) {
+            // 同键不同正文或来源必须显式冲突，不能让重放覆盖已投递内容。
+            if (existing.content !== input.content || inboxOriginKey(existing.origin) !== inboxOriginKey(input.origin)) throw new Error("INBOX_INPUT_CONFLICT");
+            return existing;
+          }
         }
         const inboxInput: InboxInput = {
           inputId: randomUUID(),
@@ -68,6 +73,7 @@ export function createNodeInputInbox(options: NodeStoreOptions): InputInbox {
           clientMessageId: input.clientMessageId,
           attachments: input.attachments ?? [],
           selectedSkills: input.selectedSkills ?? [],
+          origin: input.origin,
           createdAt: new Date().toISOString(),
         };
         inputs.push(inboxInput);

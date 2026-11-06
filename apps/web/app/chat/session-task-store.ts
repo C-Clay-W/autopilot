@@ -58,6 +58,8 @@ export interface SessionTaskManager {
   updateRuntimeState(sessionKey: string, runtimeStatus: SessionStatus, activeTurnId?: string): void;
   markLimitReached(sessionKey: string): void;
   applyTerminalEvent(sessionKey: string, event: SessionTaskTerminalEvent): void;
+  /** 协作终态事件只清理目标 Turn 遗留的执行态；身份不匹配时保持现状。 */
+  applyThreadTurnTerminal(workspaceId: string, sessionId: string, turnId: string): void;
   removeSession(sessionKey: string): void;
 }
 
@@ -335,6 +337,26 @@ export function createSessionTaskManager(): SessionTaskManager {
     });
   }
 
+  /**
+   * 用协作终态事件收束目标 Turn 的陈旧执行态：只清理仍显示 running/starting 且身份匹配的会话。
+   * 成功、失败、中断等精确终态仍以随后的受限快照为准；activeTurnId 已被新 Turn 占用时不覆盖。
+   */
+  function applyThreadTurnTerminal(workspaceId: string, sessionId: string, turnId: string): void {
+    const sessionKey = createWorkspaceSessionKey(workspaceId, sessionId);
+    const store = getStore(sessionKey);
+    if (!store) return;
+    const current = store.getSnapshot();
+    if (current.phase !== "running" && current.phase !== "starting") return;
+    if (current.activeTurnId && current.activeTurnId !== turnId) return;
+    const next: SessionTaskSnapshot = {
+      ...current,
+      session: { ...current.session, runtimeStatus: "completed", activeTurnId: undefined },
+      phase: "completed",
+      activeTurnId: undefined,
+    };
+    if (store.replace(next)) rebuildListSnapshot();
+  }
+
   /** 删除目标 Session 的内存 store，避免后续状态误写入已删除会话。 */
   function removeSession(sessionId: string): void {
     if (!stores.delete(sessionId)) return;
@@ -355,6 +377,7 @@ export function createSessionTaskManager(): SessionTaskManager {
     updateRuntimeState,
     markLimitReached,
     applyTerminalEvent,
+    applyThreadTurnTerminal,
     removeSession,
   };
 }

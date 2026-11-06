@@ -5,6 +5,7 @@
  * 便于宿主以 type-only 方式引用，避免循环依赖。
  */
 
+import type { ThreadHostContext, ThreadFacade } from "../application/thread-service";
 import type { TurnService } from "../application/turn-service";
 import type { ProjectService } from "../application/project-service";
 import type { SessionService } from "../application/session-service";
@@ -16,6 +17,8 @@ import type { UserQuestionSubmissionService } from "../application/user-question
 
 /** 公开 AgentRuntime 接口；宿主通过此 Facade 访问所有 Runtime 能力。 */
 export interface AgentRuntime {
+  /** 仅受信宿主绑定来源；不接收模型自报身份。 */
+  threads: { bind(context: ThreadHostContext): ThreadFacade };
   /** turn 操作服务。 */
   turns: TurnService;
   /** project 操作服务；Phase 3 新增。 */

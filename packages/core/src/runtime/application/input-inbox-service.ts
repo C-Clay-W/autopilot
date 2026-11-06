@@ -76,24 +76,39 @@ export function createAgentInputInboxCapability(
   inbox: InputInbox,
   sessionId: string,
   turnId: string,
+  imageStore?: import("../ports/session-image-store").SessionImageStore,
 ): import("../../internal/agent-runtime").AgentInputInboxCapability {
   return {
     async drain({ maxDelivery, boundary }) {
       const inputs = await inbox.drain({ sessionId, turnId, maxDelivery, boundary });
-      const injected: Array<{ inputId: string; content: string }> = [];
+      const injected: import("../../internal/agent-runtime").AgentInjectedInput[] = [];
       for (const item of inputs) {
         if (item.status !== "pending" && item.status !== "claimed") continue;
         // drain 先领取输入；在交给 Kernel 前立即绑定到当前 turn，避免成功消费后仍停留在 claimed。
+        const images: NonNullable<import("../../internal/agent-runtime").AgentInjectedInput["images"]> = [];
+        let totalBytes = 0;
+        if (item.attachments.length > 10) throw new Error("图片数量超过上限");
+        for (const attachment of item.attachments) {
+          if (!imageStore) throw new Error("会话图片不可用");
+          const loaded = await imageStore.read({ sessionId, id: attachment.id });
+          if (attachment.sha256 && (loaded.image.sha256 !== attachment.sha256 || loaded.image.width !== attachment.width || loaded.image.height !== attachment.height || loaded.image.bytes !== attachment.bytes)) throw new Error("会话图片校验失败");
+          totalBytes += loaded.bytes.byteLength;
+          if (totalBytes > 20 * 1024 * 1024) throw new Error("图片总大小超过上限");
+          images.push({ type: "image-ref", id: loaded.image.id, sha256: loaded.image.sha256, width: loaded.image.width, height: loaded.image.height });
+        }
         if (await inbox.consume({ sessionId, inputId: item.inputId, turnId })) {
-          injected.push({ inputId: item.inputId, content: item.content });
+          // 来源原样交给 Kernel 呈现，不能因共享 user 载体而丢掉“另一会话消息”身份。
+          injected.push({ inputId: item.inputId, content: item.content, ...(item.origin ? { origin: item.origin } : {}), ...(images.length ? { images } : {}) });
         }
       }
       return injected;
     },
-    async waitForInput({ timeoutMs }) {
-      if (inbox.waitForInput) {
-        await inbox.waitForInput({ sessionId, turnId, timeoutMs });
-      }
-    },
+    // Port缺失等待能力时不公开立即完成的伪等待，避免协作wait被反复取消而空转。
+    ...(inbox.waitForInput ? {
+      /** 只桥接Port真实提供的事件等待，不创建第二个轮询器。 */
+      async waitForInput({ timeoutMs }: { turnId: string; timeoutMs: number }): Promise<void> {
+        await inbox.waitForInput!({ sessionId, turnId, timeoutMs });
+      },
+    } : {}),
   };
 }

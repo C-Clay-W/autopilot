@@ -1,9 +1,10 @@
 /** P16 真实 Route 配线回归：冻结 Runtime/HTTP 边界，验证领取身份和旧 queue History 不重复正文。 */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const mocks = vi.hoisted(function routeMocks() { return { runtime: vi.fn(), messages: vi.fn(), persistUserMessage: vi.fn(), stream: vi.fn(), lock: vi.fn() }; });
+const mocks = vi.hoisted(function routeMocks() { return { runtime: vi.fn(), messages: vi.fn(), persistUserMessage: vi.fn(), stream: vi.fn(), lock: vi.fn(), turnHost: { start: vi.fn() } }; });
 vi.mock("@/lib/workspace-host/work-route-boundary", function boundary() { return { rejectUnscopedWorkRequest: function allowed() { return null; } }; });
 vi.mock("@/lib/workspace-host/work-session-error", function error() { return { toWorkSessionErrorResponse: function response(error: unknown) { return Response.json({ error: String(error) }, { status: 500 }); } }; });
+vi.mock("@/lib/workspace-host/web-workspace-session", function session() { return { requireWorkspaceTurnHost: function host() { return mocks.turnHost; } }; });
 vi.mock("@/lib/agent-turn-store", function turns() { return { tryAcquireQueueStartLock: mocks.lock, cancelActiveTurn: vi.fn(), hasActiveTurn: vi.fn() }; });
 vi.mock("@/lib/session-store", function store() { return { getSessionMeta: vi.fn(async function meta() { return { id: "session", pinnedSkills: [] }; }), getSessionMessages: mocks.messages, updatePinnedSkills: vi.fn(), deleteSession: vi.fn() }; });
 vi.mock("@/lib/session-attachment-store", function attachments() { return { resolveSessionImages: function none() { return []; } }; });
@@ -22,20 +23,38 @@ function runtime() {
 }
 
 describe("P16 queue Routes", function suite() {
-  beforeEach(function reset() { vi.clearAllMocks(); mocks.messages.mockResolvedValue([]); mocks.lock.mockReturnValue(vi.fn()); mocks.stream.mockImplementation(function stream() { return new ReadableStream({ start(controller) { controller.close(); } }); }); });
+  beforeEach(function reset() {
+    vi.clearAllMocks();
+    mocks.messages.mockResolvedValue([]);
+    mocks.lock.mockReturnValue(vi.fn());
+    mocks.stream.mockImplementation(function stream() { return new ReadableStream({ start(controller) { controller.close(); } }); });
+    mocks.turnHost.start.mockImplementation(function accept(input: { turnId: string }) { return { turnId: input.turnId }; });
+  });
 
-  it("start_next 回传实际领取inputId和新TurnId，并为唯一用户历史记录保留身份", async function claimedHeaders() {
+  it("普通新输入只提交意图：202 回执 turnId，执行交给 TurnHost", async function acceptedByHost() {
+    const ports = runtime();
+    mocks.runtime.mockResolvedValue(ports);
+    const response = await POST(new Request("http://localhost/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content: "新任务", clientMessageId: "client-message-1", delivery: "auto" }) }), { params: Promise.resolve({ id: "session" }) });
+    expect(response.status).toBe(202);
+    const payload = await response.json() as { accepted: boolean; turnId: string };
+    expect(payload).toMatchObject({ accepted: true });
+    expect(payload.turnId).toBeTruthy();
+    expect(mocks.persistUserMessage).toHaveBeenCalledWith(ports, "session", "新任务", []);
+    // 页面不再接收执行 SSE；启动参数原样交给宿主 Runner。
+    expect(mocks.turnHost.start).toHaveBeenCalledWith(expect.objectContaining({ sessionId: "session", turnId: payload.turnId, content: "新任务" }));
+    // 普通输入不再在 Route 内领取队列输入。
+    expect(ports.inbox.claimNext).not.toHaveBeenCalled();
+    expect(mocks.stream).not.toHaveBeenCalled();
+  });
+
+  it("start_next 不再是页面调度入口，也不领取输入", async function rejectsLegacyStartNext() {
     const ports = runtime();
     mocks.runtime.mockResolvedValue(ports);
     const response = await POST(new Request("http://localhost/messages", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ operation: "start_next" }) }), { params: Promise.resolve({ id: "session" }) });
-    expect(response.status).toBe(200);
-    const turnId = response.headers.get("X-Agent-Turn-Id");
-    expect(turnId).toBeTruthy();
-    expect(response.headers.get("X-Agent-Input-Id")).toBe("queue-input");
-    expect(ports.inbox.consume).toHaveBeenCalledWith({ sessionId: "session", inputId: "queue-input", turnId });
-    expect(mocks.persistUserMessage).toHaveBeenCalledTimes(1);
-    expect(mocks.persistUserMessage).toHaveBeenCalledWith(ports, "session", "队列原文", [], "input:queue-input");
-    expect(mocks.stream).toHaveBeenCalledWith(expect.objectContaining({ turnId, content: "队列原文", continuity: { source: "claimed_queue" } }));
+    // 本文件的错误映射替身把领域码统一收敛为失败响应；这里只断言不再被接受且没有领取/启动副作用。
+    expect(response.ok).toBe(false);
+    expect(ports.inbox.claimNext).not.toHaveBeenCalled();
+    expect(mocks.turnHost.start).not.toHaveBeenCalled();
   });
 
   it.each([true, false])("History queue关联身份存在=%s，保留原用户气泡且不补重复正文", async function queueHistory(linked) {

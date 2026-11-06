@@ -14,6 +14,9 @@ export interface TranscriptStore {
   /** 读取某 Session 的全部 transcript 事件。 */
   getEvents(sessionId: string): Promise<AgentEventEnvelope[]>;
 
+  /** 按受限游标只读一页，不初始化存储或恢复 Turn。 */
+  readPage(sessionId: string, options: { cursor?: string; limit: number }): Promise<{ items: AgentEventEnvelope[]; nextCursor?: string; cursor?: string }>;
+
   /** 删除指定 Session 的完整 transcript。 */
   deleteBySession(sessionId: string): Promise<void>;
 }

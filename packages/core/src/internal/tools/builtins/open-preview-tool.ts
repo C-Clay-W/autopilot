@@ -1,18 +1,26 @@
 /** open_preview 工具：经 ToolExecutor/PolicyEngine 授权后调用宿主 Work 预览能力，只准备导航交付。 */
 
+import type { JobService } from "../../../runtime/application/job-service";
+import { prepareStaticPreview, resolveStaticPreviewFile } from "./static-preview";
 import { z } from "zod";
+import { createToolError } from "../tool-error";
 import type { AgentToolDefinition } from "../types";
 import type { WorkPreviewCapability, WorkPreviewPrepareResult } from "../../../runtime/protocol/work-preview-capability";
 
 const schema = z.object({
-  url: z.string().min(1).max(2_048),
+  url: z.string().min(1).max(2_048).optional(),
+  staticPath: z.string().min(1).max(512).optional(),
   jobId: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u).optional(),
   openWhen: z.enum(["now", "after_turn"]).optional(),
-}).strict();
+}).strict().superRefine(function targetChoice(value, context) {
+  if (Boolean(value.url) === Boolean(value.staticPath) || (value.staticPath && value.jobId)) context.addIssue({ code: "custom", message: "url与staticPath必须二选一；staticPath不接受jobId" });
+});
 
 /** 创建 open_preview 工具；仅在受信宿主注入 WorkPreviewCapability 的 Work Turn 注册，Chat/CLI 永不注册。 */
 export function createOpenPreviewTool(input: {
   capability: WorkPreviewCapability;
+  jobs?: JobService;
+  workspaceRoot?: string;
   workspaceId: string;
   sessionId: string;
   turnId: string;
@@ -20,8 +28,20 @@ export function createOpenPreviewTool(input: {
   return {
     name: "open_preview",
     description:
-      "根据用户意图、会话上下文与当前成果判断是否有展示必要，并选择适当时机准备内置浏览器预览；url 必须来自可靠信息，缺地址或存在多个候选时先询问。成功只表示预览请求已准备，实际显示由用户端处理；本工具不读取、不验证、不操作网页内容。",
+      "根据用户意图、会话上下文与当前成果判断是否有展示必要，并选择适当时机准备内置浏览器预览；已有静态HTML成果而没有服务时传staticPath（工作区相对HTML路径），宿主经审批复用同会话受管服务或准备固定单文件静态服务并验证真实地址，不猜端口；它只提供该HTML，外部资源需已有服务。url与staticPath二选一。url必须来自可靠信息，缺地址或存在多个候选时先询问。只支持 HTTP(S)，不支持 file URL；页面 URL 可以带路径，不能带查询参数或凭据。需要本地常驻服务时先复用或用 start_background_job 启动受管服务（serviceUrl 仅填 loopback origin），核对 read_background_job 及归属后再预览；超时后先确认 Job/端口事实，不能盲重试或换命令。用户指定子会话执行时，必须 send_thread 委派并在目标中执行，受阻要报告，不能由主会话静默代办。成功只表示预览请求已准备，实际显示由用户端处理；本工具不读取、不验证、不操作网页内容。",
     inputSchema: schema,
+    /** 审批前只做确定性参数校验；宿主的完整目标规则与 execute 复用同一个纯函数。 */
+    async validateInput(value) {
+      if (value.staticPath) {
+        if (!input.jobs) throw createToolError("PREVIEW_UNAVAILABLE", "当前宿主没有受管静态服务能力");
+        await resolveStaticPreviewFile(input.workspaceRoot, value.staticPath);
+        return;
+      }
+      let target: URL;
+      try { target = new URL(value.url!); } catch { throw createToolError("PREVIEW_INVALID_TARGET", "预览仅支持有效的 HTTP(S) 页面地址"); }
+      if (!["http:", "https:"].includes(target.protocol) || target.username || target.password || target.search || /[\u0000-\u0020\u007f]/u.test(value.url!)) throw createToolError("PREVIEW_INVALID_TARGET", "预览只支持无凭据、无查询参数的 HTTP(S) 页面 URL；本地文件请先通过受管后台 Job 提供服务");
+      input.capability.validatePreviewTarget?.(value.url!);
+    },
     metadata: { effect: "dynamic", destructive: false, concurrency: { max: 1, resourceKey: "workspace:open-preview" }, retry: { safe: false }, timeout: { defaultMs: 35_000, maxMs: 35_000 } },
     /** 生成本地可信事实：预览属于外部效果且默认需要审批，模型输入不能改变风险边界。 */
     async createActionFacts(value) {
@@ -29,20 +49,22 @@ export function createOpenPreviewTool(input: {
         toolName: "open_preview",
         effect: "external",
         destructive: false,
-        operation: "preview",
+        operation: value.staticPath ? "prepare_static_preview" : "preview",
         risk: "external_side_effect",
         requiresApproval: true,
         approval: {
-          reason: "准备内置浏览器预览需要确认；预览只会在内置面板打开页面，不会读取或操作网页内容",
-          preview: { url: value.url, jobId: value.jobId, openWhen: value.openWhen ?? "after_turn" },
+          reason: value.staticPath ? "准备固定的本机单文件HTML服务并打开预览，需要进程执行确认；服务由当前会话Job管理" : "准备内置浏览器预览需要确认；预览只会在内置面板打开页面，不会读取或操作网页内容",
+          preview: { ...(value.staticPath ? { staticPath: value.staticPath, action: "固定Node单文件静态服务；仅loopback，系统分配端口" } : { url: value.url }), jobId: value.jobId, openWhen: value.openWhen ?? "after_turn" },
         },
       };
     },
     /** 调用宿主能力准备导航；身份四元组来自 Runtime 绑定，模型输入无法伪造归属。 */
     async execute(value, context) {
+      const target = value.staticPath
+        ? await prepareStaticPreview({ jobs: input.jobs!, workspaceRoot: input.workspaceRoot!, workspaceId: input.workspaceId, sessionId: input.sessionId, turnId: input.turnId, staticPath: value.staticPath }, context)
+        : { url: value.url!, ...(value.jobId !== undefined ? { jobId: value.jobId } : {}) };
       return input.capability.preparePreview({
-        url: value.url,
-        ...(value.jobId !== undefined ? { jobId: value.jobId } : {}),
+        ...target,
         openWhen: value.openWhen ?? "after_turn",
         workspaceId: input.workspaceId,
         sessionId: input.sessionId,

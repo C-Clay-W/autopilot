@@ -10,9 +10,10 @@ import path from "node:path";
 import { createNodeStateSchemaManager, type NodeStateSchemaDiagnostic, type NodeStateSchemaMigration } from "./state-schema-manager";
 import { readJsonLines, type JsonlCorruptionDiagnostic } from "./file-utils";
 import { normalizeNodeSession } from "./session-record";
+import { upgradeSessionIdentity, upgradeThreadCreationSources } from "./state-upgrade";
 
-/** 当前共享 durable 状态清单版本；旧数据没有清单时按既有布局兼容读取。 */
-export const NODE_STATE_SCHEMA_VERSION = 6;
+/** 当前共享 durable 状态版本；已知旧版在宿主初始化时备份并逐级升级。 */
+export const NODE_STATE_SCHEMA_VERSION = 8;
 /** workspace identity 算法版本；路径布局变更时显式升级以避免碰撞。 */
 export const NODE_WORKSPACE_ID_VERSION = 1;
 
@@ -79,6 +80,16 @@ const NODE_STATE_SCHEMA_MIGRATIONS: readonly NodeStateSchemaMigration[] = [{
   migrate() {
     // v6 冻结 Job owner/revision/CAS 契约；旧 Job 文件由 JobService 按 v1 只读兼容。
   },
+}, {
+  fromVersion: 6,
+  toVersion: 7,
+  /** v7 严格校验产品身份；旧 Work 缺省值在副本中显式落盘。 */
+  migrate(stagingRoot) { upgradeSessionIdentity(stagingRoot, true); },
+}, {
+  fromVersion: 7,
+  toVersion: 8,
+  /** 新来源只从已有持久意图恢复；旧进展仍保留为无任务归属的会话进展。 */
+  migrate(stagingRoot) { upgradeThreadCreationSources(stagingRoot); },
 }];
 
 /** 一个状态根下各 durable Store 的固定目录布局。 */
@@ -164,25 +175,28 @@ export function getNodeStatePaths(stateRoot: string): NodeStatePaths {
   };
 }
 
-/** 校验已存在的 schema manifest；缺少 manifest 的历史数据将在 initialize 时迁移。 */
+/** 只接受显式初始化的目标格式，不读取或迁移旧根。 */
 export function assertNodeStateSchema(stateRoot: string): void {
   const paths = getNodeStatePaths(stateRoot);
-  if (!fs.existsSync(paths.schemaFile)) return;
-  createNodeStateSchemaManager({ stateRoot: paths.root, targetVersion: NODE_STATE_SCHEMA_VERSION, migrations: NODE_STATE_SCHEMA_MIGRATIONS }).verify();
+  if (!fs.existsSync(paths.schemaFile)) throw new NodeStateError("STATE_SCHEMA_VERSION_UNSUPPORTED");
+  createNodeStateSchemaManager({ stateRoot: paths.root, targetVersion: NODE_STATE_SCHEMA_VERSION, migrations: [] }).verify();
 }
 
-/** 确保状态根存在并完成必要的 schema 迁移；迁移失败时不覆盖旧状态。 */
+/** 写入入口复用宿主初始化；当前版本直接校验，不重复迁移或备份。 */
 export function ensureNodeStateRoot(stateRoot: string): NodeStatePaths {
   return initializeNodeStateRoot(stateRoot);
 }
 
-/** 在 trust 建立后显式初始化或逐级迁移 schema manifest。 */
+/** Trust 后初始化新根或升级已知旧版；无标识非空根及未知新版保持原样。 */
 export function initializeNodeStateRoot(stateRoot: string): NodeStatePaths {
   try {
     if (fs.existsSync(stateRoot) && fs.lstatSync(stateRoot).isSymbolicLink()) throw new NodeStateError("STATE_SCHEMA_UNSAFE_PATH");
     const paths = getNodeStatePaths(stateRoot);
+    const recovering = fs.existsSync(`${paths.root}.schema-original`);
+    if (!recovering && !fs.existsSync(paths.schemaFile) && fs.existsSync(paths.root) && fs.readdirSync(paths.root).length !== 0) throw new NodeStateError("STATE_SCHEMA_VERSION_UNSUPPORTED");
     const manager = createNodeStateSchemaManager({ stateRoot: paths.root, targetVersion: NODE_STATE_SCHEMA_VERSION, migrations: NODE_STATE_SCHEMA_MIGRATIONS });
     manager.migrate();
+    assertNodeStateSchema(paths.root);
     return paths;
   } catch (error) { throw toNodeBoundaryError(error, "STATE_STORAGE_UNAVAILABLE"); }
 }

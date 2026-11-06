@@ -10,7 +10,8 @@ function createSampler(content: string, toolCalls: unknown[] = []): ModelSampler
   return {
     async sample(messages, tools) {
       expect(tools).toEqual([]);
-      expect(messages[0]).toMatchObject({ role: "system", content: [expect.objectContaining({ text: expect.stringContaining("上下文压缩器") })] });
+      expect(messages.slice(0, createMessages().length)).toEqual(createMessages());
+      expect(messages.at(-1)).toMatchObject({ role: "user", content: [expect.objectContaining({ text: expect.stringContaining("上下文压缩器") })] });
       return { content, toolCalls: toolCalls as never[], reasoningSummary: "test", finishReason: "stop" };
     },
   };

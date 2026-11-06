@@ -1,12 +1,14 @@
 /** Chat 宿主组合根：用现有 Core Runtime 和 Node Chat Ports 装配应用级会话，不经过 Workspace。 */
 import type { RunConfig } from "@autopilot-agent/core";
-import { createNodeChatStorage, createNodeChatCapabilityLoader, createNodeCapabilityLoader, createNodeRagRuntime, createNodeSettingsLoader, type CreateNodeChatStorageOptions, type NodeChatCapabilityLoaderOptions } from "@autopilot-agent/adapters";
+import { createNodeChatStorage, createNodeChatCapabilityLoader, createNodeCapabilityLoader, createNodeRagRuntime, createNodeSettingsLoader, type CreateNodeChatStorageOptions, type NodeChatCapabilityLoaderOptions, type NodeChatStorage } from "@autopilot-agent/adapters";
 import { createChatKnowledgeService } from "./chat-knowledge-service";
 import { loadCore } from "../core-loader";
 import { createSettingsRunConfig } from "../settings/runtime-settings";
 
 /** 宿主/测试注入端口，绝不接受浏览器的 Runtime、路径或 loader 参数。 */
 export interface WebChatHostOptions extends CreateNodeChatStorageOptions {
+  /** 仅受信宿主/测试可注入完整存储；HTTP/浏览器不得提供，缺省仍装配 Node durable 存储。 */
+  storage?: NodeChatStorage;
   homeDirectory?: string;
   modelSampler?: RunConfig["modelSampler"];
   capability?: Omit<NodeChatCapabilityLoaderOptions, "storage">;
@@ -19,7 +21,7 @@ export async function createWebChatHost(options: WebChatHostOptions = {}) {
   const core = loadCore();
   const settingsLoader = createNodeSettingsLoader({ homeDirectory: options.homeDirectory });
   let loaded = settingsLoader.loadUser();
-  const storage = createNodeChatStorage({ ...options, userSettingsPath: loaded.paths.user, parseDocument: options.parseDocument ?? core.parseDocument });
+  const storage = options.storage ?? createNodeChatStorage({ ...options, userSettingsPath: loaded.paths.user, parseDocument: options.parseDocument ?? core.parseDocument });
   const controller = new AbortController();
   const env = options.env ?? process.env;
   /** 每次管理操作或新 RAG Turn 从同一 User 快照构造四角色连接。 */
@@ -49,7 +51,7 @@ export async function createWebChatHost(options: WebChatHostOptions = {}) {
       modelSampler: options.modelSampler,
       modelSamplerFactory: options.modelSampler ? undefined : core.createDefaultModelSamplerFactory(),
       async chatLoader(binding) {
-        return createNodeChatCapabilityLoader({ loadKnowledge: knowledge.loadKnowledge, ...options.capability, visionAnalyzer: createChatVisionAnalyzer(), storage })(binding);
+        return createNodeChatCapabilityLoader({ loadKnowledge: knowledge.loadKnowledge, ...options.capability, interactiveUi: options.capability?.interactiveUi ?? true, visionAnalyzer: createChatVisionAnalyzer(), storage })(binding);
       },
       /** Core 仅在持久 web 身份下调用；每次重新解析 User 配置，不缓存旧搜索能力。 */
       webLoader: function loadChatWeb() { return webLoader.loadChatWeb({ retrievalMode: "web" }); },

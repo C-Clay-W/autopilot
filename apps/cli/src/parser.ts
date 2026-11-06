@@ -14,6 +14,7 @@ import type {
   CliOutputFormat,
   CliParseResult,
   CliSlashCommand,
+  CliThreadCommand,
 } from "./types.js";
 
 /** 交互 TTY 可用的 slash 命令目录；只列出 parser 已真正支持的命令。 */
@@ -54,6 +55,21 @@ export function renderHelp(): string {
     "  autopilot config show|get|set ... --scope user|project|local",
     "  autopilot mcp list | approve <server> [--yes] | revoke <server>",
     "  autopilot job list | show <id> | output <id> | kill <id>",
+    "  autopilot thread group of --thread <id>  (读取groupId/revision)",
+    "  autopilot thread group enable --thread <id> --request-id <id>",
+    "  autopilot thread group disable --group <id> --request-id <id>",
+    "  autopilot thread create --group <id> --thread <parentId> --request-id <id> [--title <t>] [--role <label>] [--model <provider/modelId>] [--effort <level>]",
+    "  autopilot thread associate --group <id> --thread <id> --request-id <id>",
+    "  autopilot thread bind-host --group <id> --thread <id> --expected-revision <n> --execution-host <cli-work-v1|web-work-v1>",
+    "  autopilot thread list --group <id> [--cursor <c>] [--limit <n>]",
+    "  autopilot thread read --group <id> --thread <id> [--cursor <c>] [--limit <n>]",
+    "  autopilot thread send --group <id> --thread <id> --mode <notify|run|steer> --request-id <id> (--message-file <path> | --message-stdin) [--reply-to <id>] [--expected-turn-id <id>] [--handoff-title <t> --handoff-file <path>]",
+    "  autopilot thread wait --group <id> --thread <id> [--thread <id> ...] [--cursor <threadId>=<cursor> ...] [--task <threadId>=<messageId> ...] [--timeout-ms <n>]",
+    "  autopilot thread state read --group <id>",
+    "  autopilot thread state set --group <id> --request-id <id> --expected-revision <n> --key <k> (--value <json> | --value-file <path>)",
+    "  autopilot thread state remove --group <id> --request-id <id> --expected-revision <n> --key <k>",
+    "  autopilot thread interrupt --group <id> --thread <id> --expected-turn-id <id> --request-id <id>",
+    "  autopilot thread watch --group <id> [--cursor <c>] [--limit <n>]",
     "  autopilot undo --session <id> --yes",
     "  autopilot doctor [--connectivity]",
     "  autopilot sandbox status | setup --yes",
@@ -155,6 +171,8 @@ export function parseArgv(argv: readonly string[]): CliParseResult {
     if (token.startsWith("-")) return { kind: "error", message: `未知选项 ${token}` };
 
     if (!commandName) {
+      // 协作命令族有独立选项集；交给专用 parser，避免把 --thread/--group 泄漏给其他命令。
+      if (token === "thread") return parseThreadArgv(argv.slice(index + 1), host);
       commandName = token;
       continue;
     }
@@ -272,6 +290,410 @@ function createInvocation(command: CliCommand, host: CliHostOptions): CliInvocat
   return { command, host };
 }
 
+/** 协作命令支持的带值选项；未列出的选项一律拒绝，避免拼写错误被静默忽略。 */
+const THREAD_VALUE_OPTIONS: ReadonlySet<string> = new Set([
+  "--group", "--thread", "--request-id", "--title", "--role", "--model", "--effort",
+  "--cursor", "--limit", "--mode", "--message-file", "--reply-to", "--expected-turn-id",
+  "--handoff-title", "--handoff-file", "--task", "--timeout-ms", "--expected-revision", "--key",
+  "--value", "--value-file", "--execution-host",
+]);
+
+/** 协作命令支持的开关选项。 */
+const THREAD_FLAG_OPTIONS: ReadonlySet<string> = new Set(["--message-stdin"]);
+
+/** 可与协作命令混排的宿主选项；值语义与全局 parser 一致。 */
+const THREAD_HOST_OPTIONS: ReadonlySet<string> = new Set(["--state-root", "--trust-root", "--workspace-root"]);
+
+/** 协作命令的原始选项集合；重复选项保留全部值，由各子命令判定是否允许重复。 */
+interface ThreadArgBag {
+  options: Map<string, string[]>;
+  flags: Set<string>;
+  positionals: string[];
+  host: CliHostOptions;
+}
+
+/** 构造统一的用法错误。 */
+function threadUsageError(message: string): CliParseResult {
+  return { kind: "error", message };
+}
+
+/** 拆分协作命令的选项与位置参数；只做词法切分，不解释语义。 */
+function readThreadArgs(tokens: readonly string[]): ThreadArgBag | { error: string } {
+  const options = new Map<string, string[]>();
+  const flags = new Set<string>();
+  const positionals: string[] = [];
+  const host: CliHostOptions = {};
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (THREAD_FLAG_OPTIONS.has(token)) {
+      flags.add(token);
+      continue;
+    }
+    if (THREAD_HOST_OPTIONS.has(token)) {
+      const value = tokens[index + 1];
+      if (value === undefined) return { error: `选项 ${token} 需要一个值` };
+      if (token === "--state-root") host.stateRoot = value;
+      else if (token === "--trust-root") host.trustRoot = value;
+      else host.workspaceRoot = value;
+      index += 1;
+      continue;
+    }
+    if (!THREAD_VALUE_OPTIONS.has(token)) {
+      if (token.startsWith("-")) return { error: `未知选项 ${token}` };
+      positionals.push(token);
+      continue;
+    }
+    const value = tokens[index + 1];
+    if (value === undefined) return { error: `选项 ${token} 需要一个值` };
+    const values = options.get(token) ?? [];
+    values.push(value);
+    options.set(token, values);
+    index += 1;
+  }
+  return { options, flags, positionals, host };
+}
+
+/** 读取唯一必填选项；缺失、重复或空值统一返回用法错误。 */
+function requiredThreadOption(bag: ThreadArgBag, name: string): { value: string } | { error: string } {
+  const values = bag.options.get(name);
+  if (!values || values.length !== 1 || !values[0]) return { error: `thread 命令需要且只接受一个 ${name}` };
+  return { value: values[0] };
+}
+
+/** 读取可选单值选项；重复出现视为用法错误。 */
+function optionalThreadOption(bag: ThreadArgBag, name: string): { value?: string } | { error: string } {
+  const values = bag.options.get(name);
+  if (!values) return {};
+  if (values.length !== 1 || !values[0]) return { error: `选项 ${name} 只能出现一次且不能为空` };
+  return { value: values[0] };
+}
+
+/** 解析有界整数选项；不接受负数或小数。 */
+function threadInteger(value: string, name: string, min: number, max: number): { value: number } | { error: string } {
+  if (!/^\d+$/u.test(value)) return { error: `${name} 需要非负整数` };
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < min || parsed > max) return { error: `${name} 必须在 ${min}-${max} 之间` };
+  return { value: parsed };
+}
+
+/** 组装协作命令；位置参数必须为空，避免把多余文本当成正文或身份。 */
+function threadCommand(subcommand: string, command: CliThreadCommand, bag: ThreadArgBag, host: CliHostOptions): CliParseResult {
+  if (bag.positionals.length > 0) return threadUsageError(`thread ${subcommand} 不接受位置参数：${bag.positionals.join(" ")}`);
+  return { kind: "command", invocation: createInvocation({ type: "thread", command }, { ...host, ...bag.host }) };
+}
+
+/** 解析 `autopilot thread ...` 薄命令族；argv 契约见 CLI-Reference 第 12 节。 */
+function parseThreadArgv(tokens: readonly string[], host: CliHostOptions): CliParseResult {
+  const name = tokens[0];
+  if (!name || name.startsWith("-")) return threadUsageError("thread 支持 group|create|associate|bind-host|list|read|send|wait|state|interrupt|watch");
+  if (name === "group") return parseThreadGroup(tokens.slice(1), host);
+  if (name === "state") return parseThreadState(tokens.slice(1), host);
+  if (name !== "bind-host" && name !== "create" && name !== "associate" && name !== "list" && name !== "read" && name !== "send" && name !== "wait" && name !== "interrupt" && name !== "watch") {
+    return threadUsageError(`未知 thread 子命令 ${name}`);
+  }
+  const bag = readThreadArgs(tokens.slice(1));
+  if ("error" in bag) return threadUsageError(bag.error);
+  if (name === "create") return parseThreadCreate(bag, host);
+  if (name === "associate") return parseThreadAssociate(bag, host);
+  if (name === "bind-host") return parseThreadBindHost(bag, host);
+  if (name === "list") return parseThreadList(bag, host);
+  if (name === "read") return parseThreadRead(bag, host);
+  if (name === "send") return parseThreadSend(bag, host);
+  if (name === "wait") return parseThreadWait(bag, host);
+  if (name === "interrupt") return parseThreadInterrupt(bag, host);
+  return parseThreadWatch(bag, host);
+}
+
+/** 解析 `thread group enable|disable`；启用与停用都必须带稳定请求编号。 */
+function parseThreadGroup(tokens: readonly string[], host: CliHostOptions): CliParseResult {
+  const action = tokens[0];
+  const bag = readThreadArgs(tokens.slice(1));
+  if ("error" in bag) return threadUsageError(bag.error);
+  if (action === "of") {
+    const threadId = requiredThreadOption(bag, "--thread");
+    if ("error" in threadId) return threadUsageError(threadId.error);
+    return threadCommand("group of", { type: "group_of", threadId: threadId.value }, bag, host);
+  }
+  if (action === "enable") {
+    const rootThreadId = requiredThreadOption(bag, "--thread");
+    if ("error" in rootThreadId) return threadUsageError(rootThreadId.error);
+    const requestId = requiredThreadOption(bag, "--request-id");
+    if ("error" in requestId) return threadUsageError(requestId.error);
+    return threadCommand("group enable", { type: "group_enable", requestId: requestId.value, rootThreadId: rootThreadId.value }, bag, host);
+  }
+  if (action === "disable") {
+    const groupId = requiredThreadOption(bag, "--group");
+    if ("error" in groupId) return threadUsageError(groupId.error);
+    const requestId = requiredThreadOption(bag, "--request-id");
+    if ("error" in requestId) return threadUsageError(requestId.error);
+    return threadCommand("group disable", { type: "group_disable", requestId: requestId.value, groupId: groupId.value }, bag, host);
+  }
+  return threadUsageError("thread group 支持 of|enable|disable");
+}
+
+/** 解析 `thread state read|set|remove`；写入必须给 expected revision 与请求编号。 */
+function parseThreadState(tokens: readonly string[], host: CliHostOptions): CliParseResult {
+  const action = tokens[0];
+  const bag = readThreadArgs(tokens.slice(1));
+  if ("error" in bag) return threadUsageError(bag.error);
+  if (action !== "read" && action !== "set" && action !== "remove") return threadUsageError("thread state 支持 read|set|remove");
+  const groupId = requiredThreadOption(bag, "--group");
+  if ("error" in groupId) return threadUsageError(groupId.error);
+  if (action === "read") return threadCommand("state read", { type: "state_read", groupId: groupId.value }, bag, host);
+  const requestId = requiredThreadOption(bag, "--request-id");
+  if ("error" in requestId) return threadUsageError(requestId.error);
+  const revision = requiredThreadOption(bag, "--expected-revision");
+  if ("error" in revision) return threadUsageError(revision.error);
+  const expectedRevision = threadInteger(revision.value, "--expected-revision", 0, Number.MAX_SAFE_INTEGER);
+  if ("error" in expectedRevision) return threadUsageError(expectedRevision.error);
+  const key = requiredThreadOption(bag, "--key");
+  if ("error" in key) return threadUsageError(key.error);
+  const value = optionalThreadOption(bag, "--value");
+  if ("error" in value) return threadUsageError(value.error);
+  const valueFile = optionalThreadOption(bag, "--value-file");
+  if ("error" in valueFile) return threadUsageError(valueFile.error);
+  if (action === "remove") {
+    if (value.value !== undefined || valueFile.value !== undefined) return threadUsageError("thread state remove 不接受 --value/--value-file");
+    return threadCommand("state remove", { type: "state_remove", requestId: requestId.value, groupId: groupId.value, expectedRevision: expectedRevision.value, key: key.value }, bag, host);
+  }
+  let stateValue: { kind: "inline"; json: string } | { kind: "file"; path: string };
+  if (value.value !== undefined && valueFile.value === undefined) stateValue = { kind: "inline", json: value.value };
+  else if (valueFile.value !== undefined && value.value === undefined) stateValue = { kind: "file", path: valueFile.value };
+  else return threadUsageError("thread state set 需要 --value 或 --value-file 二选一");
+  return threadCommand("state set", {
+    type: "state_set",
+    requestId: requestId.value,
+    groupId: groupId.value,
+    expectedRevision: expectedRevision.value,
+    key: key.value,
+    value: stateValue,
+  }, bag, host);
+}
+
+/** 解析 `thread create`；`--thread` 是父会话，模型与推理强度只能在宿主目录内选择。 */
+function parseThreadCreate(bag: ThreadArgBag, host: CliHostOptions): CliParseResult {
+  const groupId = requiredThreadOption(bag, "--group");
+  if ("error" in groupId) return threadUsageError(groupId.error);
+  const parentThreadId = requiredThreadOption(bag, "--thread");
+  if ("error" in parentThreadId) return threadUsageError(parentThreadId.error);
+  const requestId = requiredThreadOption(bag, "--request-id");
+  if ("error" in requestId) return threadUsageError(requestId.error);
+  const title = optionalThreadOption(bag, "--title");
+  if ("error" in title) return threadUsageError(title.error);
+  const roleLabel = optionalThreadOption(bag, "--role");
+  if ("error" in roleLabel) return threadUsageError(roleLabel.error);
+  const model = optionalThreadOption(bag, "--model");
+  if ("error" in model) return threadUsageError(model.error);
+  const effort = optionalThreadOption(bag, "--effort");
+  if ("error" in effort) return threadUsageError(effort.error);
+  let modelRef: { provider: string; modelId: string } | undefined;
+  if (model.value !== undefined) {
+    const separator = model.value.indexOf("/");
+    if (separator <= 0 || separator === model.value.length - 1) return threadUsageError("--model 需要 provider/modelId");
+    modelRef = { provider: model.value.slice(0, separator), modelId: model.value.slice(separator + 1) };
+  }
+  if (effort.value !== undefined && effort.value !== "none" && effort.value !== "low" && effort.value !== "medium" && effort.value !== "high" && effort.value !== "max") {
+    return threadUsageError("--effort 支持 none|low|medium|high|max");
+  }
+  return threadCommand("create", {
+    type: "create",
+    requestId: requestId.value,
+    groupId: groupId.value,
+    parentThreadId: parentThreadId.value,
+    ...(title.value !== undefined ? { title: title.value } : {}),
+    ...(roleLabel.value !== undefined ? { roleLabel: roleLabel.value } : {}),
+    ...(modelRef ? { modelRef } : {}),
+    ...(effort.value !== undefined ? { reasoningEffort: effort.value } : {}),
+  }, bag, host);
+}
+
+/** 解析 `thread list`；游标与条数由 Core 再校验一次。 */
+function parseThreadList(bag: ThreadArgBag, host: CliHostOptions): CliParseResult {
+  const groupId = requiredThreadOption(bag, "--group");
+  if ("error" in groupId) return threadUsageError(groupId.error);
+  const cursor = optionalThreadOption(bag, "--cursor");
+  if ("error" in cursor) return threadUsageError(cursor.error);
+  const limit = optionalThreadOption(bag, "--limit");
+  if ("error" in limit) return threadUsageError(limit.error);
+  let limitValue: number | undefined;
+  if (limit.value !== undefined) {
+    const parsedLimit = threadInteger(limit.value, "--limit", 1, 100);
+    if ("error" in parsedLimit) return threadUsageError(parsedLimit.error);
+    limitValue = parsedLimit.value;
+  }
+  return threadCommand("list", {
+    type: "list",
+    groupId: groupId.value,
+    ...(cursor.value !== undefined ? { cursor: cursor.value } : {}),
+    ...(limitValue !== undefined ? { limit: limitValue } : {}),
+  }, bag, host);
+}
+
+/** 解析 `thread read`；读取不启动、不恢复目标会话。 */
+function parseThreadRead(bag: ThreadArgBag, host: CliHostOptions): CliParseResult {
+  const groupId = requiredThreadOption(bag, "--group");
+  if ("error" in groupId) return threadUsageError(groupId.error);
+  const threadId = requiredThreadOption(bag, "--thread");
+  if ("error" in threadId) return threadUsageError(threadId.error);
+  const cursor = optionalThreadOption(bag, "--cursor");
+  if ("error" in cursor) return threadUsageError(cursor.error);
+  const limit = optionalThreadOption(bag, "--limit");
+  if ("error" in limit) return threadUsageError(limit.error);
+  let limitValue: number | undefined;
+  if (limit.value !== undefined) {
+    const parsedLimit = threadInteger(limit.value, "--limit", 1, 100);
+    if ("error" in parsedLimit) return threadUsageError(parsedLimit.error);
+    limitValue = parsedLimit.value;
+  }
+  return threadCommand("read", {
+    type: "read",
+    groupId: groupId.value,
+    threadId: threadId.value,
+    ...(cursor.value !== undefined ? { cursor: cursor.value } : {}),
+    ...(limitValue !== undefined ? { limit: limitValue } : {}),
+  }, bag, host);
+}
+
+/** 解析 `thread send`；正文只允许文件或显式 stdin，避免 shell 二次解释。 */
+function parseThreadSend(bag: ThreadArgBag, host: CliHostOptions): CliParseResult {
+  const groupId = requiredThreadOption(bag, "--group");
+  if ("error" in groupId) return threadUsageError(groupId.error);
+  const threadId = requiredThreadOption(bag, "--thread");
+  if ("error" in threadId) return threadUsageError(threadId.error);
+  const requestId = requiredThreadOption(bag, "--request-id");
+  if ("error" in requestId) return threadUsageError(requestId.error);
+  const mode = requiredThreadOption(bag, "--mode");
+  if ("error" in mode) return threadUsageError(mode.error);
+  if (mode.value !== "notify" && mode.value !== "run" && mode.value !== "steer") return threadUsageError("--mode 支持 notify|run|steer");
+  const messageFile = optionalThreadOption(bag, "--message-file");
+  if ("error" in messageFile) return threadUsageError(messageFile.error);
+  const fromStdin = bag.flags.has("--message-stdin");
+  if (Boolean(messageFile.value) === fromStdin) return threadUsageError("正文需要 --message-file 或 --message-stdin 二选一");
+  const replyTo = optionalThreadOption(bag, "--reply-to");
+  if ("error" in replyTo) return threadUsageError(replyTo.error);
+  const expectedTurnId = optionalThreadOption(bag, "--expected-turn-id");
+  if ("error" in expectedTurnId) return threadUsageError(expectedTurnId.error);
+  if (mode.value === "steer" && expectedTurnId.value === undefined) return threadUsageError("--mode steer 必须提供 --expected-turn-id");
+  if (mode.value !== "steer" && expectedTurnId.value !== undefined) return threadUsageError("只有 --mode steer 接受 --expected-turn-id");
+  const handoffTitle = optionalThreadOption(bag, "--handoff-title");
+  if ("error" in handoffTitle) return threadUsageError(handoffTitle.error);
+  const handoffFile = optionalThreadOption(bag, "--handoff-file");
+  if ("error" in handoffFile) return threadUsageError(handoffFile.error);
+  if (Boolean(handoffTitle.value) !== Boolean(handoffFile.value)) return threadUsageError("交接需要同时提供 --handoff-title 与 --handoff-file");
+  if (handoffTitle.value !== undefined && mode.value !== "run") return threadUsageError("交接只允许 --mode run");
+  return threadCommand("send", {
+    type: "send",
+    requestId: requestId.value,
+    groupId: groupId.value,
+    threadId: threadId.value,
+    mode: mode.value,
+    contentSource: messageFile.value ? { kind: "file", path: messageFile.value } : { kind: "stdin" },
+    ...(replyTo.value !== undefined ? { replyTo: replyTo.value } : {}),
+    ...(expectedTurnId.value !== undefined ? { expectedTurnId: expectedTurnId.value } : {}),
+    ...(handoffTitle.value && handoffFile.value ? { handoff: { title: handoffTitle.value, markdownFile: handoffFile.value } } : {}),
+  }, bag, host);
+}
+
+/** 解析 `thread wait`；每个 `--thread` 一个目标，游标用 `--cursor <threadId>=<cursor>` 指定。 */
+function parseThreadWait(bag: ThreadArgBag, host: CliHostOptions): CliParseResult {
+  const groupId = requiredThreadOption(bag, "--group");
+  if ("error" in groupId) return threadUsageError(groupId.error);
+  const threadValues = bag.options.get("--thread") ?? [];
+  if (threadValues.length === 0 || threadValues.length > 8) return threadUsageError("thread wait 需要 1-8 个 --thread");
+  if (new Set(threadValues).size !== threadValues.length) return threadUsageError("thread wait 的 --thread 不能重复");
+  const cursors = new Map<string, string>();
+  for (const entry of bag.options.get("--cursor") ?? []) {
+    const separator = entry.indexOf("=");
+    if (separator <= 0 || separator === entry.length - 1) return threadUsageError("--cursor 需要 <threadId>=<cursor>");
+    const target = entry.slice(0, separator);
+    if (!threadValues.includes(target)) return threadUsageError(`--cursor 的目标 ${target} 不在 --thread 列表中`);
+    if (cursors.has(target)) return threadUsageError(`--cursor 重复指定了 ${target}`);
+    cursors.set(target, entry.slice(separator + 1));
+  }
+  const tasks = new Map<string, string>();
+  for (const entry of bag.options.get("--task") ?? []) {
+    const separator = entry.indexOf("=");
+    if (separator <= 0 || separator === entry.length - 1) return threadUsageError("--task 需要 <threadId>=<messageId>");
+    const target = entry.slice(0, separator);
+    if (!threadValues.includes(target) || tasks.has(target)) return threadUsageError("--task 目标必须属于 --thread 且不能重复");
+    tasks.set(target, entry.slice(separator + 1));
+  }
+  const timeout = optionalThreadOption(bag, "--timeout-ms");
+  if ("error" in timeout) return threadUsageError(timeout.error);
+  const timeoutMs = timeout.value === undefined ? { value: 30_000 } : threadInteger(timeout.value, "--timeout-ms", 0, 30_000);
+  if ("error" in timeoutMs) return threadUsageError(timeoutMs.error);
+  return threadCommand("wait", {
+    type: "wait",
+    groupId: groupId.value,
+    targets: threadValues.map(function toTarget(threadId) {
+      const cursor = cursors.get(threadId);
+      return { threadId, ...(tasks.has(threadId) ? { taskId: tasks.get(threadId)! } : {}), ...(cursor !== undefined ? { cursor } : {}) };
+    }),
+    timeoutMs: timeoutMs.value,
+  }, bag, host);
+}
+
+/** 显式关联已有会话；只有受信人类 owner 可在 Core 中真正授权。 */
+function parseThreadAssociate(bag: ThreadArgBag, host: CliHostOptions): CliParseResult {
+  const groupId = requiredThreadOption(bag, "--group");
+  if ("error" in groupId) return threadUsageError(groupId.error);
+  const threadId = requiredThreadOption(bag, "--thread");
+  if ("error" in threadId) return threadUsageError(threadId.error);
+  const requestId = requiredThreadOption(bag, "--request-id");
+  if ("error" in requestId) return threadUsageError(requestId.error);
+  return threadCommand("associate", { type: "associate", groupId: groupId.value, threadId: threadId.value, requestId: requestId.value }, bag, host);
+}
+
+/** 人类明确选择旧目标的执行档位，组版本用于拒绝迟到确认。 */
+function parseThreadBindHost(bag: ThreadArgBag, host: CliHostOptions): CliParseResult {
+  const groupId = requiredThreadOption(bag, "--group");
+  if ("error" in groupId) return threadUsageError(groupId.error);
+  const threadId = requiredThreadOption(bag, "--thread");
+  if ("error" in threadId) return threadUsageError(threadId.error);
+  const revision = requiredThreadOption(bag, "--expected-revision");
+  if ("error" in revision) return threadUsageError(revision.error);
+  const executionHost = requiredThreadOption(bag, "--execution-host");
+  if ("error" in executionHost) return threadUsageError(executionHost.error);
+  if (!/^\d+$/u.test(revision.value) || !Number.isSafeInteger(Number(revision.value))) return threadUsageError("--expected-revision 需要非负整数");
+  if (executionHost.value !== "cli-work-v1" && executionHost.value !== "web-work-v1") return threadUsageError("--execution-host 需要 cli-work-v1 或 web-work-v1");
+  return threadCommand("bind-host", { type: "bind_host", groupId: groupId.value, threadId: threadId.value, expectedRevision: Number(revision.value), executionHost: executionHost.value }, bag, host);
+}
+
+/** 解析 `thread interrupt`；必须带发送时观察到的 Turn，避免中断错任务。 */
+function parseThreadInterrupt(bag: ThreadArgBag, host: CliHostOptions): CliParseResult {
+  const groupId = requiredThreadOption(bag, "--group");
+  if ("error" in groupId) return threadUsageError(groupId.error);
+  const threadId = requiredThreadOption(bag, "--thread");
+  if ("error" in threadId) return threadUsageError(threadId.error);
+  const requestId = requiredThreadOption(bag, "--request-id");
+  if ("error" in requestId) return threadUsageError(requestId.error);
+  const expectedTurnId = requiredThreadOption(bag, "--expected-turn-id");
+  if ("error" in expectedTurnId) return threadUsageError(expectedTurnId.error);
+  return threadCommand("interrupt", { type: "interrupt", requestId: requestId.value, groupId: groupId.value, threadId: threadId.value, expectedTurnId: expectedTurnId.value }, bag, host);
+}
+
+/** 解析 `thread watch`；只观察组事件，Ctrl+C 只结束观察。 */
+function parseThreadWatch(bag: ThreadArgBag, host: CliHostOptions): CliParseResult {
+  const groupId = requiredThreadOption(bag, "--group");
+  if ("error" in groupId) return threadUsageError(groupId.error);
+  const cursor = optionalThreadOption(bag, "--cursor");
+  if ("error" in cursor) return threadUsageError(cursor.error);
+  const limit = optionalThreadOption(bag, "--limit");
+  if ("error" in limit) return threadUsageError(limit.error);
+  let limitValue: number | undefined;
+  if (limit.value !== undefined) {
+    const parsedLimit = threadInteger(limit.value, "--limit", 1, 100);
+    if ("error" in parsedLimit) return threadUsageError(parsedLimit.error);
+    limitValue = parsedLimit.value;
+  }
+  return threadCommand("watch", {
+    type: "watch",
+    groupId: groupId.value,
+    ...(cursor.value !== undefined ? { cursor: cursor.value } : {}),
+    ...(limitValue !== undefined ? { limit: limitValue } : {}),
+  }, bag, host);
+}
+
 /** 解析单行 slash command；普通文本不在此函数内改写。 */
 export function parseSlashAction(input: string): CliActionParseResult {
   const trimmed = input.trim();
@@ -286,6 +708,7 @@ export function parseSlashAction(input: string): CliActionParseResult {
   if (name === "cancel") return parts.length === 1 ? { kind: "action", action: { type: "cancel_turn" } } : invalidSlashArguments(name);
   if (name === "queue") return parseQueuedPrompt(parts);
   if (name === "compact") return parts.length === 1 ? { kind: "action", action: { type: "compact" } } : invalidSlashArguments(name);
+  if (name === "resume") return parts.length === 1 ? { kind: "action", action: { type: "resume" } } : { kind: "error", message: "/resume 不接受额外参数" };
   if (name === "context") {
     if (parts.length === 1) return { kind: "action", action: { type: "show_context", all: false } };
     if (parts.length === 2 && parts[1] === "all") return { kind: "action", action: { type: "show_context", all: true } };

@@ -1,7 +1,7 @@
 /** Presentation package 定向测试：验证安全边界、callId 身份、replay 幂等与 Host 输入。 */
 import { describe, expect, it } from "vitest";
 import type { AgentCheckpoint, AgentEvent, AgentEventEnvelope } from "@autopilot-agent/core";
-import { createPresentationState, groupToolCalls, redactPresentationText, reducePresentationInput, replayPresentationInputs, resolvePresentationApproval, restorePresentationApproval, selectAssistantAnswers, selectRequiredApprovals, selectTimeline, selectToolCalls } from "../src/index.js";
+import { createPresentationState, getPresentationCopy, groupToolCalls, redactPresentationText, reducePresentationInput, replayPresentationInputs, resolvePresentationApproval, restorePresentationApproval, selectAssistantAnswers, selectRequiredApprovals, selectTimeline, selectToolCalls } from "../src/index.js";
 import { createPresentationFixture } from "./presentation.fixture.js";
 
 describe("Presentation reducer", function presentationReducerSuite() {
@@ -175,6 +175,23 @@ describe("Presentation reducer", function presentationReducerSuite() {
     expect(full.items.find(function findJob(item) { return item.kind === "job"; })).toMatchObject({ state: "interrupted" });
     expect(full.items.find(function findEvidence(item) { return item.kind === "capability_notice" && item.scope === "evidence"; })).toMatchObject({ summary: "2 个来源" });
     expect(live).toBeDefined();
+  });
+
+  it("协作工具只投影协作语义，不显示消息正文或共享板内容", function projectsThreadToolFacts() {
+    const state = replayPresentationInputs([
+      { kind: "runtime_event" as const, envelope: { seq: 1, sessionId: "session-thread", turnId: "turn-thread", timestamp: "2026-10-29T00:00:00.000Z", event: { type: "turn_started", turnId: "turn-thread", stepCount: 0 } as AgentEvent } },
+      { kind: "runtime_event" as const, envelope: { seq: 2, sessionId: "session-thread", turnId: "turn-thread", timestamp: "2026-10-29T00:00:01.000Z", event: { type: "tool_started", turnId: "turn-thread", stepId: "step-1", callId: "call-thread-send", toolName: "send_thread", summary: "发送协作消息" } as AgentEvent } },
+      { kind: "runtime_event" as const, envelope: { seq: 3, sessionId: "session-thread", turnId: "turn-thread", timestamp: "2026-10-29T00:00:02.000Z", event: { type: "tool_result", turnId: "turn-thread", stepId: "step-1", callId: "call-thread-send", toolName: "send_thread", retryCount: 0, summary: "发送协作消息", result: { status: "success", callId: "call-thread-send", toolName: "send_thread", output: { messageId: "message-1", content: "MESSAGE_BODY_CANARY" }, meta: { durationMs: 5, inputHash: "hash" }, display: { titleKey: "tool.thread.write.completed", target: "thread-target", summary: "发送协作消息" } } } as AgentEvent } },
+      { kind: "runtime_event" as const, envelope: { seq: 4, sessionId: "session-thread", turnId: "turn-thread", timestamp: "2026-10-29T00:00:03.000Z", event: { type: "tool_started", turnId: "turn-thread", stepId: "step-2", callId: "call-thread-read", toolName: "read_shared_state", summary: "读取共享状态" } as AgentEvent } },
+    ]);
+
+    const send = selectToolCalls(state, "turn-thread").find(function findSend(call) { return call.callId === "call-thread-send"; });
+    expect(send).toMatchObject({ profileKey: "send_thread", category: "other", titleKey: "tool.thread.write.completed", target: "thread-target", resultSummary: "发送协作消息" });
+    expect(getPresentationCopy(send!.titleKey)).toBe("协作请求");
+    const read = selectToolCalls(state, "turn-thread").find(function findRead(call) { return call.callId === "call-thread-read"; });
+    expect(read?.titleKey).toBe("tool.thread.read.running");
+    expect(getPresentationCopy(read!.titleKey)).toBe("正在读取协作会话");
+    expect(JSON.stringify(state)).not.toContain("MESSAGE_BODY_CANARY");
   });
 
   it("脱敏 Host 文本并保持长度边界", function redactsHostText() {

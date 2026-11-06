@@ -1,12 +1,11 @@
 /** Chat Host/API 集成：用真实公开 Core/Node 存储和 fake sampler 验证无工作区聊天、附件及生命周期。 */
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import * as XLSX from "xlsx";
 import { createCanvas } from "@napi-rs/canvas";
 import type { RunConfig } from "@autopilot-agent/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CHAT_ATTACHMENT_TTL_MS, NodeChatError, createNodeWorkspaceRegistry } from "@autopilot-agent/adapters";
+import { CHAT_ATTACHMENT_TTL_MS, NodeChatError, NodeStateError, createNodeWorkspaceRegistry } from "@autopilot-agent/adapters";
 import { createWebChatHost, type WebChatHost, type WebChatHostOptions } from "@/lib/runtime-host/web-chat-host";
 import { runChatSessionRoute, toChatErrorResponse } from "@/lib/runtime-host/chat-session-route";
 import { createSessionTaskController } from "@/app/chat/session-task-controller";
@@ -16,7 +15,9 @@ const hosts: WebChatHost[] = [];
 
 /** 每个夹具使用独占 state/home，不访问真实用户配置、知识库或 Provider。 */
 async function fixture(extra: Partial<WebChatHostOptions> = {}) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "chat-host-stage3-"));
+  const fixtureRoot = path.resolve(process.cwd(), "../../.agent-tests/work-test/state-upgrade-01a19ad3/fixtures/web");
+  fs.mkdirSync(fixtureRoot, { recursive: true });
+  const root = fs.mkdtempSync(path.join(fixtureRoot, "chat-host-stage3-"));
   roots.push(root);
   fs.mkdirSync(path.join(root, "home"));
   let now = 2_000_000_000_000;
@@ -43,6 +44,35 @@ async function fixture(extra: Partial<WebChatHostOptions> = {}) {
 afterEach(function cleanup() { for (const host of hosts.splice(0)) host.stop(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); vi.restoreAllMocks(); });
 
 describe("Chat Host Stage3", function suite() {
+  /** 启动失败发生在创建/历史入口都必须返回真实稳定码，不让旧状态伪装成内部500。 */
+  it.each(["GET", "POST"])("状态升级错误在 %s 入口保留安全原因和恢复指引", async function schemaErrors(method) {
+    const loader = async function load(): Promise<WebChatHost> { throw new NodeStateError("STATE_SCHEMA_VERSION_UNSUPPORTED"); };
+    const response = await runChatSessionRoute(new Request("http://localhost/api/chat/sessions", { method, ...(method === "POST" ? { body: JSON.stringify({ chatRetrievalMode: "none" }) } : {}) }), [], loader);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ code: "STATE_SCHEMA_VERSION_UNSUPPORTED", error: "状态数据格式不受当前版本支持，请更新程序后重试；现有数据已保留" });
+    const failed = toChatErrorResponse({ code: "STATE_SCHEMA_MIGRATION_FAILED", message: "C:/private/state api_key=secret" });
+    expect(failed.status).toBe(409);
+    expect(await failed.text()).not.toMatch(/private|secret/);
+  });
+
+  /** 以真实 Node Chat Host 重新打开v6并继续发问，避免只验证错误映射而遗漏恢复使用。 */
+  it("v6 Chat 自动升级后可读取历史并继续发送", async function upgradesExistingChat() {
+    const f = await fixture();
+    await expect(f.host.runtime.sessions.create({ productMode: "chat", chatRetrievalMode: "none" })).resolves.toMatchObject({ productMode: "chat" });
+    const id = await f.session();
+    const first = await f.route("POST", [id, "messages"], { content: "升级前", clientMessageId: "before_upgrade" });
+    await first.text();
+    f.host.stop();
+    fs.writeFileSync(path.join(f.host.storage.paths.stateRoot, "schema.json"), '{"schemaVersion":6}');
+    const reopened = await createWebChatHost(f.options); hosts.push(reopened);
+    const history = await runChatSessionRoute(new Request("http://localhost/api/chat/sessions"), [id], async function load() { return reopened; });
+    expect(history.status).toBe(200);
+    expect((await history.json()).messages.map(function content(message: { content: string }) { return message.content; })).toEqual(["升级前", "讨论完成"]);
+    const next = await runChatSessionRoute(new Request("http://localhost/api/chat/sessions", { method: "POST", body: JSON.stringify({ content: "升级后", clientMessageId: "after_upgrade" }) }), [id, "messages"], async function load() { return reopened; });
+    expect(next.status).toBe(200);
+    expect(await next.text()).toContain("turn_completed");
+  });
+
   /** 从真实上传到实际采样目录和工具读取，验证临时文件不初始化或写入知识根。 */
   it.each(["none", "web"])("%s 图片和文档只作为临时附件，模型从目录取得引用", async function temporaryAttachments(mode) {
     const loadKnowledge = vi.fn();

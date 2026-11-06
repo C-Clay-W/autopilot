@@ -39,6 +39,8 @@ export type {
   CliRenderer,
   CliStatusView,
   CliRuntime,
+  CliThreadCommand,
+  CliThreadMode,
   CliTurnStatus,
 } from "./types.js";
 export { createCliTuiStore, runCliTui } from "./tui.js";

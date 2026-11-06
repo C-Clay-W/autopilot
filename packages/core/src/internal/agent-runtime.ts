@@ -9,6 +9,7 @@ import { createChatToolRuntime } from "./tools/chat-tool-runtime";
 import type { CapabilityCeiling } from "../runtime/domain/product-mode";
 import type { AgentTerminationBudget, AgentTerminationReason } from "../runtime/protocol/recoverable-turn-view";
 import type { ChatCapability, ChatAttachmentGrant } from "../runtime/protocol/chat-capability";
+import type { AgentProviderFailureReason } from "../runtime/provider/provider-failure-guidance";
 import { randomUUID } from "node:crypto";
 import { createHash } from "node:crypto";
 import type { AgentToolCall, ModelSampleOptions } from "./types";
@@ -42,6 +43,7 @@ import type { RunContext } from "./kernel/run-context";
 import type { ContextCompactionManager } from "./kernel/run-context";
 import type { ContextUsageProjectionConfig } from "./kernel/run-context";
 import type { ContextUsageContribution, ContextUsageView } from "./kernel/context-budget";
+import type { TurnUsageSummaryView } from "./kernel/turn-usage";
 import { compactMessages, estimateMessageTokens, serializeCanonicalMessagesForSignature } from "./kernel/compact";
 import type { CompletionPolicy } from "./kernel/completion-policy";
 import { createMutationCompletionPolicy } from "./kernel/completion-policy";
@@ -53,9 +55,13 @@ import { createStartBackgroundJobTool } from "./tools/builtins/start-background-
 import { createOpenPreviewTool } from "./tools/builtins/open-preview-tool";
 import type { WorkPreviewCapability } from "../runtime/protocol/work-preview-capability";
 import { createListBackgroundJobsTool, createReadBackgroundJobTool, createStopBackgroundJobTool } from "./tools/builtins/background-job-tools";
+import { createThreadTools } from "./tools/builtins/thread-tools";
+import type { AgentThreadsCapability } from "../runtime/application/thread-tool-binding";
 import type { JobService } from "../runtime/application/job-service";
 import { createAskUserQuestionTool } from "./tools/builtins/ask-user-question-tool";
 import { createTodoWriteTool } from "./tools/builtins/todo-write-tool";
+import { createRenderUiTool } from "./tools/builtins/render-ui-tool";
+import { createUiDocument, type UiDocument, type UiDocumentPayload } from "../ui/document";
 import type { AgentUserQuestionCapability } from "../runtime/application/user-question-service";
 import { resolveAgentRuntimeLimits } from "../runtime/config/runtime-limits";
 
@@ -76,6 +82,9 @@ export interface AgentOptions {
   capabilityCeiling?: CapabilityCeiling;
   chatCapability?: ChatCapability;
   chatAttachmentGrants?: readonly ChatAttachmentGrant[];
+  /** 受信会话图片读取端口及冻结模型能力。 */
+  sessionImageStore?: import("../runtime/ports/session-image-store").SessionImageStore;
+  supportsImageInput?: boolean;
   clock?: () => number;
 
   workspaceRoot?: string;
@@ -88,6 +97,11 @@ export interface AgentOptions {
   web?: WebCapability;
   /** Trust 后由宿主注入的 Work 内置预览能力；缺失时不向模型注册 open_preview。 */
   workPreview?: WorkPreviewCapability;
+  /**
+   * 已绑定当前 Turn 的协作能力；组、父会话与 actor 由 Runtime 装配，缺失时不注册协作工具。
+   * Chat 不装配该能力，模型参数也不能构造它。
+   */
+  threads?: AgentThreadsCapability;
   /** 与文档 RAG 并列的只读数据库能力；是否注册由 Turn 冻结策略决定。 */
   databaseSearch?: DatabaseSearchCapability;
   /** @deprecated 仅保留旧调用方类型兼容，不影响当前工具或上下文。 */
@@ -143,6 +157,9 @@ export interface AgentOptions {
 export interface AgentInjectedInput {
   inputId: string;
   content: string;
+  images?: Array<Extract<import("./types/agent-message").AgentContentBlock, { type: "image-ref" }>>;
+  /** 受信宿主绑定的来源；缺省为当前用户，另一会话只保留稳定身份。 */
+  origin?: import("../runtime/domain/input-inbox").InboxOrigin;
 }
 
 /** Core 与应用层的持续输入能力边界；队列事实来源始终属于应用层 JSONL。 */
@@ -186,9 +203,17 @@ export interface AgentCheckpoint {
     questions: import("../runtime/domain").UserQuestionItem[];
   };
   completedCallIds: string[];
+  /** 同 Turn 已发布交互文档的调用身份；仅供私有恢复预算，不进入公开 checkpoint。 */
+  uiPublishedCallIds?: string[];
+  /** 私有文字收口状态；恢复同一 Turn 不再暴露工具，不进入公开 checkpoint DTO。 */
+  uiTextFallbackOnly?: true;
   /** Chat 视觉只保留计数预算；opaque evidence grant 与字节不随恢复复活。 */
   chatBudget?: { imageCalls: number; imageBytes: number };
+  /** 图片采样已用 Provider 恢复预算；仅内部 checkpoint 使用。 */
+  imageProviderRecoveryAttempts?: number;
   consumedInputIds?: string[];
+  /** 明确持续观察的精确任务与等待游标；旧历史缺省无责任，不产生完成后的调度。 */
+  threadObservation?: { groupId?: string; targets: Array<{ threadId: string; taskId: string; cursor?: string; progressCursor?: string; turnId?: string; turnStatus?: string; interactionState?: string; continuationState?: string; agreementPending?: boolean; reportingInstructions?: string; terminal?: boolean }> };
   /** 实际文件写入与写后读取验证状态，跨审批/恢复保留。 */
   mutationGate?: {
     required: boolean;
@@ -199,6 +224,8 @@ export interface AgentCheckpoint {
     recoveryAttempts: number;
     /** 待验证恢复段只能读回与总结；安全批次 checkpoint 也必须保留此限制。 */
     verificationOnly?: boolean;
+    /** 旧待验证任务的固定磁盘版本与已回读范围；兼容缺省，不复用写前观察范围。 */
+    verificationTargets?: Array<{ path: string; sha256: string; observedRanges: Array<{ startLine: number; endLine: number }> }>;
   };
   /** read_file 的可信观察元数据，跨审批与恢复继续执行 edit_file 时仍须校验文件未变化。 */
   fileReadStates?: Array<{
@@ -215,6 +242,8 @@ export interface AgentCheckpoint {
    * 最近一次完整 Provider usage 的私有锚点；仅供 Core durable context 预算使用。
    * 不能进入 EventSink、Transcript、CLI、JSONL、日志或公开 DTO。
    */
+  /** 最近主采样的实际工具定义，仅用于摘要前缀复用；私有、不进入公开checkpoint投影。 */
+  samplingTools?: import("./lib/llm").AgentModelToolDefinition[];
   usageAnchor?: {
     usage: AgentSampleUsage;
     /** 该 usage 所覆盖的消息数组长度；后续只估算该边界之后的新增消息。 */
@@ -228,6 +257,12 @@ export interface AgentCheckpoint {
   runtimeBudget?: {
     startedAt: number;
     totalTokens: number;
+    /** 累计输入 token；与 totalTokens 在同一采样累计点维护；缺少此字段的旧 checkpoint 不提供分项。 */
+    inputTokens?: number;
+    /** 累计输出 token；与 inputTokens 同时维护，两者之和必须等于 totalTokens 才视为完整分项。 */
+    outputTokens?: number;
+    /** 最近一次安全边界刷新时间戳；供执行段耗时投影使用，旧 checkpoint 缺少时耗时按 0 处理。 */
+    updatedAt?: number;
     /** 缺少此字段的旧 checkpoint 会在 Continue 取得 lease 后迁移到当前执行段。 */
     executionSegmentVersion?: 1;
   };
@@ -266,6 +301,8 @@ interface InternalAgentRunInput {
   /** 当前 Turn 的累计 Provider token 安全上限。 */
   maxTotalTokens?: number;
   approval?: { approvalId: string; decision: ToolApprovalDecision };
+  /** 可信TurnService确认旧审批已失效后，只重新签发当前pending call审批，不执行工具。 */
+  reissueApproval?: boolean;
   /** 应用层从可信 Question Store 读取的已提交答案；仅用于恢复原 ask_user_question 调用。 */
   userQuestion?: { requestId: string; answer: import("../runtime/domain").UserQuestionAnswer };
 }
@@ -279,11 +316,18 @@ export interface AgentCompactInput {
   signal?: AbortSignal;
   /** 当前 Turn 冻结配置创建的无工具摘要采样器；只在 Core 内部传递，不持久化也不对外暴露。 */
   sampler?: ModelSampler;
+  /** 摘要请求复用主对话当前工具定义，只采样而不执行调用。 */
+  tools?: import("./lib/llm").AgentModelToolDefinition[];
+  sessionImageStore?: import("../runtime/ports/session-image-store").SessionImageStore;
+  sessionId?: string;
+  supportsImageInput?: boolean;
+  /** 受信模型窗口；摘要输入、工具及输出预留必须共同处于该边界内。 */
+  contextWindowTokens?: number;
 }
 
 /** 旧兼容 Agent facade 的公开运行输入；checkpoint 与继承路径均不能接受私有 usage anchor 与 usage 快照。 */
 export type AgentRunInput = Omit<InternalAgentRunInput, "checkpoint" | "inheritedUsageAnchor" | "runtimeLimitsResolved"> & {
-  checkpoint?: Omit<AgentCheckpoint, "usageAnchor" | "contextUsage">;
+  checkpoint?: Omit<AgentCheckpoint, "usageAnchor" | "contextUsage" | "samplingTools">;
 };
 
 /** Session Runtime 调用内部 facade 的运行输入；不得从 package 入口导出。 */
@@ -305,6 +349,8 @@ export interface AgentCompactionResult {
 /** 供 Web、桌面与 CLI 映射的 Agent 生命周期事件。 */
 export type AgentLoopEvent =
   | { type: "turn_started"; turnId: string; stepCount: number }
+  /** 真实关联等待的安全展示事实，不含目标身份或审批参数；none清除旧等待。 */
+  | { type: "thread_wait"; turnId: string; phase: "waiting" | "processing" | "none"; pending: number; running: number; approvals: number }
   | { type: "reasoning_summary"; turnId: string; stepId: string; summary: string }
   | { type: "reasoning_delta"; turnId: string; stepId: string; delta: string }
   | { type: "answer_delta"; turnId: string; stepId: string; delta: string }
@@ -329,6 +375,8 @@ export type AgentLoopEvent =
       diff?: string;
       /** 输出预览，例：命令 stdout/stderr 前 300 字符 */
       detail?: string; }
+  /** 仅含 Core 校验和归一后的交互文档；序号由现有 recorder 按事件顺序分配。 */
+  | { type: "ui_document"; turnId: string; stepId: string; callId: string; document: UiDocument }
   | { type: "approval_required"; turnId: string; stepId: string; callId: string; toolName: string; result: Extract<ToolExecutionResult, { status: "approval_required" }> }
   | { type: "question_required"; turnId: string; stepId: string; callId: string; requestId: string; questions: import("../runtime/domain").UserQuestionItem[] }
   | { type: "question_answered"; turnId: string; requestId: string; answerSummary: { questionCount: number; selectedLabels: string[]; hasCustom: boolean } }
@@ -343,16 +391,41 @@ export type AgentLoopEvent =
   | { type: "context_compact_failed"; turnId: string; trigger: "auto" | "proactive" | "reactive"; error: string }
   | { type: "context_compact_circuit_open"; turnId: string; trigger: "reactive" }
   /** Context Usage 安全展示事件；usage 只含数字与固定枚举，null 仅用于明确清空旧状态，同值不重复发射。 */
-  | { type: "context_usage_updated"; turnId: string; usage: ContextUsageView | null }
+  | { type: "context_usage_updated"; turnId: string; usage: ContextUsageView | null;
+      /**
+       * 同一安全边界的 Turn 累计用量汇总；与 usage 一同刷新、一同去重。
+       * 旧 transcript 事件缺少该字段时表示"无新事实"，宿主保留已有展示，不清空。
+       */
+      turnUsage?: TurnUsageSummaryView | null }
   /** Stage 15 的公开审计事件；只含相对路径与终态，绝不携带 before/after 正文或 blob ref。 */
   | { type: "undo_completed" | "undo_failed"; turnId: string; transactionId: string; restoredPaths: string[]; compensatedPaths: string[]; conflicts: string[] }
   | {
-      type: "turn_paused" | "turn_completed" | "turn_interrupted" | "turn_failed" | "turn_limit_reached";
+      type: "turn_paused" | "turn_completed" | "turn_interrupted" | "turn_limit_reached";
       turnId: string;
       checkpoint: AgentCheckpoint;
       error?: string;
       /** 可公开的结构化失败类别；当前只登记沙箱可用性失败，未登记的错误码不会带出。 */
       errorCode?: string;
+      /** 仅供 Core 序列化器读取并白名单化；宿主事件使用 AgentTerminationView。 */
+      termination?: { reason?: AgentTerminationReason; budget?: AgentTerminationBudget };
+    }
+  | {
+      type: "turn_failed";
+      turnId: string;
+      checkpoint: AgentCheckpoint;
+      error?: string;
+      /** 白名单化后可供受控诊断关联的稳定失败类别。 */
+      errorCode?: string;
+      /** 标记失败发生的安全阶段，不携带调用参数或内部路径。 */
+      failureStage?: "tool_preflight" | "runtime_budget" | "tool_execution" | "context_compaction" | "provider_sampling" | "provider_recovery" | "completion_policy" | "agent_loop";
+      /** 由 Runtime 事件记录边界生成的不透明反馈 ID。 */
+      feedbackId?: string;
+      /** 仅保留 Provider 的 4xx/5xx 状态，不保留响应内容或请求头。 */
+      providerHttpStatus?: number;
+      /** Adapter 归一化后的有限中立原因；不携带厂商标记或上游正文。 */
+      providerFailureReason?: AgentProviderFailureReason;
+      /** 受限上游协议标识，仅用于诊断展示。 */
+      providerFailureDetail?: string;
       /** 仅供 Core 序列化器读取并白名单化；宿主事件使用 AgentTerminationView。 */
       termination?: { reason?: AgentTerminationReason; budget?: AgentTerminationBudget };
     };
@@ -392,6 +465,30 @@ function getLatestUserTask(messages: AgentMessage[]): string | undefined {
     if (message.role === "user" && text.trim()) return text.trim();
   }
   return undefined;
+}
+
+/**
+ * 协作使用约定：只在注册了协作工具的 Work Turn 注入；权限边界由服务端逐动作校验。
+ * 约定只描述通用机制（派工、摘要类别、两种游标分工），不设定固定汇报档位，也不硬匹配关键词。
+ */
+function getThreadWorkflowInstructions(threads: AgentThreadsCapability | undefined): string | undefined {
+  if (!threads) return undefined;
+  const webPresentation = threads.presentationHost === "web";
+  return "【会话协作】\n"
+    + "- 用户指名已有会话时先核对身份与授权并复用，不重复创建或在本地完成同一交付物冒充已派工。确需新会话时用create_thread；向自己创建的孩子发送新消息可省略mode，运行中默认steer、空闲默认run，等待审批/用户输入时拒绝。只有明确要排队才显式run。其他关系仍须显式mode，显式steer须正确expectedTurnId；重试沿用首次持久投递决策，不把迟到引导降级新run。\n"
+    + "- send_thread的accepted/pending及executionStatus/consumptionStatus=unconfirmed仅表示接受，不能报告已合并、已消费、已执行或完成。message_delivered/delivered也不等于消费；确需核对消息消费时用read_thread的messages中同一messageId的inputState，只有status=consumed及匹配inputId/turnId才是证据。pending/blocked或缺少消费事实时明确尚未确认；任务成功仍须匹配taskId的真实Turn终态。\n"
+    + `- 用户指定已有子会话执行预览时，用 send_thread 明确投递给该目标，服务 Job、审批和 open_preview 都留在实际目标；发起方只观察并提供宿主审批入口${webPresentation ? "（Web进入目标会话）" : "（CLI可按Ctrl+A原地处理关联审批，Web进入目标审批）"}。目标暂停或投递 blocked 时如实报告具体 reason，不得静默由主会话代办；用户明确要求恢复时才请求 resume_thread 并等待人类确认，不要重发 run 形成积压。执行 lease 缺失不能证明宿主离线。\n`
+    + "- groupId 只选择既有授权范围，不授予权限；多个共同范围必须明确选择。创建血缘不授予读取、控制或关联权限，不能把组外会话自动加入。\n"
+    + "- 遇到‘按原计划’等歧义先澄清或忠实转述原意，不擅自补出具体需求；不要用关键词路由。汇报使用当前证据，区分持久事实、模型自报与待核实事项，不把自己的模型选择冒称用户决定。\n"
+    + "- 派工时把汇报约定写进任务正文：要持续报还是只在阻塞或完成时报、哪些结论必须保留、达到什么条件算完成。用户中途改变要求时，用 steer（目标 Turn 仍在运行）或新的 run 把新约定交给目标，并同时调整自己后续的接收与汇报。\n"
+    + "- 默认不得擅加只在完成时报、禁止中途汇报等静默限制；按用户约定在真实阶段、阻塞和终态报告。后续持续跟踪或阶段汇报要求必须steer传达给仍运行的目标，审批期间不能伪造steer成功。\n"
+    + "- 执行目标用 report_progress 回报当前真实 run 任务短摘要，归属由当前 Turn 派生；普通独立新 Turn 不继承旧任务，无任务或多任务歧义时拒绝报告。kind=progress 是普通进度，读取时会与相邻普通进度合并为最新一条并只保留条数，容量压力下还会淘汰旧条目，所以每条的 summary 要写清仍然有效的累计状态与下一步；关键结论用 milestone，阻塞或需人工关注用 blocked，完成与失败用 completed/failed，它们是模型自报结论并逐条保留，实际执行终态仍核对对应任务的真实 Turn，不能只写在普通进度里。\n"
+    + "- 只是进度就不要再重复发一遍 send_thread；确需对方注意、补充约束或改变方向时才用 notify/steer。\n"
+    + "- 明确等待委派结果时用 wait_threads 携带精确taskId且timeoutMs>0，Core默认保留当前Turn到原task终态；timeoutMs=0只是即时快照，不新建等待责任，明确持续跟踪可设followUntilTerminal=true。阶段回复不结束观察责任。只派工不跟踪保持缺省；用户要求停止时用同一精确task调用followUntilTerminal=false、timeoutMs=0撤销观察。用户中途调整汇报约定时，通过wait_threads的reportingInstructions有界文本明确更新；内容由你理解用户意图后给出，Core不匹配话术、不限定汇报模式。历史回执仅帮助你确认task身份，不会自动建立观察。\n"
+    + "- 发起方用 wait_threads 携带 run 回执 taskId（等于 messageId）等待本次任务，read_progress 也携带同一 taskId；省略 taskId 仅观察会话，不能把目标最新 Turn 或后续独立工作当成本次任务。reason=progress 表示有新摘要，按用户意图决定是否读取；读取用 read_progress 并传该目标自己的进度游标（等待游标与进度游标分开维护，不能互换），分页用返回的 nextCursor 续读。只有 read_progress 的结果算摘要消费；为了看进度不要改用 read_thread，那会把会话历史一并带进上下文。\n"
+    + "- 等待的 reason 只是唤醒信号，不代表目标已停止或任务完成；静默等待仍会被新摘要唤醒，只是摘要正文不会自动进入上下文。\n"
+    + (webPresentation ? "- Web宿主发现目标waiting=approval时，仅用固定短句‘子会话等待审批，需要人为介入’并提供目标会话入口。不要列工具名、UUID、CLI操作教程或重复长正文。同一审批无新事实时不重复提示，不替目标审批。用户回答等待按真实状态提示。\n" : "")
+    + "- reason=attention 仅表示需要关注，不等于审批。只有summary.waiting=approval且interactionState=pending才是当前可处理审批；waiting=user_input且interactionState=pending才是待回答请求。summary.attentionKind=execution_unconfirmed/execution_lost只表示执行未确认/失联，不能推导审批、要求用户按Ctrl+A或主动恢复；continuation_failed/continuation_pending表示已决定后的恢复状态，不能重复要求审批。Web只提示待处理状态并提供目标会话入口；目标自己的审批仍在目标会话操作。不得为等待中的目标自行运行预览、自检或生成同一交付物来绕开阻塞。除非用户此刻明确要求你介入或收尾，应带着返回的 cursor 继续 wait_threads 等到 terminal 再汇总；不要把 attention 当成任务完成而提前收尾汇报，也不能替目标提交审批或回答。";
 }
 
 /** 按实际装配的 Web 子能力生成联网策略，绝不要求模型调用不可见工具。 */
@@ -435,7 +532,23 @@ export function createAgentRuntime(options: AgentOptions = {}) {
   }
   // Work 内置预览（Talk-Plan0908 Stage1）：仅受信宿主注入能力且存在 Turn 绑定时注册；Chat/CLI 永不注册。
   if (!isChat && options.workPreview && options.jobBinding && options.workspaceRoot) {
-    registry.register(createOpenPreviewTool({ capability: options.workPreview, workspaceId: options.jobBinding.workspaceId, sessionId: options.jobBinding.sessionId, turnId: options.jobBinding.turnId }));
+    registry.register(createOpenPreviewTool({ capability: options.workPreview, jobs: options.jobs, workspaceRoot: options.workspaceRoot, workspaceId: options.jobBinding.workspaceId, sessionId: options.jobBinding.sessionId, turnId: options.jobBinding.turnId }));
+  }
+  // 会话协作（Talk-Plan1028 S3）：只有 Runtime 绑定当前 Turn 的能力才注册协作工具；
+  // Chat 不注册，注册本身不代表授权，每次调用仍由 ThreadService 校验成员与工作区。
+  if (!isChat && options.threads) {
+    const threadTools = createThreadTools(options.threads);
+    registry.register(threadTools.createThread);
+    registry.register(threadTools.listThreads);
+    registry.register(threadTools.readThread);
+    registry.register(threadTools.sendThread);
+    registry.register(threadTools.waitThreads);
+    registry.register(threadTools.readSharedState);
+    registry.register(threadTools.updateSharedState);
+    registry.register(threadTools.reportProgress);
+    registry.register(threadTools.readProgress);
+    registry.register(threadTools.interruptThread);
+    registry.register(threadTools.resumeThread);
   }
   if (options.visionAnalyzer) registry.register(createVisionAnalyzeTool());
   if (options.userQuestions) registry.register(createAskUserQuestionTool(options.userQuestions));
@@ -470,7 +583,16 @@ export function createAgentRuntime(options: AgentOptions = {}) {
    * checkpoint 恢复时直接使用 checkpoint.messages，不回读正文重建分类。
    */
   async function composeInitialMessages(messages: AgentMessage[]): Promise<{ messages: AgentMessage[]; contributions: ContextUsageContribution[][] }> {
-    const result = [...messages];
+    const result = messages.map(function copyMessage(message) { return { ...message, content: [...message.content] }; });
+    const ownedMarkers = ["【宿主上下文快照】", "可用 Skills（仅元数据，按需调用 skill 工具加载）："];
+    for (const marker of ownedMarkers) {
+      let found = false;
+      for (let index = 0; index < result.length; index += 1) {
+        if (result[index].role !== "system" || !getAgentMessageText(result[index]).startsWith(marker)) continue;
+        if (found) result.splice(index--, 1);
+        else found = true;
+      }
+    }
     const contributionLedger = new Map<AgentMessage, ContextUsageContribution[]>();
     /** 登记组装期创建消息的固定分类贡献权重。 */
     function registerContributions(message: AgentMessage, entries: ContextUsageContribution[]): void {
@@ -489,18 +611,28 @@ export function createAgentRuntime(options: AgentOptions = {}) {
         : getWebWorkflowInstructions(options.web);
       const ragInstructionsMessage = ragInstructions ? createAgentTextMessage("system", ragInstructions) : undefined;
       if (ragInstructionsMessage) registerContributions(ragInstructionsMessage, [{ kind: "system", weight: weightOf(ragInstructionsMessage) }]);
+      const chatMessages = [instructionsMessage, ...(ragInstructionsMessage ? [ragInstructionsMessage] : []), ...result.filter(function removeOldChatInstructions(message) {
+        if (message.role !== "system") return true;
+        const text = getAgentMessageText(message);
+        return !text.startsWith("【产品身份】") && !text.startsWith("受控联网策略：") && !text.startsWith("只能根据最近一次 rag_search 的有效本地证据回答；");
+      })];
       return {
-        messages: [instructionsMessage, ...(ragInstructionsMessage ? [ragInstructionsMessage] : []), ...result],
-        contributions: buildInitialContextContributions(result, contributionLedger),
+        messages: chatMessages,
+        contributions: buildInitialContextContributions(chatMessages, contributionLedger),
       };
     }
     const environmentContext = createAgentTextMessage("system", getRuntimeEnvironmentContext(options.workspaceRoot));
-    const behaviorContext = createAgentTextMessage("system", behaviorProfile.instructions);
-    const mutationWorkflowContext = createAgentTextMessage("system", "任何 write_file 或 edit_file 成功后，必须立即对每个被修改的 path 调用 read_file 做写后验证；创建 HTML 时遵循 write_file → read_file → 分块 edit_file → 再 read_file 的顺序，完成验证前不要输出完成结论。");
+    const behaviorContext = createAgentTextMessage("system", `【模型行为规范】\n${behaviorProfile.instructions}`);
+    const mutationWorkflowContext = createAgentTextMessage("system", "write_file 和 edit_file 成功结果中的落盘校验仅确认实际磁盘字节与预期一致；按任务复杂度审阅返回差异、按需读取目标范围并执行必要定向验证。物理写入成功不代表业务或运行正确；旧任务的待验证文件需完整读回后才能结束。");
     const todoWorkflowContext = createAgentTextMessage("system", "Todo 使用策略：todo_write 是当前任务链的内部进度表，由你自主判断是否调用，不依赖用户明确提出。任务有 3 个及以上可验证阶段、包含多个相互依赖子任务、跨多个文件或层、需要实施验证或收口时，开始工作前主动建表，并在进入新阶段、发现新工作和每完成一项后立即更新完整列表。只读不等于简单：多阶段只读分析也应建表。仅在单一平凡步骤、简单问答或纯对话时跳过；难以判断时使用 todo_write。用户明确要求创建 Todo 只是兜底信号，不是调用前提。Todo 只描述计划进度，未验证或失败的事项必须保持 in_progress，不得标为 completed。");
     const webWorkflowInstructions = getWebWorkflowInstructions(options.web);
     const webWorkflowContext = webWorkflowInstructions
       ? createAgentTextMessage("system", webWorkflowInstructions)
+      : undefined;
+    // 协作约定（Talk-Plan1030 S3）：仅注册协作工具的 Work Turn 注入，不引入固定汇报档位。
+    const threadWorkflowInstructions = getThreadWorkflowInstructions(options.threads);
+    const threadWorkflowContext = threadWorkflowInstructions
+      ? createAgentTextMessage("system", threadWorkflowInstructions)
       : undefined;
     // Work 内置预览指引（Talk-Plan0908 Stage4）：仅宿主注入 WorkPreviewCapability 的 Runtime 注入；
     // CLI 无该能力不注入，Chat 走独立分支不受影响。按意图判断，示例不是触发词规则。
@@ -512,17 +644,35 @@ export function createAgentRuntime(options: AgentOptions = {}) {
     registerContributions(mutationWorkflowContext, [{ kind: "system", weight: weightOf(mutationWorkflowContext) }]);
     registerContributions(todoWorkflowContext, [{ kind: "system", weight: weightOf(todoWorkflowContext) }]);
     if (webWorkflowContext) registerContributions(webWorkflowContext, [{ kind: "system", weight: weightOf(webWorkflowContext) }]);
+    if (threadWorkflowContext) registerContributions(threadWorkflowContext, [{ kind: "system", weight: weightOf(threadWorkflowContext) }]);
     if (previewWorkflowContext) registerContributions(previewWorkflowContext, [{ kind: "system", weight: weightOf(previewWorkflowContext) }]);
     const hasRuntimeSystemContext = result.some(function isExistingRuntimeSystemContext(message) {
       return message.role === "system" && getAgentMessageText(message).startsWith("【产品身份】");
     });
+    // 受控运行规范按原槽位刷新；配置未变时消息字节不变，升级旧机械read约定也无需用户清理历史。
+    for (let index = 0; index < result.length; index += 1) {
+      if (result[index].role !== "system") continue;
+      const text = getAgentMessageText(result[index]);
+      if (text.startsWith("【产品身份】")) result[index] = environmentContext;
+      else if (text.startsWith("【模型行为规范】") || text.startsWith("你是 Autopilot 的执行模型。")) result[index] = behaviorContext;
+      else if (text.startsWith("任何 write_file 或 edit_file 成功后") || text.startsWith("write_file 和 edit_file 成功结果")) result[index] = mutationWorkflowContext;
+    }
     const firstSystemIndex = result.findIndex((message) => message.role === "system");
     if (!hasRuntimeSystemContext) {
-      const runtimeContexts = [environmentContext, behaviorContext, mutationWorkflowContext, todoWorkflowContext, ...(webWorkflowContext ? [webWorkflowContext] : []), ...(previewWorkflowContext ? [previewWorkflowContext] : [])];
+      const runtimeContexts = [environmentContext, behaviorContext, mutationWorkflowContext, todoWorkflowContext, ...(webWorkflowContext ? [webWorkflowContext] : []), ...(threadWorkflowContext ? [threadWorkflowContext] : []), ...(previewWorkflowContext ? [previewWorkflowContext] : [])];
       if (firstSystemIndex === -1) result.unshift(...runtimeContexts);
       else result.splice(firstSystemIndex + 1, 0, ...runtimeContexts);
     }
 
+    // 兼容旧版把快照直接附在首部 system 后的历史；仅匹配宿主固定段落边界。
+    for (const message of result) {
+      if (message.role !== "system") continue;
+      const text = getAgentMessageText(message);
+      const instructionStart = text.indexOf("\n\n以下是工作区项目指令。除非它与更高优先级的系统安全要求冲突");
+      const memoryStart = text.indexOf("\n\n【可能过期的辅助记忆/");
+      const legacy = instructionStart >= 0 ? instructionStart : memoryStart;
+      if (legacy >= 0 && !text.startsWith("【宿主上下文快照】")) message.content = [{ type: "text", text: text.slice(0, legacy) }];
+    }
     const contextSections = splitAgentContextSections(options.context);
     if (contextSections && (contextSections.instructions || contextSections.memories)) {
       const context = [contextSections.instructions, contextSections.memories].filter(Boolean).join("\n\n");
@@ -533,20 +683,20 @@ export function createAgentRuntime(options: AgentOptions = {}) {
       if (contextSections.memories && options.context) {
         contextEntries.push({ kind: "memory", weight: estimateMessageTokens([createAgentTextMessage("system", contextSections.memories)]), count: options.context.memories.length });
       }
-      const firstSystem = result.find((message) => message.role === "system");
-      if (firstSystem) {
-        // 在改写消息内容前捕获原权重，注入的指令与 Memory 作为独立分类追加。
-        const originalEntries = contributionLedger.get(firstSystem) ?? [{ kind: "system" as const, weight: weightOf(firstSystem) }];
-        firstSystem.content = [{ type: "text", text: `${getAgentMessageText(firstSystem)}\n\n${context}` }];
-        registerContributions(firstSystem, [...originalEntries, ...contextEntries]);
-      } else {
-        const contextMessage = createAgentTextMessage("system", context);
-        registerContributions(contextMessage, contextEntries);
-        result.unshift(contextMessage);
-      }
+      const contextMessage = createAgentTextMessage("system", `【宿主上下文快照】\n${context}`);
+      registerContributions(contextMessage, contextEntries);
+      const previousIndex = result.findIndex(function isContext(message) { return message.role === "system" && getAgentMessageText(message).startsWith("【宿主上下文快照】"); });
+      if (previousIndex >= 0) result[previousIndex] = contextMessage;
+      else result.splice(Math.max(0, result.findIndex(function isSystem(message) { return message.role === "system"; }) + 1), 0, contextMessage);
     }
 
+    if (!contextSections || (!contextSections.instructions && !contextSections.memories)) {
+      for (let index = result.length - 1; index >= 0; index -= 1) {
+        if (result[index].role === "system" && getAgentMessageText(result[index]).startsWith("【宿主上下文快照】")) result.splice(index, 1);
+      }
+    }
     const catalog = getModelSkillCatalog(options.skills);
+    const previousCatalogIndex = result.findIndex(function isCatalog(message) { return message.role === "system" && getAgentMessageText(message).startsWith("可用 Skills（仅元数据，按需调用 skill 工具加载）："); });
     if (catalog) {
       const catalogMessage = createAgentTextMessage("system", `可用 Skills（仅元数据，按需调用 skill 工具加载）：\n${catalog}\n\n当用户任务与某个 Skill 匹配时，必须先调用 skill 工具再回复。skill 参数必须使用上方列出的名称；同名时才使用带来源前缀的限定名。`);
       registerContributions(catalogMessage, [{
@@ -556,7 +706,8 @@ export function createAgentRuntime(options: AgentOptions = {}) {
       }]);
       const firstSystemIndex = result.findIndex((message) => message.role === "system");
       const catalogIndex = firstSystemIndex === -1 ? 0 : firstSystemIndex + 1;
-      if (firstSystemIndex === -1) result.unshift(catalogMessage);
+      if (previousCatalogIndex >= 0) result[previousCatalogIndex] = catalogMessage;
+      else if (firstSystemIndex === -1) result.unshift(catalogMessage);
       else result.splice(catalogIndex, 0, catalogMessage);
 
       const task = getLatestUserTask(result);
@@ -566,13 +717,14 @@ export function createAgentRuntime(options: AgentOptions = {}) {
           if (candidates.length) {
             const reminder = createAgentTextMessage("system", `<system-reminder>Skills relevant to your task:\n${candidates.map((candidate) => `- ${candidate.skill}: ${candidate.description}`).join("\n")}\nUse the exact skill name above with the skill tool before replying when a candidate applies.</system-reminder>`);
             registerContributions(reminder, [{ kind: "skills", weight: weightOf(reminder), count: candidates.length }]);
-            result.splice(catalogIndex + 1, 0, reminder);
+            result.push(reminder);
           }
         } catch {
           // 候选发现失败不阻断原有 catalog 与精确 Skill 调用链路。
         }
       }
     }
+    if (!catalog && previousCatalogIndex >= 0) result.splice(previousCatalogIndex, 1);
     return { messages: result, contributions: buildInitialContextContributions(result, contributionLedger) };
   }
 
@@ -580,6 +732,8 @@ export function createAgentRuntime(options: AgentOptions = {}) {
   async function* run(input: InternalAgentRunInput): AsyncGenerator<AgentLoopEvent> {
     const mcpRuntime = !isChat && options.mcp ? new McpStdioRuntime({
       capability: options.mcp,
+      sessionId: options.sessionId,
+      sessionImageStore: options.sessionImageStore,
       workspaceRoot: options.workspaceRoot,
       workspaceTrusted: options.workspaceTrusted,
       resolvePersistentGrant: options.resolvePersistentGrant,
@@ -597,6 +751,17 @@ export function createAgentRuntime(options: AgentOptions = {}) {
       }
     }
     const turnId = input.checkpoint?.turnId ?? input.turnId ?? randomUUID();
+    const pendingUiDocuments = new Map<string, UiDocumentPayload>();
+    const uiPublishedCallIds = new Set(input.checkpoint?.uiPublishedCallIds ?? []);
+    /** 把已发布身份投影到私有恢复快照，不以未发布或失败调用消耗预算。 */
+    function withUiBudget(checkpoint: AgentCheckpoint): AgentCheckpoint {
+      return uiPublishedCallIds.size ? { ...checkpoint, uiPublishedCallIds: [...uiPublishedCallIds] } : checkpoint;
+    }
+    registry.unregister("render_ui");
+    const chatRetrievalMode = options.capabilityCeiling?.chatRetrievalMode;
+    if (isChat && (chatRetrievalMode === "none" || chatRetrievalMode === "web") && options.chatCapability?.interactiveUi === true) {
+      registry.register(createRenderUiTool(function collectUiDocument(callId, document) { pendingUiDocuments.set(callId, document); }, [...uiPublishedCallIds]));
+    }
     /** 保守统计历史视觉调用，恢复不能通过丢失计数重置额度。 */
     const previousImageCalls = input.checkpoint?.messages.flatMap(getAgentToolCalls).filter(function imageCall(call) { return call.name === "chat_vision_analyze"; }).length ?? 0;
     const chat = isChat ? createChatToolRuntime({ sessionId: options.sessionId ?? "", turnId, retrievalMode: options.capabilityCeiling!.chatRetrievalMode! }, options.chatCapability, options.chatAttachmentGrants ?? [], options.clock ?? Date.now, { imageCalls: Math.max(previousImageCalls, input.checkpoint?.chatBudget?.imageCalls ?? 0), imageBytes: Math.max(previousImageCalls * 5 * 1024 * 1024, input.checkpoint?.chatBudget?.imageBytes ?? 0) }) : undefined;
@@ -615,6 +780,8 @@ export function createAgentRuntime(options: AgentOptions = {}) {
 
     if (input.signal) {
       input.signal.addEventListener("abort", () => abortController.abort(), { once: true });
+      // 取消可能先于本次注册发生（宿主异步执行 + 立即取消）：已 abort 的信号不会补发事件，必须显式检查。
+      if (input.signal.aborted) abortController.abort();
     }
 
     const inheritedUsageAnchor = input.checkpoint ? undefined : input.inheritedUsageAnchor;
@@ -632,6 +799,8 @@ export function createAgentRuntime(options: AgentOptions = {}) {
     const runContext: RunContext = {
       turnId,
       capabilityCeiling: options.capabilityCeiling,
+      sessionImageStore: options.sessionImageStore,
+      supportsImageInput: options.supportsImageInput === true,
       chat,
       todoChainId: input.todoChainId,
       messages,
@@ -670,15 +839,30 @@ export function createAgentRuntime(options: AgentOptions = {}) {
       maxTotalTokens: input.maxTotalTokens,
       clock: options.clock,
       approval: input.approval,
+      reissueApproval: input.reissueApproval,
       userQuestion: input.userQuestion,
-      onSafeToolBatch: options.onSafeToolBatch,
+      onSafeToolBatch: options.onSafeToolBatch ? async function persistUiBudget(checkpoint) { await options.onSafeToolBatch!(withUiBudget(checkpoint)); } : undefined,
       contextUsageProjection: options.contextUsageProjection,
       initialContextContributions: composedInitial?.contributions,
     };
 
     try {
-      yield* runKernel(runContext);
+      for await (const event of runKernel(runContext)) {
+        if (event.type === "tool_result" && event.toolName === "render_ui") {
+          const payload = pendingUiDocuments.get(event.callId);
+          pendingUiDocuments.delete(event.callId);
+          if (payload && event.result.status === "success") {
+            const digest = createHash("sha256").update(`${event.turnId}\0${event.callId}`).digest("hex").slice(0, 32);
+            const document = createUiDocument(payload, `ui_${digest}`);
+            uiPublishedCallIds.add(event.callId);
+            yield { type: "ui_document", turnId: event.turnId, stepId: event.stepId, callId: event.callId, document };
+          }
+        }
+        yield "checkpoint" in event && event.checkpoint ? { ...event, checkpoint: withUiBudget(event.checkpoint) } as AgentLoopEvent : event;
+      }
     } finally {
+      pendingUiDocuments.clear();
+      registry.unregister("render_ui");
       await mcpRuntime?.shutdown();
       for (const toolName of mcpToolNames) registry.unregister(toolName);
     }
@@ -689,7 +873,7 @@ export function createAgentRuntime(options: AgentOptions = {}) {
 
   /** 分层 compact 的摘要阶段；工具正文先瘦身，摘要模型没有工具可调用，失败由应用层保留旧投影。 */
   async function compact(input: AgentCompactInput): Promise<AgentCompactionResult> {
-    return compactMessages({ ...input, sampler: input.sampler ?? modelSampler });
+    return compactMessages({ sessionImageStore: options.sessionImageStore, sessionId: options.sessionId, supportsImageInput: options.supportsImageInput, ...input, tools: input.tools ?? registry.getModelDefinitions().map(function modelTool(definition) { return { type: "function" as const, function: { name: definition.name, description: definition.description, parameters: definition.inputSchema } }; }), sampler: input.sampler ?? modelSampler });
   }
 
   return { getToolDefinitions: () => registry.getModelDefinitions(), run, resume: run, compact, cancel };

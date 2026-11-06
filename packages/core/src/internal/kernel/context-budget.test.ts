@@ -522,7 +522,12 @@ describe("Kernel 集成", function kernelIntegrationSuite() {
     const events: AgentLoopEvent[] = [];
     for await (const event of kernel.run()) events.push(event);
     const usageEvents = events.filter((event) => event.type === "context_usage_updated");
-    expect(usageEvents.length).toBe(1);
-    expect(usageEvents[0]!.type === "context_usage_updated" && usageEvents[0]!.usage).toBeNull();
+    // 投影始终 fail closed；turnUsage 随后续采样累计变化允许再发射，但 usage 必须始终为 null。
+    expect(usageEvents.length).toBeGreaterThanOrEqual(1);
+    expect(usageEvents.every((event) => event.usage === null)).toBe(true);
+    const last = usageEvents.at(-1)!;
+    expect(last.type === "context_usage_updated" && last.usage).toBeNull();
+    // 同一事件携带的 Turn 累计用量不因 context 投影失败而丢失。
+    expect(last.type === "context_usage_updated" && last.turnUsage?.totalTokens).toBe(120);
   });
 });
