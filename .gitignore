@@ -1,6 +1,8 @@
 # Dependencies and generated output
 node_modules/
 .next/
+.webpack/
+apps/desktop/resources/
 .turbo/
 dist/
 dist-types/

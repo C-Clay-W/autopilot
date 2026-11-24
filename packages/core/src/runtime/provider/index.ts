@@ -16,7 +16,7 @@ export { ProviderProtocolAdapterRegistry } from "./provider-protocol-adapter";
 export { createFirstPartyModelSampler } from "./first-party-model-sampler";
 export type { CreateFirstPartyModelSamplerInput } from "./first-party-model-sampler";
 export { resolveFirstPartyModelSampleOptions, resolveModelSampleOptions } from "./model-sample-resolver";
-export { listModelCapabilities, getModelCapability } from "./model-capability-catalog";
+export { listModelCapabilities, getModelCapability, resolveRouteModelCapability, resolveRouteProtocolProfile } from "./model-capability-catalog";
 export { createVisionAnalyzer } from "./vision-analyzer";
 export type { FrozenProviderConfig } from "./frozen-provider-config";
 export type { ModelCapability, PromptCacheMode } from "./model-capability-catalog";
@@ -24,3 +24,6 @@ export type { VisionAnalyzer } from "./vision-analyzer";
 export type { FirstPartyEffortSource, ResolvedFirstPartyModelSample } from "./model-sample-resolver";
 export { createDefaultModelBehaviorProfile } from "./model-behavior-profile";
 export type { ModelBehaviorProfile } from "./model-behavior-profile";
+
+export { createOpenAiResponsesRequest, createOpenAiResponsesSampler } from "./openai-responses-adapter";
+export type { CreateOpenAiResponsesSamplerInput } from "./openai-responses-adapter";

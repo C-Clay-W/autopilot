@@ -19,7 +19,7 @@ export function TuiPermissionPicker(props: { options: CliPermissionOption[]; sel
         return <Text key={option.mode} bold={focused} color={focused && props.useColor ? TUI_ACCENT_COLOR : undefined}>{focused ? "› " : "  "}<Text color={checkboxColor} dimColor={false}>[{option.selected ? "on" : "off"}]</Text> {option.label} ({option.mode})</Text>;
       })}
       {selectedOption ? <Text dimColor={props.useColor}>  {selectedOption.description}</Text> : null}
-      <Text dimColor={props.useColor}>{selectedOption?.selected ? "已选择；Enter 保存为下一个 Turn 默认" : "Space 选择此权限模式"}{props.screenReader ? " · permission selector" : ""}</Text>
+      <Text dimColor={props.useColor}>{selectedOption?.selected ? "已选择；Enter 保存，下次安全恢复或新回合生效" : "Space 选择此权限模式"}{props.screenReader ? " · permission selector" : ""}</Text>
     </Box>
   );
 }

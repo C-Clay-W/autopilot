@@ -3,8 +3,16 @@
  */
 import { describe, expect, it } from "vitest";
 import { createSettingsRunConfig } from "@/lib/settings/runtime-settings";
+import { resolveAutopilotSettings } from "@autopilot-agent/core";
 
 describe("Stage2 runtime settings", function stage2RuntimeSettingsSuite() {
+  it.each(["openai-responses", "openai-chat-completions"])("%s route 与模型能力进入 Chat/Work 共用的下一 Turn 配置", function mapsRoutedConnection(apiProtocol) {
+    const route = { id: "gateway", apiProtocol, baseUrl: "https://main.fixture/v1", compatibilityPreset: "generic", credentialRef: { provider: "gateway", key: "USER_SETTINGS_MAIN" }, models: [{ id: "custom", capabilities: { supportedReasoningEfforts: ["none", "xhigh"] } }] };
+    const settings = resolveAutopilotSettings([{ scope: "user", value: { model: "gateway/custom", providerRoutes: { gateway: route }, effortLevel: "xhigh", env: { CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000", API_TIMEOUT_MS: "120000" } } }]);
+    expect(settings.diagnostics).toEqual([]);
+    const runtime = createSettingsRunConfig(settings);
+    expect(runtime).toMatchObject({ modelRef: { provider: "gateway", modelId: "custom" }, reasoningProfile: { effort: "xhigh" }, providerSettings: { routes: { gateway: route }, primary: { apiProtocol, baseUrl: route.baseUrl, credentialRef: route.credentialRef, compactThresholdTokens: 64000, timeoutMs: 120000 } } });
+  });
   it("可选 maxTurns 进入新 Turn 的 maxSteps 默认值", function mapsMaxTurnsToSteps() {
     const settings = {
       maxTurns: 500,

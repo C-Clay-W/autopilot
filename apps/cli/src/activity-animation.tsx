@@ -143,9 +143,11 @@ export function resolveCliActivityView(input: { activity: CliActivityState; stat
 }
 
 /** 渲染稳定活动文案和可选的固定宽度离散帧。 */
-export function TuiActivityLine(props: { threadWait?: import("./types.js").CliProjection["threadWait"]; activity: CliActivityState; status: CliTurnStatus; waitingForApproval: boolean; useColor: boolean; screenReader: boolean; reducedMotion: boolean; animationActive: boolean; clock: TuiAnimationClock; startedAt?: number; elapsedMs?: number; runningSince?: number; activeForm?: string }): ReactNode {
+export function TuiActivityLine(props: { compacting?: boolean; threadWait?: import("./types.js").CliProjection["threadWait"]; activity: CliActivityState; status: CliTurnStatus; waitingForApproval: boolean; useColor: boolean; screenReader: boolean; reducedMotion: boolean; animationActive: boolean; clock: TuiAnimationClock; startedAt?: number; elapsedMs?: number; runningSince?: number; activeForm?: string }): ReactNode {
   const [clockTime, setClockTime] = useState(props.clock.now());
-  const view = resolveCliActivityView({ activity: props.activity, status: props.status, now: clockTime, waitingForApproval: props.waitingForApproval, threadWait: props.threadWait });
+  const view: CliActivityView | undefined = props.compacting
+    ? { phase: "thinking", label: "Compacting context…", frame: getCliActivityFrame("thinking", clockTime) }
+    : resolveCliActivityView({ activity: props.activity, status: props.status, now: clockTime, waitingForApproval: props.waitingForApproval, threadWait: props.threadWait });
   const shouldAnimate = props.animationActive && !props.screenReader && !props.reducedMotion && view !== undefined && view.phase !== "terminal";
   const shouldTick = shouldAnimate || (props.runningSince !== undefined && props.status === "running");
 
@@ -171,7 +173,7 @@ export function TuiActivityLine(props: { threadWait?: import("./types.js").CliPr
       <Box width={3} flexShrink={0}>
         <Text bold={isStalled} color={props.useColor ? "ansi256(208)" : undefined}>{frame}</Text>
       </Box>
-      <Text bold={isStalled} dimColor={props.useColor && !isStalled}>{props.threadWait && props.status === "running" ? view.label : props.activeForm ?? view.label}</Text>
+      <Text bold={isStalled} dimColor={props.useColor && !isStalled}>{props.compacting || props.threadWait && props.status === "running" ? view.label : props.activeForm ?? view.label}</Text>
     </Box>
   );
 }

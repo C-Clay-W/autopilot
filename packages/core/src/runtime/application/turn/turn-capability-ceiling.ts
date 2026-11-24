@@ -8,6 +8,8 @@ import { getChatToolNames } from "../../../internal/tools/chat-tool-runtime";
 
 /** 只在执行期间存在的 Chat 端口，不能进入 Session、Turn 或公开配置视图。 */
 export interface TurnCapabilities extends RunConfig {
+  hostToolAdmission?: (toolName: string) => Promise<void>;
+  hostTools?: import("../../../internal/tools/types").AgentToolDefinition<any, any>[];
   chatCapability?: ChatCapability;
 }
 
@@ -31,11 +33,21 @@ export async function resolveTurnCapabilities(input: {
   if (identity.productMode === "work") {
     // Work 预览能力只从受信宿主 runtimeDefault 装配；override 不可注入或替换，
     // 旧 Turn（冻结缺失/禁用）不开新能力，禁用或宿主移除时明确不可用且不换 OS opener。
-    // 协作能力只从受信宿主默认值装配；Turn/Project/Session override 不能注入或替换它。
-    const capabilities: TurnCapabilities = { ...runtimeDefault, ...override, rag: undefined, chatLoader: undefined, ragSourcePolicy: undefined, rerankPolicy: undefined, focusedPdfFileName: undefined, workPreview: undefined, workPreviewLoader: undefined, threads: continuing && input.frozen.threadsEnabled !== true ? undefined : runtimeDefault.threads };
+    // 所有能力只来自受信宿主；合法请求运行参数已由 resolveRunConfig 显式解析，
+    // 下游从 frozen 消费模型、权限、预算、compact 和 databaseSearchPolicy，不能在这里合并 override。
+    const capabilities: TurnCapabilities = { ...runtimeDefault, rag: undefined, chatLoader: undefined, ragSourcePolicy: undefined, rerankPolicy: undefined, focusedPdfFileName: undefined, workPreview: undefined, workPreviewLoader: undefined, browser: undefined, browserLoader: undefined, threads: continuing && input.frozen.threadsEnabled !== true ? undefined : runtimeDefault.threads };
     if (capabilities.webLoader) capabilities.web = await capabilities.webLoader();
+    capabilities.hostToolsLoader = undefined;
+    const hostTools = await runtimeDefault.hostToolsLoader?.({ sessionId: session.id, turnId });
+    capabilities.hostTools = hostTools?.tools;
+    capabilities.hostToolAdmission = hostTools?.beforeExecute;
+    if (hostTools?.allowedTools) ceiling = restrictCapabilityCeiling(ceiling, hostTools.allowedTools);
+    const browserEnabled = session.managedExecution
+      ? Boolean(hostTools?.browser) && (!continuing || input.frozen.browserEnabled === true)
+      : input.frozen.browserEnabled === true;
+    if (browserEnabled) capabilities.browser = session.managedExecution ? hostTools?.browser : runtimeDefault.browserLoader ? await runtimeDefault.browserLoader() : runtimeDefault.browser;
     if (input.frozen.workPreviewEnabled === true) capabilities.workPreview = await runtimeDefault.workPreviewLoader?.();
-    return { capabilities, frozen: { ...input.frozen, threadsEnabled: continuing ? input.frozen.threadsEnabled === true : Boolean(runtimeDefault.threads), workContextVersion: 1, ragSourcePolicy: undefined, rerankPolicy: undefined, capabilityCeiling: ceiling } };
+    return { capabilities, frozen: { ...input.frozen, browserEnabled, threadsEnabled: continuing ? input.frozen.threadsEnabled === true : Boolean(runtimeDefault.threads), workContextVersion: 1, ragSourcePolicy: undefined, rerankPolicy: undefined, capabilityCeiling: ceiling } };
   }
   const binding: ChatCapabilityBinding = { sessionId: session.id, turnId, retrievalMode: identity.chatRetrievalMode! };
   const loaded = await runtimeDefault.chatLoader?.(binding);
@@ -71,5 +83,5 @@ export async function resolveTurnCapabilities(input: {
     web,
     chatCapability,
   };
-  return { capabilities, frozen: { ...input.frozen, workspaceRoot: undefined, workspaceTrusted: false, permissionMode: "ask", workPreviewEnabled: false, databaseSearchPolicy: { enabled: false }, ragSourcePolicy: undefined, rerankPolicy: undefined, capabilityCeiling: ceiling, chatAttachmentGrants: grants } };
+  return { capabilities, frozen: { ...input.frozen, workspaceRoot: undefined, workspaceTrusted: false, permissionMode: "ask", workPreviewEnabled: false, browserEnabled: false, databaseSearchPolicy: { enabled: false }, ragSourcePolicy: undefined, rerankPolicy: undefined, capabilityCeiling: ceiling, chatAttachmentGrants: grants } };
 }

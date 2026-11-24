@@ -1,11 +1,11 @@
 /**
- * Node 用户设置分类保存服务：原子合并主模型与 RAG 配置，并收敛旧主连接引用。
+ * Node 用户设置分类保存服务：原子合并三种主模型协议与 RAG 配置，兼容旧 Anthropic 主连接。
  */
 
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { isExternalPermissionDiagnostic, normalizeProviderBaseUrl, resolveAutopilotSettings, type SettingsDiagnostic } from "@autopilot-agent/core";
+import { isExternalPermissionDiagnostic, normalizeProviderBaseUrl, resolveAutopilotSettings, resolveRouteModelCapability, type ApiProtocol, type ProviderRouteProfile, type ReasoningEffort, type SettingsDiagnostic } from "@autopilot-agent/core";
 import { atomicReplace, withFileLock } from "../file-utils";
 import { ensureUserConfigDirectory } from "./user-config-directory";
 import { resolveNodeUserSettingsPath } from "./node-settings-loader";
@@ -22,6 +22,8 @@ type RagConnectionRole = keyof typeof RAG_ROLE_CONTRACT;
 
 /** 主模型分类提交值；Key 留空时仅允许沿用无冲突的同一主连接凭据。 */
 export interface MainSettingsCategoryInput {
+  apiProtocol?: ApiProtocol;
+  compatibilityPreset?: ProviderRouteProfile["compatibilityPreset"];
   baseUrl: string;
   model: string;
   apiKey?: string;
@@ -30,11 +32,20 @@ export interface MainSettingsCategoryInput {
   sonnetModel?: string;
   haikuModel?: string;
   subagentModel?: string;
-  effort?: "auto" | "low" | "medium" | "high" | "max";
+  effort?: "auto" | ReasoningEffort;
   maxOutputTokens?: number;
   compactWindow?: number;
   timeoutMs?: number;
   alwaysThinkingEnabled?: boolean;
+}
+
+/** 仅供设置表单预览的连接元数据，不含凭据或内部路由标识。 */
+export type MainModelCapabilitiesInput = Pick<MainSettingsCategoryInput, "apiProtocol" | "compatibilityPreset" | "baseUrl" | "model">;
+
+/** 由 Core 统一解析的可请求强度和 Agent 工具能力。 */
+export interface MainModelCapabilities {
+  supportedReasoningEfforts: readonly ReasoningEffort[];
+  supportsToolCalls: boolean;
 }
 
 /** 单个 RAG 角色提交值；Embedding 角色必须显式给出维度。 */
@@ -165,7 +176,15 @@ function assertRevision(original: string, revision: string | undefined): void {
 /** 从固定 env 字段读取非空旧凭据，不向结果或错误暴露值。 */
 function readEnvironmentKey(environment: Record<string, unknown>, key: string | undefined): string | undefined {
   if (!key) return undefined;
-  return parseApiKey(environment[key]);
+  return parseApiKey(environment[key] ?? (key.startsWith("USER_SETTINGS_") ? environment[key.slice("USER_SETTINGS_".length)] : undefined));
+}
+
+/** 与 Node CredentialStore 一致按显式引用检查用户 Key，再检查非 USER_SETTINGS 的宿主环境。 */
+function readMainCredential(environment: Record<string, unknown>, ref: ProviderRouteProfile["credentialRef"], env: NodeJS.ProcessEnv): string | undefined {
+  const configured = readEnvironmentKey(environment, ref.key);
+  if (configured || ref.key.startsWith("USER_SETTINGS_")) return configured;
+  const envKey = `${ref.provider.toUpperCase().replace(/[^A-Z0-9_]/gu, "_")}_${ref.key.toUpperCase()}`;
+  return parseApiKey(env[envKey]);
 }
 
 /** 返回主连接与旧 route 中可迁移的凭据候选。 */
@@ -217,13 +236,16 @@ function removeLegacyPrimaryRoutes(raw: Record<string, unknown>, environment: Re
 
 /** 解析并规范化主模型分类提交。 */
 function normalizeMainInput(input: MainSettingsCategoryInput): Omit<MainSettingsCategoryInput, "apiKey"> & { apiKey?: string } {
+  const apiProtocol = input.apiProtocol ?? "anthropic-messages";
   const baseUrl = normalizeProviderBaseUrl(input.baseUrl);
   const model = parseSettingString(input.model);
   const apiKey = parseApiKey(input.apiKey);
   const availableModels = input.availableModels?.map(function parseModel(value) { return parseSettingString(value); });
-  if (!baseUrl || !model || (input.apiKey !== undefined && input.apiKey !== "" && !apiKey)
+  if (!["anthropic-messages", "openai-chat-completions", "openai-responses"].includes(apiProtocol)
+    || (input.compatibilityPreset !== undefined && (apiProtocol === "anthropic-messages" || !["openai", "deepseek", "generic"].includes(input.compatibilityPreset)))
+    || !baseUrl || !model || (input.apiKey !== undefined && input.apiKey !== "" && !apiKey)
     || (availableModels && (availableModels.length === 0 || availableModels.some(function missing(value) { return !value; }) || new Set(availableModels).size !== availableModels.length))
-    || (input.effort !== undefined && !["auto", "low", "medium", "high", "max"].includes(input.effort))
+    || (input.effort !== undefined && !["auto", "none", "low", "medium", "high", "xhigh", "max"].includes(input.effort))
     || (input.maxOutputTokens !== undefined && (!Number.isInteger(input.maxOutputTokens) || input.maxOutputTokens < 1 || input.maxOutputTokens > 1_000_000))
     || (input.compactWindow !== undefined && (!Number.isInteger(input.compactWindow) || input.compactWindow < 1 || input.compactWindow > 10_000_000))
     || (input.timeoutMs !== undefined && (!Number.isInteger(input.timeoutMs) || input.timeoutMs < 1_000 || input.timeoutMs > 600_000))
@@ -231,18 +253,93 @@ function normalizeMainInput(input: MainSettingsCategoryInput): Omit<MainSettings
   for (const value of [input.opusModel, input.sonnetModel, input.haikuModel, input.subagentModel]) {
     if (value !== undefined && !parseSettingString(value)) throw new NodeUserSettingsError("SETTINGS_INPUT_INVALID");
   }
-  return { ...input, baseUrl, model, ...(apiKey ? { apiKey } : {}), ...(availableModels ? { availableModels: availableModels as string[] } : {}) };
+  return { ...input, apiProtocol, baseUrl, model, ...(apiKey ? { apiKey } : {}), ...(availableModels ? { availableModels: availableModels as string[] } : {}) };
+}
+
+/** 连接与预设不变时保留受信模型覆盖；切换协议或地址时从新协议缺省重新解析。 */
+function createMainRoute(raw: Record<string, unknown>, input: MainSettingsCategoryInput): ProviderRouteProfile {
+  const previous = resolveAutopilotSettings([{ scope: "user", value: raw }]);
+  const selected = previous.modelRef && previous.providerRoutes[previous.modelRef.provider];
+  const apiProtocol = input.apiProtocol ?? "anthropic-messages";
+  const sameConnection = selected?.apiProtocol === apiProtocol && selected.baseUrl === input.baseUrl;
+  const matches = sameConnection && selected.compatibilityPreset === input.compatibilityPreset;
+  let id = selected?.id ?? "web-main";
+  for (let suffix = 2; !selected && previous.providerRoutes[id]; suffix += 1) id = `web-main-${suffix}`;
+  const ids = [...new Set([...(input.availableModels ?? (matches ? selected.models.map(function modelId(model) { return model.id; }) : [])), input.model])];
+  return {
+    id, apiProtocol, baseUrl: input.baseUrl,
+    credentialRef: sameConnection ? selected.credentialRef : { provider: id, key: `USER_SETTINGS_WEB_MAIN_${revisionOf(`${id}/${apiProtocol}/${input.baseUrl}`).slice(0, 16).toUpperCase()}` },
+    ...(selected?.displayName ? { displayName: selected.displayName } : {}),
+    ...(input.compatibilityPreset ? { compatibilityPreset: input.compatibilityPreset } : {}),
+    ...(matches && selected.protocolProfile ? { protocolProfile: selected.protocolProfile } : {}),
+    models: ids.map(function modelEntry(modelId) { return matches ? selected.models.find(function matchesId(model) { return model.id === modelId; }) ?? { id: modelId } : { id: modelId }; }),
+  };
+}
+
+/** 只返回 Core 的实际能力结果，未知模型不自行扩展 effort，错误不包含配置正文。 */
+function resolveMainCapabilities(route: ProviderRouteProfile, model: string): MainModelCapabilities {
+  try {
+    const capability = resolveRouteModelCapability(route, model);
+    return { supportedReasoningEfforts: capability.supportedReasoningEfforts ?? [], supportsToolCalls: capability.supportsToolCalls !== false };
+  } catch {
+    throw new NodeUserSettingsError("SETTINGS_INPUT_INVALID");
+  }
+}
+
+/** 原子更新选中的协议 route，保留其他 route、视觉连接和未修改的受信模型元数据。 */
+function applyRoutedMainCategory(raw: Record<string, unknown>, input: MainSettingsCategoryInput, env: NodeJS.ProcessEnv): void {
+  const route = createMainRoute(raw, input);
+  const capabilities = resolveMainCapabilities(route, input.model);
+  if (!capabilities.supportsToolCalls) throw new NodeUserSettingsError("SETTINGS_INPUT_INVALID", { scope: "user", code: "MODEL_NOT_SUPPORTED", field: "model" });
+  if (input.effort && input.effort !== "auto" && !capabilities.supportedReasoningEfforts.includes(input.effort)) {
+    throw new NodeUserSettingsError("SETTINGS_INPUT_INVALID", { scope: "user", code: "SETTINGS_EFFORT_INVALID", field: "effortLevel" });
+  }
+  const environment = { ...(isRecord(raw.env) ? raw.env : {}) };
+  const previous = resolveAutopilotSettings([{ scope: "user", value: raw }]);
+  const selected = previous.modelRef && previous.providerRoutes[previous.modelRef.provider];
+  const sameConnection = selected?.apiProtocol === route.apiProtocol && selected.baseUrl === route.baseUrl;
+  if (!input.apiKey && !sameConnection) throw new NodeUserSettingsError("SETTINGS_KEY_REQUIRED");
+  const key = input.apiKey ?? readMainCredential(environment, route.credentialRef, env);
+  if (!key) throw new NodeUserSettingsError("SETTINGS_KEY_REQUIRED");
+  if (input.apiKey) environment[route.credentialRef.key] = input.apiKey;
+  delete environment.ANTHROPIC_MODEL;
+  delete environment.CLAUDE_CODE_EFFORT_LEVEL;
+  raw.env = environment;
+  raw.providerRoutes = { ...(isRecord(raw.providerRoutes) ? raw.providerRoutes : {}), [route.id]: route };
+  raw.model = `${route.id}/${input.model}`;
+  if (input.effort && input.effort !== "auto") raw.effortLevel = input.effort;
+  else delete raw.effortLevel;
 }
 
 /** 将完整主模型分类写入 CC env，并在有歧义时拒绝猜测旧 Key。 */
-function applyMainCategory(raw: Record<string, unknown>, input: MainSettingsCategoryInput): void {
+function applyMainCategory(raw: Record<string, unknown>, input: MainSettingsCategoryInput, env: NodeJS.ProcessEnv): void {
   const normalized = normalizeMainInput(input);
+  const previous = resolveAutopilotSettings([{ scope: "user", value: raw }]);
+  const previousRoute = previous.modelRef && previous.providerRoutes[previous.modelRef.provider];
+  if (normalized.apiProtocol !== "anthropic-messages" || (input.apiProtocol !== undefined && previousRoute)) {
+    applyRoutedMainCategory(raw, normalized, env);
+    if (normalized.maxOutputTokens === undefined) delete raw.maxOutputTokens;
+    else raw.maxOutputTokens = normalized.maxOutputTokens;
+    const environment = raw.env as Record<string, unknown>;
+    const optional = {
+      ANTHROPIC_DEFAULT_OPUS_MODEL: normalized.opusModel,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: normalized.sonnetModel,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: normalized.haikuModel,
+      CLAUDE_CODE_AUTO_COMPACT_WINDOW: normalized.compactWindow?.toString(),
+      API_TIMEOUT_MS: normalized.timeoutMs?.toString(),
+      CLAUDE_CODE_SUBAGENT_MODEL: normalized.subagentModel,
+    };
+    for (const [key, value] of Object.entries(optional)) {
+      if (value === undefined) delete environment[key];
+      else environment[key] = value;
+    }
+    if (normalized.apiProtocol === "anthropic-messages" && normalized.alwaysThinkingEnabled !== undefined) raw.alwaysThinkingEnabled = normalized.alwaysThinkingEnabled;
+    return;
+  }
   const environment = { ...(isRecord(raw.env) ? raw.env : {}) };
   const candidates = collectMainCredentialCandidates(raw, environment);
   const distinct = [...new Set(candidates.map(function value(candidate) { return candidate.value; }))];
   if (!normalized.apiKey && distinct.length > 1) throw new NodeUserSettingsError("SETTINGS_MIGRATION_CONFLICT");
-  const previous = resolveAutopilotSettings([{ scope: "user", value: raw }]);
-  const previousRoute = previous.modelRef && previous.providerRoutes[previous.modelRef.provider];
   const previousBaseUrl = normalizeProviderBaseUrl(previousRoute?.baseUrl ?? previous.firstParty.baseUrl);
   const officialDeepSeekMigration = previousBaseUrl === "https://api.deepseek.com" && normalized.baseUrl === "https://api.deepseek.com/anthropic";
   if (!normalized.apiKey && previousBaseUrl !== normalized.baseUrl && !officialDeepSeekMigration) throw new NodeUserSettingsError("SETTINGS_KEY_REQUIRED");
@@ -269,6 +366,7 @@ function applyMainCategory(raw: Record<string, unknown>, input: MainSettingsCate
   }
   raw.env = environment;
   delete raw.model;
+  delete raw.effortLevel;
   raw.availableModels = normalized.availableModels ?? [...new Set([normalized.model, normalized.opusModel, normalized.sonnetModel, normalized.haikuModel, normalized.subagentModel].filter(function present(value): value is string { return Boolean(value); }))];
   if (normalized.maxOutputTokens === undefined) delete raw.maxOutputTokens;
   else raw.maxOutputTokens = normalized.maxOutputTokens;
@@ -277,7 +375,7 @@ function applyMainCategory(raw: Record<string, unknown>, input: MainSettingsCate
 }
 
 /** 校验并合并独立 Search；仅 DeepSeek 官方主连接可直接引用主凭据。 */
-function applyWebSearch(raw: Record<string, unknown>, input: WebSearchSettingsCategoryInput): void {
+function applyWebSearch(raw: Record<string, unknown>, input: WebSearchSettingsCategoryInput, env: NodeJS.ProcessEnv): void {
   if (typeof input.enabled !== "boolean" || typeof input.useMainKey !== "boolean") throw new NodeUserSettingsError("SETTINGS_INPUT_INVALID");
   if (!input.enabled) {
     raw.webSearch = false;
@@ -287,15 +385,19 @@ function applyWebSearch(raw: Record<string, unknown>, input: WebSearchSettingsCa
   const baseUrl = normalizeProviderBaseUrl(input.baseUrl);
   const model = parseSettingString(input.model);
   const environment = { ...(isRecord(raw.env) ? raw.env : {}) };
-  const mainBaseUrl = normalizeProviderBaseUrl(environment.ANTHROPIC_BASE_URL);
-  const canReuseMainKey = mainBaseUrl === "https://api.deepseek.com/anthropic" && Boolean(readEnvironmentKey(environment, "ANTHROPIC_AUTH_TOKEN") ?? readEnvironmentKey(environment, "ANTHROPIC_API_KEY"));
+  const settings = resolveAutopilotSettings([{ scope: "user", value: raw }]);
+  const mainRoute = settings.modelRef && settings.providerRoutes[settings.modelRef.provider];
+  const mainBaseUrl = mainRoute?.baseUrl ?? normalizeProviderBaseUrl(environment.ANTHROPIC_BASE_URL);
+  const mainRef = mainRoute?.credentialRef ?? { provider: "deepseek", key: "USER_SETTINGS_ANTHROPIC_AUTH_TOKEN" };
+  const mainKey = mainRoute ? readMainCredential(environment, mainRef, env) : readEnvironmentKey(environment, "ANTHROPIC_AUTH_TOKEN") ?? readEnvironmentKey(environment, "ANTHROPIC_API_KEY");
+  const canReuseMainKey = (!mainRoute || mainRoute.apiProtocol === "anthropic-messages") && mainBaseUrl === "https://api.deepseek.com/anthropic" && Boolean(mainKey);
   if (input.useMainKey) {
     if (!canReuseMainKey) throw new NodeUserSettingsError("SETTINGS_INPUT_INVALID");
     raw.webSearch = {
       provider: "deepseek",
       baseUrl: "https://api.deepseek.com/anthropic",
       model: "deepseek-flash",
-      credentialRef: { provider: "deepseek", key: "USER_SETTINGS_ANTHROPIC_AUTH_TOKEN" },
+      credentialRef: mainRef,
     };
     return;
   }
@@ -340,10 +442,11 @@ function applyRagRole(raw: Record<string, unknown>, role: RagConnectionRole, inp
 }
 
 /** 创建用户设置分类服务；只操作受限 User settings 路径。 */
-export function createNodeUserSettingsService(options: { homeDirectory?: string; fetchImpl?: typeof fetch } = {}) {
+export function createNodeUserSettingsService(options: { homeDirectory?: string; fetchImpl?: typeof fetch; env?: NodeJS.ProcessEnv } = {}) {
   const homeDirectory = options.homeDirectory;
   const settingsPath = resolveNodeUserSettingsPath(homeDirectory);
   const fetchImpl = options.fetchImpl ?? fetch;
+  const env = options.env ?? process.env;
 
   /** 在跨进程锁内执行一次修订校验、分类合并、Core 校验和原子替换。 */
   async function save(update: (raw: Record<string, unknown>) => void, revision?: string): Promise<UserSettingsWriteResult> {
@@ -362,6 +465,11 @@ export function createNodeUserSettingsService(options: { homeDirectory?: string;
   }
 
   return {
+    /** 预览草稿模型在当前 route 覆盖下的能力，不读取或返回 API Key。 */
+    getMainModelCapabilities(input: MainModelCapabilitiesInput): MainModelCapabilities {
+      const normalized = normalizeMainInput(input);
+      return resolveMainCapabilities(createMainRoute(readUserSettings(settingsPath).raw, normalized), normalized.model);
+    },
     /** 用户主动刷新时调用 DeepSeek 官方目录；无凭据、失败或异常响应均使用维护目录。 */
     async refreshMainModelCatalog(): Promise<MainModelCatalogResult> {
       const maintained = ["deepseek-v4-pro[1m]", "deepseek-v4-flash"];
@@ -390,10 +498,11 @@ export function createNodeUserSettingsService(options: { homeDirectory?: string;
       const { blocking, permissions } = splitDiagnostics(resolved.diagnostics);
       // 权限段错误不阻断安全模型状态读取；其他分类仍 fail-closed，并指出首个出错字段。
       if (blocking.length > 0) throw new NodeUserSettingsError("SETTINGS_INVALID", safeDiagnostic(blocking[0]!));
-      const mainBaseUrl = resolved.firstParty.baseUrl ?? "https://api.deepseek.com/anthropic";
+      const mainRoute = resolved.modelRef && resolved.providerRoutes[resolved.modelRef.provider];
+      const mainBaseUrl = mainRoute?.baseUrl ?? resolved.firstParty.baseUrl ?? "https://api.deepseek.com/anthropic";
       const mainModel = resolved.modelRef?.modelId ?? "deepseek-v4-flash";
-      const mainKey = readEnvironmentKey(environment, "ANTHROPIC_AUTH_TOKEN") ?? readEnvironmentKey(environment, "ANTHROPIC_API_KEY");
-      const search = resolved.webSearch ?? (!resolved.webSearchDisabled && mainKey && mainBaseUrl === "https://api.deepseek.com/anthropic"
+      const mainKey = mainRoute ? readMainCredential(environment, mainRoute.credentialRef, env) : readEnvironmentKey(environment, "ANTHROPIC_AUTH_TOKEN") ?? readEnvironmentKey(environment, "ANTHROPIC_API_KEY");
+      const search = resolved.webSearch ?? (!resolved.webSearchDisabled && !mainRoute && mainKey && mainBaseUrl === "https://api.deepseek.com/anthropic"
         ? { provider: "deepseek" as const, baseUrl: "https://api.deepseek.com/anthropic", model: "deepseek-flash", credentialRef: { key: "USER_SETTINGS_ANTHROPIC_AUTH_TOKEN" } }
         : undefined);
       const searchKeyName = search?.credentialRef.key;
@@ -414,16 +523,18 @@ export function createNodeUserSettingsService(options: { homeDirectory?: string;
       return {
         revision: revisionOf(current.original),
         main: {
-          provider: mainBaseUrl === "https://api.deepseek.com/anthropic" ? "deepseek" : "custom",
+          provider: mainBaseUrl === "https://api.deepseek.com/anthropic" || mainRoute?.compatibilityPreset === "deepseek" ? "deepseek" : "custom",
+          apiProtocol: mainRoute?.apiProtocol ?? "anthropic-messages",
+          ...(mainRoute?.compatibilityPreset ? { compatibilityPreset: mainRoute.compatibilityPreset } : {}),
           baseUrl: mainBaseUrl,
           model: mainModel,
           configured: Boolean(mainKey),
-          availableModels: resolved.availableModels.length > 0 ? [...resolved.availableModels] : ["deepseek-v4-flash", "deepseek-v4-pro[1m]"],
+          availableModels: mainRoute ? mainRoute.models.map(function modelId(model) { return model.id; }) : resolved.availableModels.length > 0 ? [...resolved.availableModels] : ["deepseek-v4-flash", "deepseek-v4-pro[1m]"],
           opusModel: typeof environment.ANTHROPIC_DEFAULT_OPUS_MODEL === "string" ? environment.ANTHROPIC_DEFAULT_OPUS_MODEL : undefined,
           sonnetModel: typeof environment.ANTHROPIC_DEFAULT_SONNET_MODEL === "string" ? environment.ANTHROPIC_DEFAULT_SONNET_MODEL : undefined,
           haikuModel: typeof environment.ANTHROPIC_DEFAULT_HAIKU_MODEL === "string" ? environment.ANTHROPIC_DEFAULT_HAIKU_MODEL : undefined,
           subagentModel: resolved.firstParty.subagentModelId,
-          effort: typeof environment.CLAUDE_CODE_EFFORT_LEVEL === "string" ? environment.CLAUDE_CODE_EFFORT_LEVEL as UserSettingsStatus["main"]["effort"] : undefined,
+          effort: resolved.reasoningProfile?.effort ?? "auto",
           maxOutputTokens: resolved.firstParty.maxOutputTokens,
           compactWindow: resolved.firstParty.compactWindow,
           timeoutMs: resolved.firstParty.timeoutMs,
@@ -431,7 +542,7 @@ export function createNodeUserSettingsService(options: { homeDirectory?: string;
         },
         search: {
           enabled: Boolean(search),
-          useMainKey: searchKeyName === "USER_SETTINGS_ANTHROPIC_AUTH_TOKEN",
+          useMainKey: mainRoute ? mainRoute.apiProtocol === "anthropic-messages" && mainRoute.baseUrl === "https://api.deepseek.com/anthropic" && searchKeyName === mainRoute.credentialRef.key : searchKeyName === "USER_SETTINGS_ANTHROPIC_AUTH_TOKEN",
           provider: search?.provider ?? "deepseek",
           baseUrl: search?.baseUrl ?? "https://api.deepseek.com",
           model: search?.model ?? "deepseek-v4-flash",
@@ -448,14 +559,14 @@ export function createNodeUserSettingsService(options: { homeDirectory?: string;
     },
     /** 保存主模型分类并执行旧 route/哈希凭据迁移。 */
     saveMain(input: MainSettingsCategoryInput, revision?: string): Promise<UserSettingsWriteResult> {
-      return save(function updateMain(raw) { applyMainCategory(raw, input); }, revision);
+      return save(function updateMain(raw) { applyMainCategory(raw, input, env); }, revision);
     },
     /** 原子保存设置中心的主模型分类，包含已经独立化的 Search 连接。 */
     saveMainCategory(input: MainSettingsCategoryUpdate, revision?: string): Promise<UserSettingsWriteResult> {
       if (!isRecord(input) || !isRecord(input.main) || !isRecord(input.search) || Object.keys(input).some(function unknown(key) { return key !== "main" && key !== "search"; })) return Promise.reject(new NodeUserSettingsError("SETTINGS_INPUT_INVALID"));
       return save(function updateMainAndSearch(raw) {
-        applyMainCategory(raw, input.main);
-        applyWebSearch(raw, input.search);
+        applyMainCategory(raw, input.main, env);
+        applyWebSearch(raw, input.search, env);
       }, revision);
     },
     /** 增量保存 RAG 分类；未提交角色保持不变。 */

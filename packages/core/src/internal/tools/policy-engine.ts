@@ -1,7 +1,7 @@
 /**
  * PolicyEngine：工具执行前唯一的强制策略入口，合并硬门禁、Skill、审批、grant、Trust 与权限模式。
  */
-import { isTaskFileSetDeclarationConstraint } from "../../runtime/domain/approval";
+import { isExternalTaskFileSetConstraint, isTaskFileSetDeclarationConstraint } from "../../runtime/domain/approval";
 import { SANDBOX_ERROR_CODES } from "../../runtime/domain/sandbox-policy";
 import { isWorkspaceCommandConstraint } from "./permissions/command-policy";
 import { TOOL_ERROR_CODES } from "./tool-error";
@@ -19,12 +19,7 @@ export interface PolicyEvaluationInput {
    * 未注入表示该调用不经过沙箱判定，行为与本字段引入前完全一致。
    */
   sandbox?: { available: boolean };
-  /**
-   * Talk-Plan1022 S1：Windows 宿主执行事实——受信宿主已停用进程沙箱，进程调用经用户
-   * 逐次审批后在宿主直接执行（无 OS 隔离）。由 ToolExecutor 探测到宿主执行 port 后注入；
-   * 任何 grant、full_access、auto_approve 或 Trust 自动放行都不代替此次确认，
-   * 仅 hard deny、Skill 白名单与显式外部 deny 仍然先于本分支拒绝。
-   */
+  /** 受信宿主确认进程直接执行、无 OS 隔离；审批仍按风险与人类权限分流。 */
   hostExecution?: boolean;
 }
 
@@ -39,10 +34,17 @@ export class PolicyEngine {
    */
   canUsePersistentGrant(context: ToolExecutionContext, facts: ToolActionFacts): boolean {
     if (facts.requiresApproval !== true || facts.toolName === "stop_background_job" || facts.toolName === "resume_thread") return false;
+    if (this.requiresSingleApproval(context, facts)) return false;
     // 集合声明（工作区与外部）必须逐次审批：旧集合 grant 不能静默放行后续的新清单声明（增量要用户明确确认）。
     if (isTaskFileSetDeclarationConstraint(facts.stableConstraint)) return false;
     if (context.permissionMode === "ask" && facts.toolName === "run_command") return isWorkspaceCommandConstraint(facts.stableConstraint);
     return true;
+  }
+
+  /** 删除、推送、未能判定效果的进程与 MCP 保留人工授权。 */
+  requiresSingleApproval(context: ToolExecutionContext, facts: ToolActionFacts): boolean {
+    if (facts.risk === "destructive" || facts.requireSingleApproval || facts.operation === "mcp_tools_call" || isExternalTaskFileSetConstraint(facts.stableConstraint)) return true;
+    return context.permissionMode !== "ask" && !facts.externalExecutionTarget && facts.risk === "unknown" && ["run_command", "start_background_job"].includes(facts.toolName);
   }
 
   /** 对一个已校验的工具调用作出唯一执行决定。 */
@@ -80,22 +82,8 @@ export class PolicyEngine {
     if (facts.externalMutation === true && facts.externalRestriction === "deny") {
       return { decision: "deny", reason: "该工作区外文件修改已被显式规则拒绝", errorCode: TOOL_ERROR_CODES.COMMAND_FORBIDDEN, ...base };
     }
-    // Talk-Plan1022 S1：Windows 宿主执行逐次确认，先于只读自动放行、grant、full_access、
-    // auto_approve 与 Trust；allowedDecisions 收窄为单次允许/拒绝。审批卡按工具说明
-    // 无隔离事实（run_command 批准后真实执行；start_background_job 通道未接通，批准不启动）。
-    if (input.hostExecution === true) {
-      return {
-        decision: "approval_required",
-        reason: facts.toolName === "start_background_job"
-          ? "Windows 宿主执行：后台命令将在当前用户权限下直接运行，未启用沙箱隔离，需要逐次确认"
-          : "Windows 宿主执行：命令将在当前用户权限下直接运行，未启用沙箱隔离，需要逐次确认",
-        ...base,
-        allowedApprovalDecisions: ["allow_once", "deny"],
-      };
-    }
     // 用户暂停属于显式控制边界；全权限、自动批准与持久 grant 都不能代替恢复确认。
     if (facts.toolName === "resume_thread") return { decision: "approval_required", reason: facts.approval?.reason ?? "恢复暂停任务需要确认", ...base, allowedApprovalDecisions: ["allow_once", "deny"] };
-    if (!facts.requiresApproval) return { decision: "allow", reason: facts.approval?.reason ?? "本地策略确认该操作为只读", ...base };
     // Talk-Plan1013 Stage5 R5：外部读取 ask 逐次询问——先于 grant 与任何权限模式分支，
     // allowedDecisions 收窄为单次允许/拒绝，不写任何持久规则，full_access 也不能跳过。
     if (facts.externalRestriction === "ask") {
@@ -106,6 +94,11 @@ export class PolicyEngine {
         allowedApprovalDecisions: ["allow_once", "deny"],
       };
     }
+    // 明确保护的操作不被档位、回合或持久授权放行。
+    if (this.requiresSingleApproval(context, facts) || context.permissionMode !== "full_access" && risk === "external_side_effect" && facts.externalMutation !== true) {
+      return { decision: "approval_required", reason: facts.approval?.reason ?? "危险或外部副作用操作需要单次确认", ...base, allowedApprovalDecisions: ["allow_once", "deny"] };
+    }
+    if (!facts.requiresApproval && facts.externalMutation !== true) return { decision: "allow", reason: facts.approval?.reason ?? "本地策略确认该操作可执行", ...base };
     // Talk-Plan1013 Stage 1：全模式外部修改 gate（Plan 16.3）。externalMutation 由文件工具的本地
     // ActionFacts 依据 canonical 目标判定，任何权限模式（full_access/auto_approve/可信宽模式）都
     // 不能越过它：只有 Runtime 校验过的精确外部持久授权或本次冻结审批可以放行，mode 本身不构成授权。
@@ -117,20 +110,18 @@ export class PolicyEngine {
           decision: "approval_required",
           reason: facts.approval?.reason ?? "工作区外文件修改需要明确用户授权",
           ...base,
-          allowedApprovalDecisions: ["allow_once", "allow_session", "allow_workspace", "deny"],
+          allowedApprovalDecisions: input.hostExecution === true ? ["allow_once", "deny"] : ["allow_once", "allow_session", "allow_workspace", "deny"],
         };
       }
+    }
+    // ask 的宿主命令保留逐次确认，无隔离事实不再阻止其他模式的安全普通调用。
+    if (input.hostExecution === true && context.permissionMode === "ask") {
+      return { decision: "approval_required", reason: `Windows 宿主执行：未启用沙箱隔离；${facts.approval?.reason ?? "本次命令需要确认"}`, ...base, allowedApprovalDecisions: ["allow_once", "deny"] };
     }
     if (grantMatched) return { decision: "allow", reason: "命中 Runtime 持久授权", ...base };
     if (context.permissionMode === "full_access") return { decision: "allow", reason: "full_access 已授予本次非硬拒绝操作", ...base };
     if (context.permissionMode === "auto_approve" && this.allowsAutoApprove(risk, context.workspaceTrusted === true)) {
       return { decision: "allow", reason: "auto_approve 与工作区信任允许本次操作", ...base };
-    }
-    // G4（Talk-Plan0917 Stage 3）：仅当调用已确认可在沙箱内隔离执行时（sandbox facts 由
-    // ToolExecutor 对进程类调用注入），auto_approve + Trust 才对外部副作用/未知风险自动放行；
-    // 裸跑下这些风险从不自动放行，不可安全包装时仍走审批或 fail-closed。
-    if (input.sandbox?.available === true && context.permissionMode === "auto_approve" && context.workspaceTrusted === true) {
-      return { decision: "allow", reason: "auto_approve：本次调用已确认在沙箱内隔离执行，自动放行", ...base };
     }
     return {
       decision: "approval_required",
@@ -139,7 +130,7 @@ export class PolicyEngine {
       // ask 模式普通命令提供"记住此命令"（工作区级精确授权，不含 allow_session）；
       // 任务文件集合审批（工作区与外部）只提供一次性批准/拒绝（集合授权为 Turn 级，由 submit 分支保存）；
       // stop_background_job 与非精确约束的 ask 命令仍保持仅单次/拒绝。
-      allowedApprovalDecisions: facts.toolName === "stop_background_job" || isTaskFileSetDeclarationConstraint(facts.stableConstraint)
+      allowedApprovalDecisions: input.hostExecution === true || facts.toolName === "stop_background_job" || isTaskFileSetDeclarationConstraint(facts.stableConstraint)
         ? ["allow_once", "deny"]
         : facts.toolName === "run_command" && context.permissionMode === "ask"
           ? isWorkspaceCommandConstraint(facts.stableConstraint)

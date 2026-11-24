@@ -6,7 +6,7 @@ Next.js 16 / React 19 的本地 Web 宿主。Chat 使用临时附件与知识检
 
 ## 启动
 
-从仓库根执行，建议 Node 20.20.2 / npm 10：
+从仓库根执行，完整工程建议 Node 22.13+ / npm 10：
 
 ```bash
 npm ci
@@ -27,15 +27,15 @@ start 绑定 127.0.0.1。服务能够操作所在机器的项目文件，不应�
 
 ## 配置与使用
 
-使用用户 home 下 `.autopilot/settings.json`，与 CLI 共享用户配置；默认 Anthropic 与显式 Chat Completions 示例见 [主包手册](../../packages/autopilot-agent/README.md)。也可在设置页配置主模型、搜索与 RAG 连接，不需要作者的 env 或 launcher。
+使用用户 home 下 `.autopilot/settings.json`，与 CLI 共享用户配置；Anthropic Messages、OpenAI Responses 与 Chat Completions 的设置见 [主包手册](../../packages/autopilot-agent/README.md)。也可在设置页配置主模型、搜索与 RAG 连接，不需要作者的 env 或 launcher。
 
 先选择模式：Chat 处理会话临时附件；Work 选择目标项目、完成 Trust，再审批具体操作。模型、搜索、视觉和 RAG 需要各自可用的服务；未配置对应连接时该能力不可用。RAG 向量空间必须与入库模型/维度一致；PDF/OCR 还需按能力准备外部工具。
 
 ## Work 预览与 Windows 执行
 
-源码 0.2.0 的 Work 支持内置预览面板、结果入口和 `open_preview` 工具，只准备导航，不读取、验证或操作页面；Chat 不注册该工具。宿主校验预览目标与 Job 归属，服务归属无法证明时不自动展开。完整浏览器与 Provider 验收仍需确认。
+Web Work 支持内置预览面板、结果入口和 `open_preview` 工具，只准备导航，不读取、验证或操作页面；Chat 不注册该工具。宿主校验预览目标与 Job 归属，服务归属无法证明时不自动展开。完整浏览器与 Provider 验收仍需确认。
 
-Windows 进程沙箱已移除；命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行，界面显示未隔离。macOS 继续使用 Seatbelt 沙箱，平台实机保证以实际验证为准。
+Windows 进程沙箱已移除；命令和后台 Job 按权限模式与风险审批后以当前用户权限执行，host MCP 另按授权执行，界面显示未隔离。macOS 继续使用 Seatbelt 沙箱，平台实机保证以实际验证为准。
 
 ## 源码与检查
 

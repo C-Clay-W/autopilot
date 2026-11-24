@@ -10,7 +10,7 @@
 2. **按所属小节就地更新**：已有 API 的参数、类型、返回值、约束、错误或示例变化时，更新它原有的小节；只有新增公开入口或公开类型分类时才新增小节，禁止在文末追加“本次新增”、阶段编号或日期化变更一类内容。
 3. **每个可调用 API 必须完整说明**：至少写明签名、参数、返回值、使用限制和最小示例；涉及安全、持久化、信任、权限、兼容或废弃时，必须单独写出注意事项。
 4. **类型与示例同步**：公开输入、输出、事件或联合值改变时，同步更新相邻类型定义、类型索引和示例。示例使用占位 workspace、模型和凭据，不写真实密钥、绝对个人路径或内部状态。
-5. **只记录现行契约**：本文档不保存按编号划分的执行阶段、日期化过程、打包与验证证据、发布记录、问题排查或已废弃方案；这些内容属于 `agent/Runbook-*.md`、`agent/plans/` 或发布文档。
+5. **只记录现行契约**：本文档不保存按编号划分的执行阶段、日期化过程、打包与验证证据、发布记录、问题排查或已废弃方案；开发过程与发布记录另行维护。
 6. **注意事项要经源码复核**：只保留当前实现可证明的输入限制、安全边界、默认值、兼容性和调用顺序；删除已过期的宿主实现细节、历史踩坑和无法由当前源码确认的结论。
 7. **稳定边界清楚**：默认入口 `@autopilot-agent/core` 是本文档范围；`@autopilot-agent/core/experimental` 单独标记为实验性，`@autopilot-agent/core/internal/*` 禁止宿主引用，不能被包装成官方用法。
 8. **变更后自检**：检查导入路径、函数/方法名称、参数顺序、默认值、联合类型、返回值和所有代码块；删除源码中已不存在的 API，明确标注仍保留的兼容 API。
@@ -71,7 +71,7 @@ const payload: UiDocumentPayload = validateUiDocumentInput(modelToolInput);
 | 导出 | 签名/类型 | 契约 |
 |---|---|---|
 | `UI_COMPONENT_NAMES` / `UI_COMPONENT_SCHEMAS` | 只读白名单及对应 Zod schema | 19 个组件：Stack、Grid、Card、Text、Metric、Tabs、Disclosure、NumberInput、Slider、Select、DataTable、LineChart、BarChart、Button、ItemList、Timeline、Steps、ChoiceGroup、Flowchart。`ItemList.items` 为 1–20 项，标题 1–80 字、说明至多 300 字；`Timeline.items` 为 1–20 项，label 至多 40 字，标题 1–80 字、说明至多 300 字；`Steps.items` 为 2–8 项并使用相同标题/说明限制，绑定初值为 0 起整数索引。`ChoiceGroup` 的 label 至多 40 字、选项为 2–8 个唯一标量值，选项 label 至多 40 字、说明至多 300 字。Steps 与 ChoiceGroup 和原 NumberInput、Slider、Select 一样以 `statePath` 绑定，归一后改用 `props.value: { $bindState: JSON Pointer }`。DataTable 可选筛选列必须存在且每行值为同一字符串或数值类型；`sortable` 缺省为 false，Web 仅对同类型列排序。图表 `series` 接受固定数据或 `savingsGrowth` 的 `select: "series"` 表达式；不接受任意 state 引用作为序列。 |
-| `UI_COMPUTED_FUNCTION_NAMES` / `UI_COMPUTED_FUNCTIONS` | 只读函数名及纯函数目录 | 仅 `savingsGrowth`、`weightedAverage`、`sum`；不接受任意属性路径、eval 或动态函数名。`savingsGrowth` 只支持 `args.select: "final" | "series"`，分别返回有限数值或符合图表目录的单条逐年序列。 |
+| `UI_COMPUTED_FUNCTION_NAMES` / `UI_COMPUTED_FUNCTIONS` | 只读函数名及纯函数目录 | 仅 `savingsGrowth`、`weightedAverage`、`sum`；不接受任意属性路径、eval 或动态函数名。`savingsGrowth` 只支持 `args.select: "final" \| "series"`，分别返回有限数值或符合图表目录的单条逐年序列。 |
 | `UI_DOCUMENT_SCHEMA_VERSION` | 常量 `1` | 当前安全 UI 文档协议版本。 |
 | `Flowchart` props | `{ direction: "TB" \| "LR", description, nodes, edges }` | `description` 为 1–500 字的文字等价说明；1–24 个节点 `{ id, label, kind?: "process" \| "decision" \| "terminal" }`，标签1–40字；0–48条边 `{ id, from, to, label? }`，边标签最多24字。节点/边ID为1–40个字母数字、下划线或短横线，各自唯一；拒绝重复关系和悬空引用，允许分支/回路。仅Chat Intelligent UI，不为CLI装配。 |
 | `uiDocumentInputSchema` | Zod schema | 检查 `{ title, fallbackText, spec: { root, elements, state? } }`；`elements` 是以节点 ID 为键的动态 map，元素按 19 类 `type` 约束匹配的 `props`，并限制元素外层 `children/slots/visible/on`。动态 map 不转换成数组；单独 parse 仍不替代完整语义校验。 |
@@ -101,6 +101,7 @@ import {
 | `AgentProviderFailureReason` | 闭合字符串联合 | 仅含 invalid_request、authentication_failed、billing_insufficient、quota_exhausted、rate_limited、service_unavailable。 |
 | `getAgentProviderFailureMessage(errorCode, reason?)` | `(unknown, unknown?) => string \| undefined` | 仅返回固定安全提示，不拼接上游自由文本。 |
 | `sanitizeAgentProviderFailureReason(errorCode, reason)` | `(unknown, unknown) => AgentProviderFailureReason \| undefined` | 只接受与既有 Provider 错误分类匹配的原因。 |
+| `sanitizeAgentProviderFailureDetail(value)` | `(unknown) => string \| undefined` | 仅保留 `code:` / `type:` 加 1–32 位有界协议标识，首位须为字母或数字；过滤常见凭据形式，非法值返回 `undefined`。格式检查不能证明未知上游标识没有敏感内容。 |
 | `normalizeLegacyProviderFailureReason(errorCode, profile, status)` | `(unknown, unknown, unknown) => AgentProviderFailureReason \| undefined` | 仅迁移已知旧 profile 与匹配状态，不改变既有反馈 ID、stage、HTTP 状态或恢复分类。 |
 
 ### 1.4 两类主入口
@@ -147,6 +148,7 @@ interface CreateAgentRuntimeOptions {
 }
 
 interface AgentRuntime {
+  facts: RuntimeFacts;
   threads: { bind(context: ThreadHostContext): ThreadFacade };
   projects: ProjectService;
   sessions: SessionService;
@@ -163,8 +165,10 @@ interface AgentRuntime {
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|:--:|---|
 | `ports` | `RuntimePorts` | 是 | 全部持久化与平台能力的实现集合。Node 生产宿主使用 `@autopilot-agent/adapters` 的 `createNodeRuntimePorts()`；数据库/Keychain 等其他平台可提供等价完整实现，不能缺项。 |
-| `defaultRunConfig` | `RunConfig` | 否 | Runtime 默认配置；新 Turn 可由 Project、Session 和本次调用按字段覆盖。 |
-| `enableUserQuestions` | `boolean` | 否 | 仅 Web 等具备结构化答案提交入口的宿主设为 `true`；关闭时 `ask_user_question` 不注册到模型定义。`runtime.questions` 仍是受校验的提交服务，不会使 CLI 获得恢复权限。 |
+| `defaultRunConfig` | `RunConfig` | 否 | Runtime 默认配置；模型、推理、凭据、权限与执行预算按 Turn > Session > Project > Runtime 解析。Trust、沙箱及进程内能力仅来自受信宿主。 |
+| `enableUserQuestions` | `boolean` | 否 | Web 和 Desktop 受管 AP 等具备答案提交入口的 Work 宿主设为 `true`；普通 CLI 默认关闭新问题工具。关闭仅影响新工具注册，`runtime.questions` 仍可校验/保存历史暂停问题的答案；继续执行须遵循原 Turn 的宿主归属与恢复规则。 |
+
+可信宿主的 `RunConfig.hostToolsLoader` 可以通过 `beforeExecute(toolName)` 核对普通工具准入。参数来自实际工具定义，现有无参数回调仍可使用。由同一宿主通过此 loader 注册的工具按原绑定合同执行。
 
 `createNodeRuntimePorts(options)` 是仓库已经提供的 Node 生产实现，不需要宿主自行重写 Store。它要求显式 `stateRoot`，可接收 `workspaceRoot`、`cwd`、`env`、`productMode` 与仅供 CredentialStore 按需读取的 `userSettingsPath`，并一次装配 Session、Thread、Checkpoint、Transcript、Credential、Project、Event、Workspace、Turn、Approval、InputInbox、Lease、Job、Undo mutation 及 Session resource 的全部 Port。相同 `stateRoot` 的两次装配可恢复同一份 durable 状态。默认是 Work；Chat 使用下述 `createNodeChatStorage()`，获得拒绝工作区访问的端口和正确的附件清理绑定。
 
@@ -220,19 +224,35 @@ Session Store、schema 管理器、Chat 路径/附件/装配边界精确识别�
 
 `createNodeCapabilityLoader().loadContext(workspaceRoot, query?)` 保留项目指令发现，但旧 Memory 来源未验证，当前不召回任何 Memory；有 query 时返回固定诊断 `LEGACY_MEMORY_REVIEW_REQUIRED`。公开兼容函数 `retrieveNodeMemories(stateRoot, workspaceRoot, query, maxItems?)` 返回空数组，不读取或迁移旧文件。路径辅助函数继续可供用户审阅，不能作为向 Work 注入旧内容的授权。
 
-`createMemoryPorts()` 只适用于无持久化的进程内场景，不能替代生产 Node Port。
+`createMemoryPorts(workspaceRoot = "/tmp/test-workspace"): RuntimePorts` 每次创建一组隔离的内存 Port，只适用于无持久化的进程内场景，不能替代生产 Node Port；默认沙箱为不可用 Port，进程执行会 fail closed。其 Session Store 的 `get`/`list` 返回深拷贝，`save`/`createIfAbsent` 保存输入深拷贝；修改调用方对象不会隐式写回存储。SessionService 仍保留面向第三方 Store 的兼容隔离与身份校验。
+
+默认入口还导出可单独装配的 `MemorySessionStore`、`MemoryCheckpointStore`、`MemoryTranscriptStore`、`MemoryCredentialStore`、`MemoryProjectStore`、`MemoryEventSink`、`MemoryTurnStore`、`MemoryApprovalStore`、`MemoryInputInbox`、`MemoryJobStore`、`MemoryFileMutationStore`、`MemorySessionResourceStore`、`MemoryUserQuestionStore` 和 `DefaultClock`（均无参构造），以及 `MemoryWorkspaceAdapter(root: string, markers: string[] = [])`。它们实现相应 Port；`DefaultClock.now()` 返回毫秒时间。最小用法为 `const runtime = createAgentRuntime({ ports: createMemoryPorts("/workspace/demo") });`；需要替换一个 Port 时修改该组装对象，再创建 Runtime。
 
 `shutdown()` 存在时，CLI/Desktop 等拥有进程生命周期的宿主必须在正常退出前调用它；它只终止当前 Runtime 启动的活动非 PTY Job，不会重新附着历史进程。
+
+### 执行事实：`runtime.facts`
+
+`facts.read({ sessionId, cursor?, limit })` 从既有 transcript 只读一页；`limit` 为 1—100，返回 `{ items: RuntimeFact[], cursor?, nextCursor? }`。过滤正文事件后 items 可以为空，调用者仍须保存 cursor，并在 nextCursor 存在时续读。Store 游标绑定 Session，失效/非法游标沿 Store 明确报错。仅 durable Session 可重放，不存在或 ephemeral 返回 `FACTS_SESSION_UNAVAILABLE`。
+
+`facts.snapshot({ sessionId })` 返回 `RuntimeFactSnapshot`：协议 1、Session、cursor、`consistency: "overlap"` 和执行摘要（Turn、状态、执行可信度、lastSeq、结果、等待及交互身份/状态）。先读取 transcript 游标再查询既有执行视图，随后从该游标续读允许重复，不能假定跨 Store 原子快照。未知仍为 unconfirmed，Snapshot 不制造历史事件；审批/问题决定以执行视图核对的持久 Store 为准。
+
+`RuntimeFact` 包含 `protocol: 1`、`source: "core"`、eventId、sessionId、turnId、sequence、timestamp、eventType、payload；eventId 为原 `[sessionId, turnId, seq]` 的 JSON 编码，sequence 只在同一 Turn 内排序。生命周期、工具、审批请求、问题和 Inbox 事件沿原名称；payload 只含适用 callId/requestId/approvalId/inputId/status。不带正文、工具名称/输入/输出、checkpoint、凭据或错误原文。`projectRuntimeFact(envelope)` 供受信 EventSink 投影实时提示，非目录事件返回 null；持久续读是恢复依据，回调不构成消费确认。
+
+```ts
+const page = await runtime.facts.read({ sessionId, limit: 100 });
+const snapshot = await runtime.facts.snapshot({ sessionId });
+// 宿主先持久消费 page，再保存对应 cursor；Snapshot 只校准状态。
+```
 
 ### 2.1.1 会话协作基础：`runtime.threads`
 
 恢复示例：`await boundThreads.resume({ protocolVersion: 1, groupId, requestId, threadId, expectedTurnId })`。受信宿主使用该 API 时必须已有显式恢复授权；模型只能经 `resume_thread` 的逐次审批入口。`read_thread.thread.relativeLink` 提供实际目标入口，`messages[].deliveryReason` 仅投影当前交付的安全阻塞枚举；用户指定子会话执行预览时必须显式向该目标 send，服务/审批/预览归属不能转移到主会话。
 
-`runtime.threads.bind(context)` 只供受信宿主调用。`context` 包含 `workspaceId`、由真实状态根确定的不透明 `stateRootId`、`projectId`、可信 `actor`、人类已授权且由宿主收窄的 `allowedTools`、合法 `modelCatalog` 与可选的 `hostOnline`。不得从模型参数或不可信请求直接构造此上下文。`actor` 为 `{ kind: "human", principalId }` 或 `{ kind: "thread", threadId, turnId }`，通信动作要求组内成员与活动 Turn；创建无组范围要求精确的 Session.activeTurnId 与真实 running Turn。宿主仍须先验证 Work Trust；共享板和消息不会形成审批。`hostOnline` 只由宿主按“本进程是否已接管驱动”填写，缺省表示未知，不据此猜测离线。
+`runtime.threads.bind(context)` 只供受信宿主调用；根入口的 `createThreadFacade(ports: RuntimePorts, context: ThreadHostContext): ThreadFacade` 提供相同的独立装配入口（例如 `const threads = createThreadFacade(ports, context)`），沿用同一身份、Trust 和授权要求。`context` 包含 `workspaceId`、由真实状态根确定的不透明 `stateRootId`、`projectId`、可信 `actor`、人类已授权且由宿主收窄的 `allowedTools`、合法 `modelCatalog` 与可选的 `hostOnline`。不得从模型参数或不可信请求直接构造此上下文。`actor` 为 `{ kind: "human", principalId }` 或 `{ kind: "thread", threadId, turnId }`，通信动作要求组内成员与活动 Turn；创建无组范围要求精确的 Session.activeTurnId 与真实 running Turn。宿主仍须先验证 Work Trust；共享板和消息不会形成审批。`hostOnline` 只由宿主按“本进程是否已接管驱动”填写，缺省表示未知，不据此猜测离线。
 
 模型工具的 create/list/read/send/wait/state/progress/interrupt 支持可选 groupId；服务端按本次 Actor 和目标共同授权范围解析，无匹配拒绝、多个匹配要求显式选择，不缓存上次组。已有目标仅由人类 associate 加入，来源不授予权限。
 
-普通 Work Turn 在受信宿主和当前 Project 范围内装配协作工具，不以创建来源或旧组启用决定普通会话能力。首次 create 可在唯一启用组复用，或由可信自身活动 Turn 按需创建新范围；已停用组不自动复活。多个启用组时拒绝歧义。新会话工具不采用协作组的持久目录上限；显式工具限制、Trust 和宿主限制仍有效。`FrozenRunConfig.threadsEnabled` 记录开始时的协作装配，恢复缺失/false 不追加工具，原 capabilityCeiling 继续取交集。 Work 审批/暂停恢复时重新取得受信宿主动态协作能力，保留原先可用的 wait_threads/read_progress/report_progress；主模型和权限仍使用冻结配置。当前 Node 目标状态与协作游标格式为 8；旧根明确拒绝，不迁移或回填。任务进展保留会话累计 progressSeq，同时新增每 task 单调 taskProgressSeq；task 查询使用独立序号并仅合并同任务/Turn 的相邻普通摘要，容量仍按每 Session 32 条保留，淘汰计数不补正文。任务 pendingProgress 含该任务已淘汰条目，会话累计计数保持原语义。run 当前在 ThreadDelivery pending/blocked 排队，目标空闲后逐条独立 Turn；若存在 inputId，以 durable Inbox consumed.turnId 为准，未消费不视为已执行。
+普通 Work Turn 在受信宿主和当前 Project 范围内装配协作工具，不以创建来源或旧组启用决定普通会话能力。首次 create 可在唯一启用组复用，或由可信自身活动 Turn 按需创建新范围；已停用组不自动复活。多个启用组时拒绝歧义。新会话工具不采用协作组的持久目录上限；显式工具限制、Trust 和宿主限制仍有效。`FrozenRunConfig.threadsEnabled` 记录开始时的协作装配，恢复缺失/false 不追加工具，原 capabilityCeiling 继续取交集。 Work 审批/暂停恢复时重新取得受信宿主动态协作能力，保留原先可用的 wait_threads/read_progress/report_progress；主模型仍冻结，权限仅在安全恢复边界采用受信人类修订。当前 Node durable schema 为 8；已知旧根在 Trust 后经 `initializeNodeStateRoot()` 逐级迁移，普通协作查询不迁移或回填。旧游标不自动改写，仍须匹配当前状态根与视图。任务进展保留会话累计 progressSeq，同时新增每 task 单调 taskProgressSeq；task 查询使用独立序号并仅合并同任务/Turn 的相邻普通摘要，容量仍按每 Session 32 条保留，淘汰计数不补正文。任务 pendingProgress 含该任务已淘汰条目，会话累计计数保持原语义。run 当前在 ThreadDelivery pending/blocked 排队，目标空闲后逐条独立 Turn；若存在 inputId，以 durable Inbox consumed.turnId 为准，未消费不视为已执行。
 
 
 ```ts
@@ -303,6 +323,8 @@ Turn 装配侧按会话收窄：当前工作区启用组成员可使用协作工
 
 `InputInbox` 输入新增可选 `origin`（`{ kind: "human", principalId? }` 或 `{ kind: "thread", threadId, turnId? }`）：由受信宿主填写，Kernel 注入时以“来自协作会话”标注呈现，仍走 user 载体但不产生人类批准。同一 `clientMessageId` 重投时正文或来源不同会抛 `INBOX_INPUT_CONFLICT`，不得覆盖已投递内容。
 
+旧缺省目标的completed绑定在原Session短锁内使用既有lease acquire/release保护，组revision CAS仍是领取/绑定竞争的提交边界。最新Turn、checkpoint、终态投影必须共同确认同一completed身份，Session为idle/completed且无activeTurnId，checkpoint无pendingCalls/pendingUserQuestion，控制无claimed/executing。新鲜owner阻止绑定。已知档位冲突继续拒绝，模型actor不具备入口。此动作只选择之后新Turn的执行宿主，原Turn、冻结配置、答案/决定及结果保留。Work start在取得lease后再次校验档位，准备期间迟到的旧Runtime无法越过人类绑定，拒绝时释放lease且不创建伪Turn。
+
 ### 2.1.3 Agent 协作工具：`create_thread` 等 11 个内置工具
 
 受信 Work 宿主在 `createAgentRuntime({ defaultRunConfig: { threads } })` 注入 `ThreadsCapability`（`{ workspaceId, stateRootId, projectId, allowedTools, modelCatalog, executionHost?, humanPrincipalId?, allowRootGroupBootstrap?, onThreadCreated?, handoff? }`；`humanPrincipalId` 是根组的人类管理 owner，`onThreadCreated` 是子会话创建后的进程内唤醒回调，`handoff` 是宿主注入的交接写入 Port。能力只存在于进程内，不写入 `FrozenRunConfig`、Session 或公开 DTO）。`createThreadsToolBinding`只在受信executionHost为web-work-v1时派生可选presentationHost=web供模型协作展示指引使用，缺省宿主的指引保持原契约。Turn 层 `runConfig` 不能注入或替换它。Runtime 在每个 Work Turn 用当前 `sessionId`/`turnId` 绑定 `{ kind: "thread", threadId, turnId }` 作为 actor；Chat 即使收到该能力也不注册工具。缺少绑定能力的 Work Turn 与现有产品一致，不出现协作工具。
@@ -318,12 +340,12 @@ Turn 装配侧按会话收窄：当前工作区启用组成员可使用协作工
 | `wait_threads` | `targets[]`、`timeoutMs` | 只观察 1–8 个目标，`timeoutMs` 0–30000；返回 `results[].reason`（snapshot/changed/progress/attention/terminal/timeout/aborted）、`pendingProgress` 计数与每目标游标。只有新摘要时返回 `progress`，父会话据此用 `read_progress` 读差量；等待结果不含摘要正文。不启动、不恢复、不取消目标。 |
 | `read_shared_state` | 无（省略 arguments 按空对象处理） | 返回共享板 `value / revision / updatedAt / updatedBy`；不自动注入其他会话上下文。 |
 | `update_shared_state` | `expectedRevision`、`operations[]`（set/remove） | CAS 更新，冲突返回 `THREAD_STATE_CONFLICT`；不自动合并，也不启动会话。 |
-| `report_progress` | `kind`、`summary`（≤600 字符）、`evidence?: { turnId?, messageId? }` | 向父会话回报一条有界进展摘要，来源固定为当前会话；返回 `{ progressSeq }`。`progress` 是可合并、可在容量压力下淘汰的普通进度，`milestone/blocked/completed/failed` 逐条保留。不启动、不恢复会话，也不代替 `send_thread` 的显式通信。 |
-| `read_progress` | `threadId`、`cursor?`、`limit?`、`kinds?` | 只返回有界摘要页，不含子会话历史、工具调用或原始输出；连续普通进度已合并（`mergedCount` 记条数），`compacted` 说明游标之前被淘汰的普通进度条数。游标只能原样回传同一目标，重复回传不重复返回。需要消息或历史时改用 `read_thread`。 |
+| `report_progress` | `kind`、`summary`（≤600 字符，服务层另限 2048 字节）、`evidence?: { turnId?, messageId? }` | 为当前真实 run 任务写入进展，来源固定为当前会话和 Turn；无唯一任务归属时拒绝。返回 `{ progressSeq, taskId, taskProgressSeq }`。`progress` 是可合并、可在容量压力下淘汰的普通进度，`milestone/blocked/completed/failed` 逐条保留。不启动、不恢复会话，也不代替 `send_thread` 的显式通信。 |
+| `read_progress` | `threadId`、`taskId?`、`cursor?`、`limit?`、`kinds?` | 只返回有界摘要页，不含子会话历史、工具调用或原始输出；连续普通进度已合并（`mergedCount` 记条数），`compacted` 说明游标之前被淘汰的普通进度条数。游标只能原样回传同一目标，重复回传不重复返回。需要消息或历史时改用 `read_thread`。 |
 | `interrupt_thread` | `threadId`、`expectedTurnId` | 返回 `{ accepted, controlId, hostOffline }`；只持久化给实际 owner，接受不代表已停止，实际结束以 Turn 状态为准；审批/用户输入等待的目标同样可以中断，收尾由持有执行的宿主完成。 |
 | `resume_thread` | `groupId?`、`threadId`、`expectedTurnId` | 所有权限模式均需要本次 `allow_once/deny` 人类确认；审批约束冻结目标 checkpoint，不能跨到后来一次暂停。返回 `{ accepted, controlId, recoveryAction? }`；只恢复原轮，不把 `run` 变为恢复。重复请求不积压任务，等待审批/回答仍在目标处理。 |
 
-工具事实与权限：读类工具 `effect: "none"`、`risk: "read_only"`；普通协作状态变更沿用组授权。`send_thread` 携带 handoff 时属于工作区文件写入，受既有写入能力上限、Skill、只读沙箱、宿主保护域与统一审批策略约束；组授权不代替文件写权限。`ThreadService` 每次调用重新校验组成员、工作区、Project 与目标成员；已接受的交接重试沿用原快照，不因文件变化或缺失而改写消息。`groupId`、父会话、`requestId` 与 actor 都由绑定提供：`requestId` 由稳定 `toolCallId` 派生（`sha256([toolName, callId])`），因此同一调用重试不会重复创建会话或投递消息；模型不能自报可信身份。
+工具事实与权限：读类工具 `effect: "none"`、`risk: "read_only"`；普通协作状态变更沿用组授权。`send_thread` 携带 handoff 时属于工作区文件写入，受既有写入能力上限、Skill、只读沙箱、宿主保护域与统一审批策略约束；组授权不代替文件写权限。`ThreadService` 每次调用重新校验组成员、工作区、Project 与目标成员；已接受的交接重试沿用原快照，不因文件变化或缺失而改写消息。所有协作工具均接受可选 `groupId`，仅用于选择已有授权组；父会话、`requestId` 与 actor 由绑定提供：`requestId` 由稳定 `toolCallId` 派生（`sha256([toolName, callId])`），因此同一调用重试不会重复创建会话或投递消息；模型不能自报可信身份。
 
 `attention`仅表示需要关注，不能等同审批。等待summary的可选`attentionKind`为`approval | user_input | continuation_failed | continuation_pending | execution_unconfirmed | execution_lost | interaction_unconfirmed`，仍由现有execution/waiting/interaction事实派生；只有waiting=approval且interactionState=pending才提示审批。系统协作提示与工具定义遵守相同约定，未知或失联不能引导Ctrl+A审批或主动恢复。`unconfirmedReason`只含`snapshot_changed | checkpoint_missing | lease_mismatch | turn_summary_lag | boundary_unconfirmed`，不导出私有lease/路径/正文。
 
@@ -336,11 +358,17 @@ Turn 装配侧按会话收窄：当前工作区启用组成员可使用协作工
 持续观察的pendingProgress通过既有read_progress按独立游标消费，不搬目标历史。目标成功Todo真实列表转换自动用report_progress发布有界累计阶段事实，真正进入审批/问答发布blocked；记录仍受当前task/组权限约束，Todo自报完成不等于执行终态。语义阶段、最终结论仍可由模型主动report_progress补充。用户插话会唤醒当前等待并交模型理解；模型用followUntilTerminal=false、timeoutMs=0撤销给定精确task观察，用可选reportingInstructions（1–1024字）明确更新任意汇报约定。Core不识别关键词或固定汇报模式，只按字段更新并将有界文本原样加来源标注后向仍运行的精确目标Turn投递steer，暂停时保留待投递，失败返回工具事实。模型默认不得自行增加中途静默；实际自然语言语义和报告文字仍由模型承担，未保证任意表述的主体识别。
 
 
-组解析：绑定在当前 Turn 首次调用时扫描已持久化组，只接受唯一一个同时满足“已启用、工作区/Project 匹配、成员包含当前会话”的组；无匹配或匹配多于一个返回 `THREAD_SCOPE_DENIED`，不做猜测。同一 Turn 内缓存该组标识，但每次操作仍由 `ThreadService` 重新授权，组停用或成员移除立即失效。协作错误码原样进入工具错误；未知存储异常统一返回 `THREADS_UNAVAILABLE` / `TOOL_EXECUTION_FAILED`，不透传路径或原始异常正文。
+组解析：每次调用按可信 actor、显式可选 `groupId` 与本次目标重新解析共同授权范围，不缓存上次组。无匹配时拒绝（无组的 `list_threads` 返回空列表），多组歧义要求显式选择；读类操作可读取已停用组，写入与等待仍须启用。组停用或成员变化立即参与下一次校验。协作错误码原样进入工具错误；未知存储异常统一返回 `THREADS_UNAVAILABLE` / `TOOL_EXECUTION_FAILED`，不透传路径或原始异常正文。
 
 协作工具可用时，Runtime 同时向模型注入一段协作使用约定（`agent-runtime.ts` 的 `getThreadWorkflowInstructions`）：派工把汇报要求写进任务正文、普通进度与 `milestone/blocked/completed/failed` 的区别、两种游标分开维护且进度读取不退回 `read_thread`；`reason=attention` 表示目标正等待审批或用户回答，是暂停而非结束，除用户要求介入外应继续等待至 `terminal`，不提前收尾也不替目标提交审批。该约定只在注册协作工具的 Work Turn 出现，Chat 与未绑定能力的 Work 不注入；它只是使用说明，不改变上面任何工具语义，也不设固定汇报档位。
 
-子会话的工具目录取“组授权工具 ∩ 宿主允许工具”，因此宿主建组时必须把需要的协作工具名纳入授权列表，子会话才能回读、回报或更新共享板；子会话权限模式固定为 `ask`，不继承父 Turn 的一次性批准。展示层只消费 `ToolDisplayFacts`（`titleKey: tool.thread.read.completed | tool.thread.write.completed`、不透明 `target`、动作摘要），不展示消息全文、共享板原始 JSON、审批内容或宿主路径。
+普通新 Work Turn 不以组持久目录限制工具，实际目录仍受当前受信宿主、显式能力上限与 Skill 限制。新子会话冻结并复制发起会话已选权限偏好，缺省回退精确发起 Turn、再回退 Project；不固定为 `ask`，也不复制一次性批准、Trust 或具体授权。旧有显式协作能力上限仍取交集。展示层只消费 `ToolDisplayFacts`（`titleKey: tool.thread.read.completed | tool.thread.write.completed`、不透明 `target`、动作摘要），不展示消息全文、共享板原始 JSON、审批内容或宿主路径。
+
+#### 内部汇报约定与普通协作输入
+- `ToolExecutionOptions.reportingAgreement?: {taskId: string; explicit: boolean}` 是 Kernel 发起内部 send_thread 时的受信执行元数据，经过原 Executor 验证/Policy 后仅交给该工具；不在模型 Schema 内，不能由工具参数生成。`AgentThreadsCapability.send` 可由该受信路径携带同名字段，绑定层复用 ThreadService.send；公开 ThreadFacade.send 拒绝 reportingAgreement/purpose。
+- ThreadService 在原组 CAS/messageIntents 中按来源会话、目标 task 和最新有效约定去重，task 必须映射精确 expectedTurnId。相同约定复用原 message/request/delivery 身份；未提交意图失败后沿原身份重试。内容真实变更（包括改回曾用内容）产生新意图；默认约定沿用已有值，跨父 Turn 不无故覆盖。Kernel 仅在成功接受后清 agreementPending，重复 wait 与 checkpoint 恢复不重设同值 pending。
+- 可选 `ThreadMessage.purpose = {kind: "reporting_agreement", taskId}` 沿原桥接投影为 `InboxOrigin` thread 分支的可选 `purpose: "reporting_agreement"`；旧记录缺省兼容，不升级 schema。内部约定以有明确来源的上下文进入模型，不作为人类写入需求重置写入意图/工具护栏；input_joined/input_consumed 与原投递审计保留。
+- 普通用户需求沿原 send 身份幂等，两个不同来源请求即使正文完全相同也分别接受、投递；不做全局文本去重/限流，不新增提醒调度器。
 
 ### 2.2 Project 服务：`runtime.projects`
 
@@ -356,7 +384,7 @@ Turn 装配侧按会话收窄：当前工作区启用组成员可使用协作工
 
 ### 2.3 Job 服务：`runtime.jobs`
 
-Job 启动、停止与恢复契约：`StartJobInput.signal?: AbortSignal` 只约束启动交付，交付前取消会清理半启动进程，成功返回后 Turn 取消不再停止 Job。`StartJobInput.sandbox` 为必填判别联合：沙箱形态 `{ execution?: "sandboxed", port: SandboxPort, policy: SandboxPolicy }`，宿主执行形态 `{ execution: "host", policy: SandboxPolicy }`（无 port，用于 Windows 停用进程沙箱的装配），必须携带 ToolExecutor 已解析确认的冻结执行范围；缺失时 `start` 以 `SANDBOX_UNAVAILABLE` fail-closed 拒绝，不创建 Job 记录、不启动进程。沙箱形态的启动顺序固定为受信命令解析（`resolveManagedCommand`，Windows npm/npx/pnpm 固定受信 CLI 与 realpath containment）→ `SandboxPort.prepare` → spawn，prepare 抛出的 `SandboxPortError`（稳定 `SANDBOX_*` 码）原样透出；宿主形态复用同一受信命令解析后直接 spawn，不经 `prepare`，子进程即目标本身。沙箱执行资源与 Job 终态绑定：spawn 失败与真实终态（进程 close 后终态化，含 kill/shutdown 路径）都幂等 `release(executionId)`，不依赖存储写入成功。scoped get/read/stop 先验证记录归属，再执行 owner 恢复；poll 与 get 使用同一恢复逻辑。沙箱形态停止必须获得私有执行能力的 `container_empty` 证据和包装 close，taskkill 成功本身不能认证容器为空，缺能力、超时或失败保持 stopping；宿主形态不使用控制协议，停止以 `terminateManagedProcessTree` 加 close 观察为实际证据。持久摘要 `JobSandboxSummary` 在宿主形态标记 `execution: "host"`（digest 仍为冻结范围的真实计算），`JobExecutionFacts.phase` 相应使用 `host_running` / `host_spawn_failed`。
+Job 启动、停止与恢复契约：`StartJobInput.signal?: AbortSignal` 只约束启动交付，交付前取消会清理半启动进程，成功返回后 Turn 取消不再停止 Job。`StartJobInput.sandbox` 为必填判别联合：沙箱形态 `{ execution?: "sandboxed", port: SandboxPort, policy: SandboxPolicy }`，宿主执行形态 `{ execution: "host", policy: SandboxPolicy }`（无 port，用于 Windows 停用进程沙箱的装配），必须携带 ToolExecutor 已解析确认的冻结执行范围；缺失时 `start` 以 `SANDBOX_UNAVAILABLE` fail-closed 拒绝，不创建 Job 记录、不启动进程。沙箱形态的启动顺序固定为受信命令解析（`resolveManagedCommand`，Windows npm/npx/pnpm 固定受信 CLI 与 realpath containment）→ `SandboxPort.prepare` → spawn，prepare 抛出的 `SandboxPortError`（稳定 `SANDBOX_*` 码）原样透出；宿主形态复用同一受信命令解析后直接 spawn，不经 `prepare`，子进程即目标本身。沙箱执行资源与 Job 终态绑定：spawn 失败与真实终态（进程 close 后终态化，含 kill/shutdown 路径）都幂等 `release(executionId)`，不依赖存储写入成功。scoped get/read/stop 先验证记录归属，再执行 owner 恢复；poll 与 get 使用同一恢复逻辑。沙箱形态停止必须获得私有执行能力的 `container_empty` 证据和包装 close，taskkill 成功本身不能认证容器为空，缺能力、超时或失败保持 stopping；宿主形态不使用控制协议，停止以 `terminateManagedProcessTree` 加 close 观察为实际证据。持久摘要 `Job.sandbox` 在宿主形态标记 `execution: "host"`（digest 仍为冻结范围的真实计算），`JobExecutionFacts.phase` 相应使用 `host_running` / `host_spawn_failed`。
 
 `JobListView.totalCount?: number` 与 `activeCount?: number` 为当前绑定 Session 全量计数，不受本页 limit 影响；活动包括 starting/running/stopping。安全输出的 stdout/stderr cursor 使用独立代次，不能互换。超长敏感记录丢弃至该记录换行；启动环境中敏感键对应的已知值纳入脱敏，不向宿主返回这些值。
 
@@ -370,9 +398,17 @@ Job 启动、停止与恢复契约：`StartJobInput.signal?: AbortSignal` 只约
 | `list` / `get` | `(workspaceId) => Promise<Job[]>` / `(id) => Promise<Job \| null>` | 读取 durable Job 元数据。 |
 | `forSession` | `({ workspaceId, sessionId }) => SessionJobService` | 创建已绑定当前 Work Session 的安全管理视图；新 Agent/宿主必须使用该入口，不把底层 `Job` 私有字段作为 DTO。 |
 
-Job 绑定 workspace 与 Session，不支持 PTY、detach 或跨进程重新附着。新记录固定 `jobRecordVersion:2`，带私有 owner `{runtimeInstanceId, hostProcessId}`、从 0 单调增长的 `revision` 和终态 `finishedAt`。新记录随存安全沙箱摘要 `Job.sandbox?: JobSandboxSummary`（`{ mode, policyDigest, policyVersion, execution?: "host" }`，与 `FrozenRunConfig` 同源摘要算法；`execution` 缺省视为沙箱，`"host"` 表示宿主直接执行且摘要仍是真实计算的冻结范围）：只含模式与冻结 policy 摘要，不含代理 env、完整 deny 路径明细、沙箱执行句柄或命令派生敏感数据；旧 v2 记录缺省该字段不参与恢复判定。只有原 Runtime 的内存句柄是可停止的正证据；其他存活 owner 返回 `JOB_OWNER_UNAVAILABLE`，无法确认或旧无 owner 记录返回 `JOB_OWNER_UNKNOWN`。只有 owner 明确死亡时，Core 才用 owner+revision 条件写恢复为 `interrupted`；PID 存活本身不证明 Runtime 身份。
+Job 绑定 workspace 与 Session，不支持 PTY、detach 或跨进程重新附着。新记录固定 `jobRecordVersion:2`，带私有 owner `{runtimeInstanceId, hostProcessId}`、从 0 单调增长的 `revision` 和终态 `finishedAt`。新记录随存安全沙箱摘要 `Job.sandbox`（类型可用 `NonNullable<Job["sandbox"]>` 引用）（`{ mode, policyDigest, policyVersion, execution?: "host" }`，与 `FrozenRunConfig` 同源摘要算法；`execution` 缺省视为沙箱，`"host"` 表示宿主直接执行且摘要仍是真实计算的冻结范围）：只含模式与冻结 policy 摘要，不含代理 env、完整 deny 路径明细、沙箱执行句柄或命令派生敏感数据；旧 v2 记录缺省该字段不参与恢复判定。只有原 Runtime 的内存句柄是可停止的正证据；其他存活 owner 返回 `JOB_OWNER_UNAVAILABLE`，无法确认或旧无 owner 记录返回 `JOB_OWNER_UNKNOWN`。只有 owner 明确死亡时，Core 才用 owner+revision 条件写恢复为 `interrupted`；PID 存活本身不证明 Runtime 身份。
 
 默认入口还导出常量 `JOB_RECORD_VERSION`，当前值为 `2`，表示 durable Job 记录格式版本；宿主不应把它当作运行中的 Job 状态。
+
+服务地址辅助函数均为纯解析，不探测监听或授予预览权限：
+
+| API | 签名 | 契约与示例 |
+|---|---|---|
+| `normalizeJobServiceUrl` | `(value: string) => string \| undefined` | 仅接受 loopback HTTP(S) 根 origin，无 userinfo/query/fragment；补全实际端口。例：`normalizeJobServiceUrl("http://localhost")` 返回 `"http://localhost:80"`，非法值为 `undefined`。 |
+| `jobServicePort` | `(serviceUrl: string) => number \| undefined` | 复用相同校验，返回有效端口；`jobServicePort("http://127.0.0.1:3000")` 为 `3000`。 |
+| `sameServiceOrigin` | `(left: string, right: string) => boolean` | 协议、端口必须一致；localhost/127.0.0.1/IPv6 回环互为别名。例：`sameServiceOrigin("http://localhost:3000", "http://127.0.0.1:3000")` 为 `true`。 |
 
 Job 启动登记与 Session 删除共用 Session 锁。`starting/running/stopping` 以及 owner 不明的旧活动记录都会以 `SESSION_HAS_ACTIVE_JOBS` 阻断删除。spawn 成功事件到达后才进入 `running`；spawn 失败或 spawn 后首次状态转换保存失败会清理半启动进程并留下失败记录。输出变化最多每秒合并保存一次，终态强制 flush。Windows 后台 `npm/npx` 由 Core 解析为当前 Node 安装旁的固定 CLI JS，并继续使用 `shell:false`；记录与 Policy 仍使用调用方原始的逻辑 program/argv。
 
@@ -456,7 +492,17 @@ interface UndoResult {
 
 `FileMutation`、`PrepareFileMutationInput`、`UndoTransaction` 与 `FileMutationStore` 是默认入口导出的 Adapter 契约，用于实现私有 WAL/blob/journal；普通宿主不得直接创建 mutation、读取 blob 或绕过 `runtime.undo`。生产 Port 必须提供持久化实现；`createMemoryPorts()` 内置的 `MemoryFileMutationStore` 只用于无持久化的进程内场景。
 
+具备 mutation store 的 `write_file` 和 `edit_file` 在替换文件前先持久化 `prepared` 记录及前后字节的 SHA，并在替换后读取原始字节核验结果。工具异常仍向调用方报告失败，能确认落盘字节等于预期时记录 `applied`，其他可收敛结果记为 `failed`。遗留的 `prepared` 记录在 Undo 服务读取时根据实际 SHA 收敛。上述步骤只记录写入事实，工具失败或 Turn 失败均不触发文件回退。
+
+文件恢复由宿主经 `runtime.undo` 发起。宿主先获取 preview，再取得用户确认并调用 `execute({ sessionId, confirmed: true })`。模型工具集不暴露此能力。Undo 自身使用独立事务日志和 staging，部分执行失败或重启后按事务与实际字节尝试补偿，回到该次 Undo 开始前的状态。
+
 `FileMutationStore.withWorkspaceLock(workspaceRoot, operation, canonicalTargets?)` 在 workspace 临界区内，对传入的 canonical 绝对目标去重并按固定顺序取锁；生产实现必须让同一 OS 用户、不同 workspace/stateRoot 的同目标共享锁域。write/edit 与 Undo/recovery 传入实际目标，取得锁后重验身份与 SHA。Node 使用 OS 用户 home 下固定 `.autopilot/file-mutation-locks`，不从 HOME/TEMP 或各 workspace 配置选锁域；活 owner 不因锁年龄被抢占，等待超时不进入临界区。Memory 实现仅保证同进程实例互斥。
+
+#### 写后验证可恢复边界
+
+`write_file` / `edit_file` 在有 WAL 和无 mutation store 的 headless 路径都读取实际落盘原始字节并核对预期 hash，只有校验成功才返回 `diskVerified: true` 并满足物理写入完成条件；保存/落盘/校验失败不返回伪成功。模型仍需按任务复杂度审阅差异、按需读回和执行定向验证；物理确认不能替代业务或运行正确性。
+
+默认完成策略依据真实 changedPaths/verifiedPaths，兼容旧 checkpoint 的未验证路径；一次有限提醒仍未读回时以 interrupted_recoverable/write_verification 暂停，不强制完成。Continue 保留原 Turn、canonical messages、真实写入与 completedCallIds；该恢复段仅暴露/允许 read_file 与最终总结，Skill 限制仍取交集。回读绑定固定版本并累计本次验证段已返回的完整行范围，写前观察范围不能充作写后验证，任意一行不能验证整个文件；旧缺版本快照由首次真实读回固定版本。版本失配不会标记已验证。私有 `verificationTargets` 与 `mutationGate.verificationOnly` 随安全批次 checkpoint 保留，拒绝重复写入不会走 completed 捷径。其他 failed 仍不可 Continue，不改旧 failed 记录或真实文件。
 
 ### 2.5 Session 服务：`runtime.sessions`
 
@@ -481,7 +527,7 @@ await runtime.sessions.rename(session.id, "README 修订");
 | `save` | `(session: Session) => Promise<void>` | 只保存既有 Session；更新 `updatedAt`，拒绝修改产品、检索模式及已有 Project 归属。 |
 | `setDefaultRunConfig` | `(id, runConfig) => Promise<Session>` | 写入 Session 级默认配置。 |
 | `rename` | `(id, title) => Promise<Session>` | 标题会 `trim`；空值或超过 200 字符抛 `SESSION_TITLE_INVALID`。 |
-| `delete` | `(id) => Promise<boolean>` | 活动 Turn 存在时抛 `TURN_ALREADY_RUNNING`；否则先清理 Session-owned 宿主资源，再清理 lease、inbox、approval、checkpoint、transcript、turn、Job、文件 mutation 和 session。 |
+| `delete` | `(id) => Promise<boolean>` | 协作组仍引用该 Session 时先抛 `THREAD_HAS_PENDING_WORK`；存在 `running` / `waiting_approval` / `waiting_user_input` Turn 时抛 `TURN_ALREADY_RUNNING`，活动 Job 抛 `SESSION_HAS_ACTIVE_JOBS`。通过检查后，先清理宿主资源，再清理 lease、inbox、approval、checkpoint、transcript、Turn、Job、mutation、用户问题及 Session；不存在返回 `false`。 |
 
 `SessionStore.getDirectoryEntry?(id)`返回轻量身份/标题/活动事实，不包含presentation或checkpoint；Node以固定分片流式校验JSON并跳过消息，不解析或保留正文，允许扫描结构字节而不承诺零正文磁盘读取。目录不会初始化/迁移/写入状态，损坏结构、缺少产品身份与ID不匹配仍拒绝。Thread成员标题优先复用此能力，未实现该可选能力的外部Store保持既有get兼容路径；CLI本地目录不走重型fallback。没有新增durable schema版本。
 
@@ -500,11 +546,23 @@ const chat = await runtime.sessions.create({
 
 `CreateSessionInput` 接受 `id?`、`productMode?`、`chatRetrievalMode?`、`projectId?`、`persistenceMode?`、`title?`、`defaultRunConfig?`。显式 `work` 必须提供当前宿主工作区对应的有效 Project；`chat` 必须提供合法的检索模式且不能带 `projectId`，创建 Chat 不访问 WorkspaceAdapter。持久化 Session 从创建起冻结模式；未持久化的草稿由宿主管理。新旧调用均不能用已有 `id` 覆盖 Session。
 
-兼容既有 Work 调用方时，省略 `productMode` 默认写入 `work`；同时缺少 `projectId` 时，仅通过注入的 WorkspaceAdapter 解析当前工作区并复用/创建其 Project，不读取 cwd 猜测工作区。旧持久化记录缺少模式时在 Core 兼容读取边界按 Work 处理，不在读取期间落盘迁移；非法字段组合抛 `SESSION_MODE_MISMATCH`，错误工作区 Project 抛 `WORKSPACE_REQUIRED`。`save()` 修改合法 Chat 检索模式抛 `CHAT_RETRIEVAL_MODE_LOCKED`，修改产品/归属或移除已写模式抛 `SESSION_MODE_MISMATCH`。创建和查询返回副本，不能通过对象别名修改 Store 中的身份。新 Work Session 由 Core 写入只读 `workContextVersion: 1`，调用方不能通过 `save()` 给旧记录补写或移除此来源版本。
+受信宿主可额外传 `managedExecution: { hostId, requestId, threadPolicy: "disabled" }` 创建普通受管 Work Session。hostId/requestId 为 1—128 位字母、数字、下划线或连字符；禁止同时传 id、Chat 或 ephemeral。Core 对 `[hostId, requestId]` 求 SHA-256 作为稳定 Session ID，并在既有 Session 锁内幂等创建；重复请求复用原身份，不更新标题/默认配置，显式 Project 冲突拒绝。该字段不是浏览器/模型 DTO，不授予 Run 归属或派工资格。`save` 与 Node Store 均拒绝改变/移除受管身份；start/continue 按持久身份关闭 Thread 工具，Thread 服务同时拒绝受管 actor、enable root 与 associate 目标。切换视图、人工接管或新 Runtime 不解除限制；独立自由 Session 保持原能力。此兼容字段不提升 durable schema。
+
+```ts
+const managed = await runtime.sessions.create({
+  managedExecution: { hostId: "desktop-host", requestId: "create-worker-1", threadPolicy: "disabled" },
+});
+```
+
+Node 受管宿主可调用 `withNodeRuntimeOwner<T>(stateRoot, operation: () => Promise<T>): Promise<T>`（从 `@autopilot-agent/adapters` 导入），在整个 operation 期间持有既有跨进程文件锁。stateRoot 只由受信 bootstrap 提供；已存活或无法确认退出的 PID 不回收，竞争超时明确失败，operation 结束释放。不等于 Checkout 写资源锁，也不授予恢复旧执行的权限。例如 `await withNodeRuntimeOwner(stateRoot, async function serve() { await stopped; });`；`stopped` 应只在宿主停止且执行清理结束后完成。
+
+兼容既有 Work 调用方时，省略 `productMode` 默认写入 `work`；同时缺少 `projectId` 时，仅通过注入的 WorkspaceAdapter 解析当前工作区并复用/创建其 Project，不读取 cwd 猜测工作区。当前格式记录缺少产品模式时，Core 与 Node Store 均拒绝；已知旧格式只能在 Trust 后的状态根初始化中迁移，不在普通读取期间落盘迁移；非法字段组合抛 `SESSION_MODE_MISMATCH`，错误工作区 Project 抛 `WORKSPACE_REQUIRED`。`save()` 修改合法 Chat 检索模式抛 `CHAT_RETRIEVAL_MODE_LOCKED`，修改产品/归属或移除已写模式抛 `SESSION_MODE_MISMATCH`。创建和查询返回副本，不能通过对象别名修改 Store 中的身份。新 Work Session 由 Core 写入只读 `workContextVersion: 1`，调用方不能通过 `save()` 给旧记录补写或移除此来源版本。
 
 `RuntimePorts.sessionResourceStore` 是默认入口导出的 `SessionResourceStore` 契约：宿主实现 `deleteBySession(sessionId)`，用来清理生命周期只属于该 Session 的外围资源。它必须幂等，且清理失败会中止删除，避免 Core 状态已删除而宿主附件遗留。Web 图片附件等资源必须通过该 Port 清理；CLI、Web 与 Desktop 不得各自绕过 `runtime.sessions.delete()`。
 
 Work 图片能力通过可选 `RuntimePorts.sessionImageStore` 读取当前工作区和 Session 内的规范化图片；缺失时图片读取失败。Node 宿主提供 `put` / `read`，读时复核身份及 SHA-256。`normalizeWorkImage` 接受最多 20 MiB、4000 万像素的 PNG/JPEG/WebP/GIF，发送副本宽高各不超过 2000、最多 3,932,160 字节和 5,242,880 个 Base64 字符；GIF 使用静态首帧。单条图片最多 10 张且副本合计最多 20 MiB。canonical / checkpoint 使用 ID、哈希与尺寸引用，采样时按冻结模型能力读取字节；受信目录将 DeepSeek v4 flash 与 `firstParty/deepseek-flash` 精确别名声明为图片输入，未知模型不推断支持。不支持图片时通过既有 `vision_analyze` 权限和审批链回退。
+
+`normalizeWorkImage({ bytes, mimeType?, signal? })` 返回 `Promise<{ bytes: Uint8Array; mimeType: "image/png" | "image/jpeg" | "image/webp" | "image/gif"; width: number; height: number; gifFirstFrame: boolean }>`；例如 `const normalized = await normalizeWorkImage({ bytes: uploadedBytes, signal });`。它检查魔数/尺寸并按需缩放或转码，非法输入、取消或无法满足发送上限时拒绝；不负责 Session 授权、存储或稳定 Runtime 错误码映射。`SessionImageStore.put({ sessionId, name, mimeType?, bytes })` 返回 `SessionImageRef`，`read({ sessionId, id })` 返回 `{ image: SessionImageRef, bytes: Uint8Array }`；宿主每次读写仍须验证归属与 hash。
 
 每次原生采样的图片 Base64 总量最多 28 MiB，其中工具图片最多 6 MiB，按实际 wire 出现次数计费。工具图片从最新结果向前保留，超出预算的旧图在请求中替换为明确省略提示；私有历史引用和附件文件不删除。用户上传图不因工具预算被省略；用户图总量超限时返回 `IMAGE_REQUEST_BUDGET_EXCEEDED` 并保留失败 checkpoint，提示压缩历史或减少图片。字节预算在编码前检查，属于本地资源保护值，不代替 Provider 自身限制。视觉回退每次仅读取下一个未完成图片，已成功分析的历史图不重复读取。
 
@@ -519,6 +577,16 @@ Work MCP 的标准 `content[].type="image"` 在工具序列化前交给同一 Se
 暂停/终态安全事件已写 transcript 后、EventSink/公开生成器消费前，执行协调器提交匹配checkpoint与Session/Turn摘要，停止心跳并释放原执行段。摘要失败明确向调用方抛出且独立尝试两份写入；已提交checkpoint保留有效请求，warning=summary_lag明确提示摘要滞后。旧流finally不重写已提交边界，不删除后继AbortController或释放不同owner。Runner已有Turn的流错误仍通知onError，delivered只确认运输结束，wait仍依据同一Core事实，未知状态返回attention。
 
 pending请求引用脱敏原approval_required信封；已有决定显示decided，过期显示expired，不再作为可提交卡。恢复视图的execution/interactionState/warning共用此投影；decided保留精确approvalId供正常continue复用已有决定。提交仍由Core核对当前执行段、Session/Turn/approval/call、受支持内建工具的冻结归一参数、允许范围、TTL与已有决定；显示不授予执行权限。
+
+#### 执行观察的增量读取与取消
+
+`readTurnExecutionView(ports, { sessionId, turnId?, signal? })` 与 `runtime.turns.getExecutionState` 接受受信进程内可选 AbortSignal。取消在各异步边界阻止后续读取与结果返回，分页返回后先检查取消再提交派生摘要。该参数只用于宿主调用。
+
+投影按原 Store 实例、Session、Turn 与字节游标保留当前执行段的 started、审批、终态及 thread_wait 边界，最多8个Session，每项最多1024条、2MiB。替换边界事件按实际保留字节计费。提交核对读取起点仍为当前摘要，迟到旧查询不会覆盖新的游标或执行段。lease、checkpoint代次、决定及control继续实时核对。游标过期只重建一次，旧超大/损坏事件沿getEvents原审计兼容规则回读，异常路径不缓存该摘要。
+
+Node Transcript分页使用原16KiB读取块中的多条完整行，游标保留文件身份并增加可选size/stamp，接受旧游标。替换、截断及同尺寸时间戳变化使新游标过期。getEvents保持相邻同字节信封去重与损坏行诊断，返回数据保持调用方隔离。追加索引同样核对文件身份与同尺寸变化。
+
+Node Checkpoint最新与历史Turn读取逐行异步审计完整JSONL，只保留目标最后记录，每条解析后让出事件循环。最新/历史副本共用8项、8MiB上限，写入清除该Session缓存，读取每次核对纳秒文件身份，返回独立副本。损坏行继续诊断且文件原样保留，底层流打开/中途错误会拒绝、关闭迭代器与流，并由原文件锁finally释放。Node Thread control解析副本另受8项、8MiB限制，实时文件身份变化/异常使缓存失效，CAS与外部更新仍以durable记录为准。
 
 #### 运行层级：Session > Turn > run > step
 
@@ -559,12 +627,12 @@ interface StartTurnInput {
 ```
 
 - `content` 与 `messages` 用于提供首轮输入；复杂宿主可传 `messages`，普通调用传 `content`。
-- 新 Turn 的会话基线取该 Session 最近一个可安全重建的终态 Turn（`completed`、`failed` 或 `interrupted`），要求 checkpoint 身份一致、消息可迁移且工具调用配对完整；失败/中断轮的原请求与已闭合工具事实会进入下一轮模型输入。配对不完整的记录被跳过并回退到更早可重建轮，不改写其 durable 数据，也不把失败轮改成可继续执行。
-- 新 Turn 冻结解析后的运行配置；优先级为单次 Turn > Session > Project > Runtime 默认值。
+- 新 Turn 的会话基线取该 Session 最近一个可安全重建的终态 Turn（`completed`、`failed` 或 `interrupted`）。身份一致且消息可迁移时，保留失败或中断轮的原请求及已闭合工具结果。中断轮尾部未闭合调用在新轮历史中以 `TOOL_OUTCOME_UNKNOWN` 配对，旧 checkpoint 保留原样。无法安全重建时回退到更早记录。
+- 新 Turn 冻结解析后的运行配置；模型、推理、凭据、权限及执行预算优先级为单次 Turn > Session > Project > Runtime 默认值。`workspaceRoot`、`compactPolicy` 与数据库策略只在 Turn / Runtime 层解析；Trust、沙箱与宿主能力另受可信来源限制。
 - 新 Turn 已写入但凭据/模型装配在首个 checkpoint 前失败时，保留原异常码（如 `MISSING_CREDENTIAL`），同时将 Turn 和 Session 收尾为 failed 并释放租约；不伪造执行事件。修复凭据后可以启动新 Turn，不会将新输入误判为仍在运行任务的 steer。
 - `workspaceTrusted` 只能由 Bootstrap 在 Trust 成功后注入 Runtime 默认配置，不能由 Project、Session 或本次 Turn 伪造。
 - `continuity` 不是浏览器 DTO：只有已成功 `claimNext()` 并将输入标为 consumed 的宿主可传 `{ source: "claimed_queue" }`。它令新 Turn 继承上一任务链 Todo；普通新 Turn 创建独立任务链，不会读取旧 Todo。
-- `start` 的硬门禁：Session 已有活动 Turn（`running`、`awaiting_approval`、`waiting_approval`）时抛 `TURN_ALREADY_RUNNING`，跨进程还存在新鲜 lease 检查。因此活动 Turn 期间**不能**再 `start` 新 Turn；此时用户输入只有两条路——`steer` 注入当前 Turn，或按 `queue` 排队等待当前 Turn 结束后由可信宿主领取。<br>这条门禁与 `continuity` 是同一因果链：queue 必须靠 `claimNext()` → `consume()` → `start({ continuity: { source: "claimed_queue" } })` 落地，而 `continuity` 只有在「已确认没有活动 Turn 并成功领取」之后才有意义。host 在领取后启动失败时，必须回收已 claim 的输入（`inbox.cancel`），避免输入永久停留在 `claimed`。
+- `start` 会先恢复 stale checkpoint，并拒绝仍持有新鲜 running checkpoint 或 Session lease 的并发执行（`TURN_ALREADY_RUNNING`）；创建前后还会核验 Work 历史来源与执行档位。当前实现不单凭 Session 的 `waiting_approval` / `waiting_user_input` 状态拒绝 `start`。宿主必须把已有暂停请求交给原 Turn 的审批/回答与 `continue` 流程，不能把 `start` 当作恢复入口。运行中输入用 `steer`；后续任务经 `queue` 排队，再由宿主 `claimNext()` → `consume()` → `start({ continuity: { source: "claimed_queue" } })`。`continuity` 仅声明任务链连续性，Core 不根据该标志自行领取或校验 Inbox。宿主负责将输入绑定到实际新 Turn，并在启动失败时收尾已领取输入。
 
 #### `continue(input)`、`cancel(input)` 与状态查询
 
@@ -583,7 +651,7 @@ interface StartTurnInput {
 | `getRecoverableState` | `({ sessionId, turnId? }) => Promise<RecoverableTurnView \| null>` | 返回最小恢复视图；`recoverable` 由 Core 确认，`termination` 仅含白名单原因和可选预算数值，适合 UI 与 CLI。 |
 | `getFrozenRunConfig` | `({ sessionId, turnId? }) => Promise<FrozenRunConfigView \| null>` | 返回脱敏后的冻结模型与推理配置。 |
 | `getContextUsage` | `({ sessionId, turnId? }) => Promise<ContextUsageView \| null>` | 只读返回最新私有 checkpoint 的安全 Context Usage 快照：冻结模型窗口、三态总量（`measured`/`projected`/`estimated`）、固定分类 breakdown、free/compact buffer/over-limit。无 checkpoint、`turnId` 不匹配或 DTO 任一不变量非法时 fail closed 为 `null`；`null` 表示当前没有可展示事实，宿主不得显示 0% 或猜测窗口。只接受 `sessionId`/`turnId`，不接受 messages/tools 等计算输入；宿主不得读取私有 `usageAnchor` 或自行重算。Live 更新走 `context_usage_updated` 事件（同值去重，`usage: null` 仅表示明确清空旧状态），刷新与重启恢复走本查询；两者消费同一份安全快照。 |
-| `getTurnUsageSummary` | `({ sessionId, turnId? }) => Promise<TurnUsageSummaryView \| null>` | 只读返回最新私有 checkpoint 的 Turn 累计用量汇总：`totalTokens` 累计输入+输出（与安全预算 `runtimeBudget.totalTokens` 同源）、`elapsedMs` 当前执行段耗时（以最近一次安全边界刷新的 checkpoint 为准，终态后不再增长），完整分项时另含 `inputTokens`/`outputTokens`。分项只在与 `totalTokens` 求和一致时整对提供；旧 checkpoint 缺分项、分项不完整或任一数值非法时降级为只含总量与耗时，无 checkpoint / `turnId` 不匹配时返回 `null`。数字全部来自 Kernel 同一采样累计点，宿主不得读取私有 `runtimeBudget` 或自行重算。Live 更新随 `context_usage_updated` 事件附带 `turnUsage`（同一安全边界、同一去重；旧 transcript 事件缺省该字段表示无新事实，宿主保留已有展示）；刷新与历史恢复走本查询。输入量按协议归一化：Anthropic Messages 把 `input_tokens` 与独立的缓存读/写桶相加，Chat Completions 的缓存命中字段已是 `prompt_tokens` 的子集不再相加，因此每个 token 只计一次、缓存命中部分包含在 `inputTokens` 内；这是 token 用量口径，不是计费金额。 |
+| `getTurnUsageSummary` | `({ sessionId, turnId? }) => Promise<TurnUsageSummaryView \| null>` | 只读返回最新私有 checkpoint 的 Turn 累计用量汇总：`totalTokens` 累计输入+输出（与安全预算 `runtimeBudget.totalTokens` 同源）、`elapsedMs` 当前执行段耗时（以最近一次安全边界刷新的 checkpoint 为准，终态后不再增长），完整分项时另含 `inputTokens`/`outputTokens`。供应商对本Turn全部已计输出均提供合法推理子项时，可选返回 `reasoningTokens`；它已包含在 `outputTokens` 中，不重复相加。缺失或部分覆盖不补造推理总量，旧checkpoint继续兼容。分项只在与 `totalTokens` 求和一致时整对提供；旧 checkpoint 缺分项、分项不完整或任一数值非法时降级为只含总量与耗时，无 checkpoint / `turnId` 不匹配时返回 `null`。数字全部来自 Kernel 同一采样累计点，宿主不得读取私有 `runtimeBudget` 或自行重算。Live 更新随 `context_usage_updated` 事件附带 `turnUsage`（同一安全边界、同一去重；旧 transcript 事件缺省该字段表示无新事实，宿主保留已有展示）；刷新与历史恢复走本查询。输入量按协议归一化：Anthropic Messages 把 `input_tokens` 与独立的缓存读/写桶相加，Chat Completions 的缓存命中字段已是 `prompt_tokens` 的子集不再相加，因此每个 token 只计一次、缓存命中部分包含在 `inputTokens` 内；这是 token 用量口径，不是计费金额。 |
 | `getUsageSnapshot` | `({ sessionId, turnId? }) => Promise<{ contextUsage: ContextUsageView \| null; turnUsage: TurnUsageSummaryView \| null }>` | 只读一次最新私有 checkpoint，复用上述两个白名单投影并返回同一时点的事实；无 checkpoint 或 `turnId` 不匹配时两项均为 `null`，各投影继续沿用自身非法值失败规则。不触发恢复、执行或持久化，不接受计算输入、不暴露私有 checkpoint。状态栏同时需要两项时使用此方法；单项查询继续兼容。例：`const { contextUsage, turnUsage } = await runtime.turns.getUsageSnapshot({ sessionId });` |
 
 ```ts
@@ -615,7 +683,11 @@ if (!handoff?.queued) {
 
 pauseSeq 绑定原暂停事件位置，checkpointDigest 对交互控制只冻结 Turn/status/pendingCalls/pendingUserQuestion/completedCallIds。心跳和预算元数据变化允许兼容恢复。新 lease 的 safeBoundarySeq=0 且尚无后续 turn_started 时可安全重领，有新执行事件但结果未确认时保留原决定并拒绝自动重放。旧缺 pauseSeq 的控制沿原完整摘要规则读取。Node codec 校验新控制身份、状态、时间、owner、摘要及固定失败码，schema 仍为 8，原容量预算保持。
 
+最新 Turn 在首个 checkpoint 前失败时，只有 Turn 和 Session 都已落失败状态、无活动 Turn 和租约，执行视图才投影为 inactive/failed。其余缺少 checkpoint 的情形保持待核查。
+
 安全执行视图增加 executionHost 与顶层 continuation（controlId/state/requestId?/approvalId?/failureCode?）。 continuation 可选 failureDiagnostic 仅含封闭 stage=read_decision/continue/after_started、category=storage/runtime/os/unknown、白名单code、started及可选filePhase。started=false只表示Runner未观察到启动事件，不能单独作为未执行证明；精确目标身份仍在原控制意图，未知码归一CONTINUE_UNKNOWN，原始异常/命令/路径/凭据不持久化。sanitizeContinuationFailure()是相同白名单的安全投影。interaction.decision仅为approved/denied，不复制原决定正文。顶层可覆盖首事件前没有有效 interaction 的窗口，当前请求匹配时同时投影 interaction.continuation。后续新请求不会采用旧控制。interaction.question 为经 Core 规范化校验的 { requestId, questions }，不包含答案正文。Chat 安全视图保持独立于 Work Thread Store。
+
+已保存交互的失败重试复用原controlId与决定，仍须原暂停checkpoint摘要一致；pauseSeq缺失、已观察启动或原边界后存在turn_started时拒绝重放。wait_threads摘要带interactionState、continuationState、interactionDecision，关注游标随交互/恢复状态变化；Kernel仅把interactionState=pending计入待审批，不修改真实暂停checkpoint。
 
 #### `steer(input)` 与 `compact(input)`
 
@@ -642,6 +714,10 @@ steer 的注入边界是四个离散的安全点，Kernel 只在完整工具批�
 | `steer` | `(input: SteerTurnInput) => Promise<InboxInput>` | 投递 steer 或 queue 输入；可含幂等 `clientMessageId`、受控附件和 Skill 引用。返回的是 inbox 输入记录，不是执行保证。 |
 | `compact` | `(input: CompactTurnInput) => Promise<CompactTurnResult>` | 压缩指定 Turn 的上下文；只在完整 canonical tool-call/result 配对切点切换投影，不删除原始 Session 记录。手动触发时 Turn 仍在运行中会抛 `TURN_ALREADY_RUNNING`（不排队、不延迟执行），须等 Turn 结束后再调用。返回显式 `outcome`：`changed` 表示消息投影实际替换、显式丢弃旧 usageAnchor，并以 estimated 降级快照发布 `context_usage_updated`；`skipped` 表示无可压缩历史（`reason: "no_compactable_history"`），checkpoint、anchor 与 usage 均不变且不发布事件。`CompactTurnResult.contextUsage` 携带 compact 后最新安全快照（无冻结窗口时为 `null`）。宿主不得以 `summary === ""` 推断 skipped，不得把 `preTokens`/`postTokens` 当 Provider 实测（它们是本地估算）。 |
 
+`CompactTurnInput` 要求 `sessionId`、`turnId`、`trigger: "auto" | "manual" | "proactive" | "reactive"`，可带 `preserveRecentTurns`、`targetTokens`、`signal`；兼容 `messages?` 可覆盖 checkpoint 消息，仅可信迁移宿主使用。正常手动入口为 `await runtime.turns.compact({ sessionId, turnId, trigger: "manual" })`。返回 `CompactTurnResult` 另含 `summary/messages/preTokens/postTokens/preservedFromIndex`；其中消息属于受信宿主调用结果，不可直接当浏览器 DTO。
+
+注意，当前 DeepSeek 与 OpenAI/GPT 均使用应用侧管理的摘要压缩，摘要由当前 Turn 冻结的 Provider 采样器生成；远程 Provider 仍会进行远程模型调用。当前尚未适配 OpenAI 原生云压缩（`/responses/compact` 或 `context_management`），Responses 协议同样使用该摘要流程。
+
 摘要调用通常复用主对话原 system、实际工具定义与 canonical 消息前缀，在尾部追加摘要任务；摘要采样产生工具调用时直接失败，绝不执行。当前采样工具定义仅存于私有 checkpoint，旧数据缺失时按当前受信配置重建。受信模型窗口不足时，只能裁去压缩后本就原样保留的最近尾部；摘要请求必须仍覆盖全部待摘要旧历史，按本地估算同时核算图片、工具 schema、摘要任务与输出预留。最小完整前缀仍超窗口则采样前明确失败，保留原投影。图片沿用宿主身份/hash和请求图片预算；无图片输入能力时仅发送明确未观察的引用占位。压缩后历史重建会自然转冷，不能保证消除所有冷请求。
 
 `compact` 与内部 `run()` 的关系：Runtime 在收到 `CONTEXT_OVERFLOW` 时会执行**一次** reactive compact，然后以新的 running checkpoint 重新调用内部 `run()`（同一 `turnId`、保留 `completedCallIds` 与 Todo）。第二次溢出或 compact 失败会发出 `context_compact_circuit_open` 并以 `turn_failed` 失败关闭，不会重放已完成的工具调用。
@@ -655,7 +731,7 @@ steer 的注入边界是四个离散的安全点，Kernel 只在完整工具批�
 | `reactive`：供应商溢出被动压（带熔断） | Provider 报 `CONTEXT_OVERFLOW` | 压缩后以新 running checkpoint 重跑内部 `run()` 一次；仍溢出或压缩失败发 `context_compact_circuit_open` 并以 `turn_failed` 失败关闭 |
 | `manual`：宿主调用 `turns.compact()`（带运行守卫） | 宿主显式触发 | 消息来源是 durable checkpoint 而非内存投影；Turn 在本进程运行中，或 checkpoint 被其他 Runtime 的新鲜 lease 持有且本进程非 owner 时拒绝（`TURN_ALREADY_RUNNING`）；成功后写回 checkpoint 并显式丢弃旧 usageAnchor（旧锚点对新消息序列无效） |
 
-`auto` 路径的阈值预算器按比例推导，不依赖魔法数字：**触发线 = min(窗口 × 0.80, 窗口 − 输出预留 − 安全 buffer)**。输出预留取 `sampleOptions.maxTokens`（默认 8,192），安全 buffer 取 max(8,192, 窗口 × 2%)，两条约束取更严者。provider 配置可显式指定 `compactThresholdTokens`，但最终触发线只取显式值与派生值的较小者，不会放宽派生约束。保留策略由 `RunConfig.compactPolicy`（`CompactPolicy { preserveRecentTurns, targetTokens }`）控制，未显式冻结 policy 时默认保留最近 4 个回合、target 70,400 token。
+`auto` 路径的阈值预算器按比例推导，不依赖魔法数字：**触发线 = min(窗口 × 0.80, 窗口 − 输出预留 − 安全 buffer)**。输出预留取冻结 `sampleOptions.maxTokens`：优先用户输出上限并受已解析模型能力上限约束，缺省使用该能力的 `maxOutputTokens`，未知/旧能力才回退8,192；旧冻结快照亦可由 `maxOutputTokens` 提供预留。Chat/Responses请求默认期限为600,000ms，显式timeoutMs保持优先；Anthropic继续使用原SDK期限与thinking/effort语义。安全 buffer 取 max(8,192, 窗口 × 2%)，两条约束取更严者。provider 配置可显式指定 `compactThresholdTokens`，但最终触发线只取显式值与派生值的较小者，不会放宽派生约束。保留策略由 `RunConfig.compactPolicy`（`CompactPolicy { preserveRecentTurns, targetTokens }`）控制，未显式冻结 policy 时默认保留最近 4 个回合、target 70,400 token。
 
 ```ts
 await runtime.turns.steer({
@@ -681,13 +757,19 @@ await runtime.turns.steer({
 |  | `list(input)` / `drain(input)` / `cancel(inputId)` | 读取、批量领取或取消输入。 |
 | `runtime.questions` | `submit(input)` | 提交 `{ sessionId, turnId, requestId, answers }`；Core 只在 `awaiting_user_input` 且三重归属一致时原子保存。随后 `turns.continue({ sessionId, turnId, requestId })` 从可信 Store 回灌原工具结果。 |
 
-`allow_session` 与 `allow_workspace` 只可由 `approvals.submit()` 建立；宿主不得自行写入授权存储。`ask` 模式下 `run_command` 只接受 `allow_once` 或 `deny`。任务文件集合审批（`constraint: "task-files:v1"`）与外部文件集合审批（`constraint: "task-ext-files:v1"`）的 `allow_once` 语义均为"批准本任务文件集合"：`submit()` 保存 `scope: "allow_session"` 且带 `turnId` / `taskFiles` 的集合 grant，`PersistentGrant` 因此新增可选 `turnId` 与 `taskFiles` 字段；该类 grant 不进入普通 `hasPersistentGrant` 命中路径，仅由 write/edit 的成员检查消费——工作区集合按工作区相对路径精确匹配（`path:` 约束），外部集合按 canonical 绝对路径经 comparable 归一精确匹配（`ext-file:` 约束），均绑定声明操作，不含父目录或递归语义；两类集合 grant 互相独立，工作区集合批准不自动放行外部目标。
+`allow_session` 与 `allow_workspace` 只可由 `approvals.submit()` 建立；宿主不得自行写入授权存储。`ask` 下普通工作区命令仅在精确 `cmd:v2` 约束时可接受 `allow_workspace`；Windows 宿主执行、危险/外部副作用保护和无精确约束的调用只接受 `allow_once` / `deny`，以冻结的 `allowedDecisions` 为准。任务文件集合审批（`constraint: "task-files:v1"`）与外部文件集合审批（`constraint: "task-ext-files:v1"`）的 `allow_once` 语义均为"批准本任务文件集合"：`submit()` 保存 `scope: "allow_session"` 且带 `turnId` / `taskFiles` 的集合 grant，`PersistentGrant` 因此新增可选 `turnId` 与 `taskFiles` 字段；该类 grant 不进入普通 `hasPersistentGrant` 命中路径，仅由 write/edit 的成员检查消费——工作区集合按工作区相对路径精确匹配（`path:` 约束），外部集合按 canonical 绝对路径经 comparable 归一精确匹配（`ext-file:` 约束），均绑定声明操作，不含父目录或递归语义；两类集合 grant 互相独立，工作区集合批准不自动放行外部目标。
+
+`inboxOriginKey(origin?: InboxOrigin): string` 是纯来源比较键，不做授权：缺省或 human 返回 `"human"`；thread 返回包含 `threadId`、可选 `turnId/purpose` 的 JSON 编码。例：`inboxOriginKey({ kind: "human", principalId: "user" }) === "human"`。只有可信宿主可填写 `InboxOrigin`，不能从该键恢复人类身份或审批。
 
 外部 `allow_workspace` 的 local 投影失败时，`submit()` 返回 `projection: "pending"`，该持久 grant 不生效。Node 投影 add/remove 在文件锁内严格读取现有配置：只有不存在可视为空；JSON 损坏、顶层非对象或不可读均保留原字节并拒绝，诊断为 `EXTERNAL_RULE_SETTINGS_INVALID` / `EXTERNAL_RULE_SETTINGS_UNREADABLE`（不安全链接为 `EXTERNAL_RULE_TARGET_UNSAFE`）。撤销先删除 grant，投影删除失败返回 `{ deleted: true, ruleRemoved: false }`，不重建权威。
 
-`ask_user_question` 是按宿主 capability 注册的交互 Tool，不是审批或命令入口。它只在 Web 等具备结构化 answerer 的宿主可见：模型请求后 Turn 进入 `awaiting_user_input`，答案经 `questions.submit()` 持久化，再由同一 Turn 的 `continue({ requestId })` 读取。CLI 保持该 Tool 不可见；必要澄清由普通助手正文完成并正常结束当前 Turn，下一条 prompt 依靠同 Session 的 canonical history 继续。
+`ask_user_question` 是按宿主 capability 注册的交互 Tool，不是审批或命令入口。它仅在显式启用 `enableUserQuestions` 的 Work 宿主可见（当前 Web 与 Desktop 受管 AP 已启用，Chat 不注册）：模型请求后 Turn 进入 `awaiting_user_input`，答案经 `questions.submit()` 持久化，再由同一 Turn 的 `continue({ requestId })` 读取。普通 CLI 默认不向模型注册新问题工具；必要澄清由普通助手正文完成并正常结束当前 Turn，下一条 prompt 依靠同 Session 的 canonical history 继续。CLI 仍可依据安全执行视图显示并回答历史暂停问题；提交后通过持久交接交由兼容原宿主继续，无组时沿已授权的本机 `continue` 入口，不能据此越过执行档位。相同归一化答案重试幂等，不同答案返回 `QUESTION_ALREADY_ANSWERED`。
 
 ### 2.8 运行配置与事件
+
+受信宿主调用 `sessions.setDefaultRunConfig` 保存权限时，Core 为人类选择签发 `Session.permissionSelection`。新 Turn 记录已观察选择修订。恢复在原租约取得且 checkpoint 身份复核后，仅采纳更新的权限选择，并在 `Turn.permissionRevisions` 保存该执行段权限、选择修订、时间、租约身份与旧审批序号截止点。原 `frozenRunConfig` 和 Provider 快照保持历史事实，`continue.runConfig.permissionMode` 不构成提权入口。缺少新字段的旧记录沿用原冻结权限，后续显式保存权限即可在下一安全恢复采用。Chat 权限仍受原能力上限约束。
+
+`getFrozenRunConfig()` 的 `permissionMode` 保留开始时的冻结事实，新增可选 `executionPermissionMode` 投影最近执行段权限。权限变化后的 pending call 重新经过原 Policy，不转发旧批准。修订落盘后即使执行段启动失败，重试也依据审批序号截止点持续撤下旧批准。私有修订审计不进入 getState 的公开 Turn 投影。危险/显式 ask/外部修改未授权时签发新审批，旧审批身份不能用于新执行段。中断时结果未知的调用仍按原恢复规则闭合，不直接重放。运行中的选择仅在下次安全恢复或新 Turn 生效。
 
 ```ts
 interface RunConfig {
@@ -729,27 +811,29 @@ interface RunConfig {
 ```
 
 - `toolAllowlist` 只收窄工具集合。Runtime 静态上限、动态 settings 上限和 Turn override 取交集；产品模式只从 Session 读取。新 Turn 的 `FrozenRunConfig.capabilityCeiling` 保存模式和工具名上限，`FrozenRunConfigView.capabilityCeiling` 只投影这份安全摘要。Chat 另在私有冻结配置保存附件 grant，公开视图不包含它。
+- Work 的能力对象、loader、sampler/factory、Provider settings、Context、Skill、MCP 和数据库能力只来自受信 Runtime 默认值，Turn override 不可替换。合法模型/推理/凭据引用、权限、步数/重试/时长/token 预算、compact 和 `databaseSearchPolicy` 仍由 `resolveRunConfig` 显式解析并冻结；continue 沿用原冻结值，工具 allowlist 仍可收窄，废弃 RAG 字段仍清除。
+- `hostToolsLoader(binding)` 仅从受信 Runtime 默认配置装配，在 Work start/continue 时获得真实 Session/Turn；Turn override 不可替换，Chat 不调用。返回 `tools` 为既有工具定义结构（name/description、Zod inputSchema、metadata、createActionFacts、execute、serializeOutput），通过原 Registry/Policy/Executor 执行；可选 allowedTools 与当前/冻结上限取交集，不能放宽。loader、闭包和工具对象不持久化，冻结只保留允许工具名。可选 beforeExecute 由同一受信 loader 返回，在普通工具每次真实执行前（含重试、审批后恢复）调用；回调拒绝时工具 handler 不执行。该回调只约束普通工具，宿主在本次 loader 返回的工具对象按对象身份走自己的业务门，不按工具名/MCP metadata 豁免。回调来自 Runtime defaults，不能由 Turn override 注入，不进入持久快照；未装配时普通 Runtime 行为不变。宿主负责在 execute 内校验业务范围；业务意图不替代实际工具权限或人类审批。最小禁用示例：`createAgentRuntime({ ports, defaultRunConfig: { hostToolsLoader: async function boundTools({ sessionId, turnId }) { return { tools: [], allowedTools: [] }; } } })`。装配实际工具时使用 `RunConfig["hostToolsLoader"]` 推导类型，不导入 Core internal 路径。
 - Chat start 只接受当前 `content`，拒绝外部 `messages` 或 Skill 上下文；`turnId` 不能覆盖已有 Turn。Chat override 不能替换宿主 sampler、`chatLoader`、Web loader、Workspace、RAG、Skill、MCP 或数据库能力。continue 复查 Session 与冻结模式，工具名及附件 ref 均受原快照限制；Chat 缺少冻结身份或模式不一致时抛 `SESSION_MODE_MISMATCH`。Work 新 Turn 由 Core 写入 `workContextVersion: 1`；有任一旧 Turn 缺少该版本或 Work ceiling、孤立 checkpoint/transcript，或无可信 Turn 的旧展示内容时，start/continue/steer/compact 抛 `WORK_HISTORY_READ_ONLY`。`getState()` 返回同名 `readOnlyReason` 并保持受限 checkpoint 原样，`getRecoverableState()` 返回 null；旧文件和历史不自动删除。新边界下完整的 Work 任务正常恢复。
 - `credentialRef` 只保存引用 `{ provider, key }`，真实 API key 只由 `CredentialStore` 解析。
 - `web` 是 Trust 后由宿主注入、只存在于当前进程的能力容器，不会进入 `FrozenRunConfig`、checkpoint、event 或持久化配置；`search` / `fetch` 子能力可独立存在，缺少某项时对应 `web_search` / `web_fetch` 工具完全不可见。完整 Search query 与结果只在同一进程的当前采样链中短暂存在；写入 durable checkpoint 前，调用参数与工具结果会替换为保持配对关系的安全占位，恢复后如仍需该信息必须重新搜索。
 - `workPreview` 是 Trust 后由宿主注入、只存在于当前进程的 Work 预览能力；`workPreviewEnabled` 在新 Turn 冻结进 `FrozenRunConfig`（缺省 false，override 不可开启），能力对象本身不进入冻结配置。`open_preview` 工具仅 Work 且能力就绪时注册，Chat/CLI 永不可见；durable checkpoint 对其输入使用与 Web 工具相同的 `{ redacted: true }` 占位。契约详见 6.5。
-- `AgentMessage` 是唯一运行时 canonical 消息：`text`、`reasoning`、`tool-call`、`tool-result` 四类 block 不含 Provider wire 字段。恢复发现未闭合调用时会先写入确定性 error result；`TOOL_OUTCOME_UNKNOWN` 不代表执行失败，而是要求先验证外部副作用。
+- `AgentMessage` 是唯一运行时 canonical 消息：`text`、`image-ref`、`reasoning`、`tool-call`、`tool-result` 五类 block 不含 Provider wire 字段。恢复发现未闭合调用时会先写入确定性 error result；`TOOL_OUTCOME_UNKNOWN` 不代表执行失败，而是要求先验证外部副作用。
 - `AgentEvent` 是对外事件联合；所有携带 checkpoint 的事件都使用同一最小生命周期视图，`messages` 与 `completedCallIds` 固定为空数组，只保留安全 Skill 身份。受信 Chat none/web 的 `render_ui` 成功后可产生 `ui_document`，仅包含 Core 校验/归一的 `UiDocument`；对应 `tool_result.output` 只含 `{ delivered: true }`。`getState()` 的 checkpoint 另可带 `consumedInputIds` 供 Web 输入去重；宿主不得收到 canonical 消息、pending calls、其他工具参数/结果、`runtimeBudget`、`usageAnchor`、Provider 原文或凭据。
 - `tool_progress` 只在长时工具执行期间产生，`tail` 为命令输出最后 ≤160 字符的节流尾部，仅用于运行中的实时进展展示；不得作为终态摘要持久化，也不进入 transcript。
-- `turn_failed` 经过 Runtime 事件记录边界时必带随机 UUID `feedbackId`，并在 EventSink 返回值与 durable Transcript 中保持相同。`errorCode`、`failureStage` 与可选 `providerHttpStatus` 只从白名单保留；阶段包括工具预检/执行、预算、上下文压缩、Provider 采样/恢复、完成策略和 Agent Loop。Provider 状态只允许整数 400–599。未知类别统一为 `TURN_EXECUTION_FAILED`，未知阶段统一为 `agent_loop`；原始异常、请求/响应正文、路径与堆栈不直接进入诊断字段，常见凭据形式会过滤，`error` 仍使用固定安全文案。可选 `providerFailureReason` 仅为闭合中立原因 `invalid_request | authentication_failed | billing_insufficient | quota_exhausted | rate_limited | service_unavailable`，与既有 `errorCode` 成对验证；脱敏器不解释厂商标记，旧 `providerFailureProfile` 不进入新公开事件。根入口 `getAgentProviderFailureMessage(errorCode, reason?)` 与 `sanitizeAgentProviderFailureReason(errorCode, reason)` 供 Web/CLI 共用；不读取响应正文、厂商名或 URL。Adapter 的 `normalizeProviderHttpFailure` 仅在可靠官方端点上解析少量固定业务 code/type，归一成中立原因及原有恢复分类；DeepSeek 官方状态、Z.ai/Kimi/百炼少量余额/额度/限流/过载事实受有限规则覆盖，不表示厂商全集。余额/额度为 `PROVIDER_REQUEST_REJECTED`，可靠限流/过载沿用原有有界恢复；未知 429 保守拒绝，不依据任意 message 触发重试。OpenAI 适配器既有上下文溢出识别优先，取消/超时边界保留。新增可选 `providerFailureDetail` 为 `code:` 或 `type:` 加 1–32 位字母、数字、下划线、点或连字符的协议标识，过滤常见凭据形式；仅来自结构化错误字段，不读取自由 message，不决定恢复。格式过滤无法证明标识不含短凭据或用户内容，老大已明确接受此残余风险。Web/CLI、历史与 transcript 经同一校验保留该字段。`normalizeLegacyProviderFailureReason(errorCode, profile, status)` 仅用于旧持久字段升级，将匹配旧分类的已知事实转成中立原因；新事件不再携带厂商 profile。
+- `turn_failed` 经过 Runtime 事件记录边界时必带随机 UUID `feedbackId`，并在 EventSink 返回值与 durable Transcript 中保持相同。`errorCode`、`failureStage` 与可选 `providerHttpStatus` 只从白名单保留；阶段包括工具预检/执行、预算、上下文压缩、Provider 采样/恢复、完成策略和 Agent Loop。Provider 状态只允许整数 400–599。未知类别统一为 `TURN_EXECUTION_FAILED`，未知阶段统一为 `agent_loop`；原始异常、请求/响应正文、路径与堆栈不直接进入诊断字段，常见凭据形式会过滤，`error` 仍使用固定安全文案。可选 `providerFailureReason` 仅为闭合中立原因 `invalid_request | authentication_failed | billing_insufficient | quota_exhausted | rate_limited | service_unavailable`，与既有 `errorCode` 成对验证；脱敏器不解释厂商标记，旧 `providerFailureProfile` 不进入新公开事件。根入口 `getAgentProviderFailureMessage(errorCode, reason?)` 与 `sanitizeAgentProviderFailureReason(errorCode, reason)` 供 Web/CLI 共用；不读取响应正文、厂商名或 URL。Adapter 的 `normalizeProviderHttpFailure` 仅在可靠官方端点上解析少量固定业务 code/type，归一成中立原因及原有恢复分类；DeepSeek 官方状态、Z.ai/Kimi/百炼少量余额/额度/限流/过载事实受有限规则覆盖，不表示厂商全集。余额/额度为 `PROVIDER_REQUEST_REJECTED`，可靠限流/过载沿用原有有界恢复；未知 429 保守拒绝，不依据任意 message 触发重试。OpenAI 适配器既有上下文溢出识别优先，取消/超时边界保留。新增可选 `providerFailureDetail` 为 `code:` 或 `type:` 加 1–32 位字母、数字、下划线、点或连字符的协议标识，过滤常见凭据形式；仅来自结构化错误字段，不读取自由 message，不决定恢复。格式过滤无法证明标识不含短凭据或用户内容。Web/CLI、历史与 transcript 经同一校验保留该字段。`normalizeLegacyProviderFailureReason(errorCode, profile, status)` 仅用于旧持久字段升级，将匹配旧分类的已知事实转成中立原因；新事件不再携带厂商 profile。
 - 终态事件和 `getRecoverableState()` 可携带 `termination: { reason?, recoverable, budget? }`。原因仅为 `runtime_budget | token_budget | repeated_tool_calls | write_verification | stale_lease | turn_limit_reached`；预算仅允许 `runtime_budget` 的非负安全整数毫秒值或 `token_budget` 的非负安全整数 Token 值。旧事件缺少投影时保留 Core 确认的恢复布尔值，不伪造原因或数值。
 - `todo_write` 是自动允许的内部状态工具。每次只接受完整替换列表 `todos`（0–20 项，`content + activeForm + status`，三态且未完成时恰有一个 `in_progress`）；成功后产生 `todo_updated`，携带当前任务链身份、受限 Todo 文案和 Core 计算的计数。completed 只表示计划状态，不表示测试、文件修改或发布成功。同一调用可附带可选 `fileTargets`（≤50 项，`path` 为工作区相对路径 + `operation: "create" | "edit"`）声明本任务的修改文件清单：此时该调用转为 `task-files:v1` 审批（`allowedDecisions` 仅 `allow_once`/`deny`），用户批准后 Core 保存绑定当前 Turn 的集合授权；本 Turn 内 `write_file`/`edit_file` 对清单成员按声明操作自动放行，非成员、新目标与外部路径仍走既有逐次审批。跨 Turn 集合自然失效；同一 Turn 的增量声明按 `path+operation` 合并。已知要修改多个工作区外文件时，可改用可选 `externalFileTargets`（≤50 项，`path` 为绝对文件系统路径，拒绝相对路径、`..`、UNC 与备用数据流语法）声明外部文件清单：转为独立的 `task-ext-files:v1` 审批（与工作区集合分卡、单独一次批准，`allowedDecisions` 同样仅 `allow_once`/`deny`），Core 在声明期把每个目标 canonical 化冻结进清单（symlink 按解析后的真实目标身份），解析进工作区的声明被拒绝并提示改用 `fileTargets`；两类声明不得混在一次调用。批准后本 Turn 内对清单内精确外部文件的对应修改自动放行，授权不含父目录或递归语义；外部 deny/ask 规则快照收窄仍先于集合命中。
 - Todo 快照只由 `todo_updated` 投影；`sanitizeEventForExternal()` 会把对应 `tool_result.output` 降为 counts，避免浏览器从原始工具结果重建列表。绝对路径和常见凭据片段会在 Todo schema 阶段拒绝。
 - `maxDurationMs` 与显式的 `maxTotalTokens` 均在每个 Turn 冻结；前者是单个活动执行段的时长上限，默认关闭，可由 `AGENT_MAX_DURATION_MS` 或 RunConfig 显式启用且无固定平台封顶；后者是跨 Continue 累计的 Provider token 上限，默认关闭，可通过 `AGENT_MAX_TOTAL_TOKENS` 或 RunConfig 显式启用，硬上限 10,000,000 tokens。等待、审批和用户回答期间不消耗新的执行段时长；Continue 取得执行 lease 并开始运行时重开时长段，但保留同一 Turn 的显式 token 累计。预算在完整工具批次等安全边界检查：`runtime_budget` 触顶产生 `interrupted_recoverable`，`continue()` 保持同一 Turn 与累计 token 预算；显式 `token_budget` 耗尽则产生 `failed` 终态，Core 拒绝继续执行。旧模式/旧默认值不在当前契约范围，不提供迁移保证。上下文水位仍由现有 auto compact 管理；跨 Turn 的 Goal 全局预算仍需由 Goal 域单独聚合。
 - 连续相同的工具名、规范化参数和结果摘要会触发无进展护栏：第 3 次注入提醒、第 5 次强提醒、第 8 次以 `interrupted_recoverable` 暂停（`interruptionReason: "repeated_tool_calls"`）。参数/结果变化、成功 mutation、Todo 推进或 steer 会重置计数；只保留脱敏哈希与次数，`sanitizeCheckpoint()` 不向宿主公开该私有状态。
 - Durable Runtime 在每个完整的模型采样与工具批次结果之后保存 `status: "running"` checkpoint，再开始下一次采样；快照包含 canonical 消息、`completedCallIds`、剩余 `pendingCalls`、Todo、usage 与安全预算，并用 lease 的 `safeBoundarySeq` 保持写入顺序。进程在该边界后重启时，已完成工具不会重放；若仍有未闭合调用，则恢复沿用 `TOOL_OUTCOME_UNKNOWN` 的 fail-closed 语义，要求先验证外部状态。
-- `resolveRunConfig()`、`resolveAgentRuntimeLimits()`、`resolveLimitConfig()` 是纯函数，可用于宿主预览解析结果；实际 continue 仍只使用冻结配置。
+- `resolveRunConfig()`、`resolveAgentRuntimeLimits()`、`resolveLimitConfig()` 不读写 Store，可用于宿主预览配置解析结果；限制层的环境默认值在模块加载时读取，解析期间不重读环境；实际 continue 仍只使用冻结配置。
 - 沙箱契约：`FrozenRunConfig` 冻结 `sandboxMode`、`sandboxTempRoot`、`sandboxPolicyDigest`（mode/workspaceRoot/tempRoot 的 SHA-256，不含敏感路径明细）与 `sandboxPolicyVersion: 1`。`sandboxMode` 与审批 `permissionMode` 正交，未知值在 `resolveRunConfig` 抛 `SANDBOX_MODE_INVALID`；`danger-full-access` 只能来自宿主默认值，模型输入、工具参数、持久 grant 与 Chat 请求体均不可达。Continue 沿用冻结值；旧 checkpoint 缺 sandbox 字段时在恢复边界幂等迁移为 `read-only`（fail-safe，不可继承宽能力）。`SandboxPort.execution?: "host"` 静态声明该装配的进程执行方式（Windows 宿主执行 Port 声明 `"host"`，其余缺省表示沙箱），是执行方式的唯一来源，不依赖 `status()` 探测。`FrozenRunConfig.processExecution?: "sandbox" | "host"` 冻结本 Turn 的有效执行方式：`TurnService.start` 写入，`continue` 在进入执行链前与当前 Port 比对，不一致（包括缺省按沙箱的旧记录落到宿主装配）以 `TURN_FROZEN_MISMATCH` 拒绝并提示新建任务，旧审批零消费、目标零启动；不得用 `status()` 探测结果重解释既有授权。`RuntimePorts.sandboxPort` 为 mandatory 字段，未接入真实 backend 的装配必须显式提供 `createUnavailableSandboxPort()`（一切进程执行 `SANDBOX_UNAVAILABLE`）；`SandboxPort.prepare` 只接受已校验的结构化 `program + args + canonical cwd + 冻结 policy + commandId`，输出可直接 spawn 的 argv + env，Core 不感知平台实现。稳定错误码 `SANDBOX_UNAVAILABLE` / `SANDBOX_NOT_PROVISIONED` / `SANDBOX_POLICY_DENIED` / `SANDBOX_RUNNER_FAILED` / `SANDBOX_SCOPE_CONFLICT` / `SANDBOX_CLEANUP_FAILED`；policy denial（沙箱正常且拒绝）与 runner failure/unavailable（目标命令未安全启动）语义不得混淆。
 - 外部权限段（`permissions`）只接受 `allow`/`deny`/`ask`。`allow` 仅 Local 投影生效，其它 scope 产生 `SETTINGS_PERMISSIONS_SCOPE_FORBIDDEN`；未知字段（如 Claude Code 的 `defaultMode`）产生 `SETTINGS_PERMISSIONS_UNSUPPORTED`，只丢弃该字段且不产生任何授权，同段的合法 `deny`/`ask` 收窄继续保留。`deny`/`ask` 出现无法解释的条目或 `permissions` 不是对象时产生 `SETTINGS_PERMISSIONS_UNSAFE` / `SETTINGS_PERMISSIONS_INVALID` 并置 `permissions.restricted`，外部限制判定与持久放行一律按拒绝处理（fail-closed）；`ExternalPermissionSnapshot.restricted` 由投影器透传该事实。投影写入在 `permissions` 不可解释时返回 `EXTERNAL_RULE_PERMISSIONS_UNSAFE`，不覆盖原字节。宿主可用 `isExternalPermissionDiagnostic()` 把权限诊断与模型/凭据分类隔离展示。
 - 沙箱 settings 与 Node Adapter：settings 的 `sandbox` 安全字段——`mode`（仅 User scope，且只允许 `read-only`/`workspace-write`；`danger-full-access` 不允许从 settings 文件声明）与 `allowedDomains`（仅 User scope）；`deniedRead`/`deniedWrite` 任意 scope 按并集收窄；裸 `*`、未知字段与非空字符串数组一律产生 `SETTINGS_SANDBOX_INVALID` / `SETTINGS_SANDBOX_MODE_FORBIDDEN` / `SETTINGS_SANDBOX_SCOPE_FORBIDDEN` 诊断。Node 装配侧 `createNodeRuntimePorts` 在 Work 模式（提供 `workspaceRoot`）下按平台装配 SandboxPort：macOS 为 `createNodeSandboxPort({ workspaceRoot, stateRoot, tempRoot })`，Windows 为 `createNodeHostExecutionSandboxPort()`；`sandboxTempRoot` 必须由宿主显式验证后传入（CLI 使用 Trust 后的 `<workspace>/.autopilot/tmp`）；Chat 模式或缺 root 使用 `createUnavailableSandboxPort()`。Node adapter 绑定单一 canonical root（policy root 不一致抛 `SANDBOX_SCOPE_CONFLICT`）：macOS 使用 Seatbelt，prepare 输出 enforcement=full，`TMPDIR` 以受控 tempRoot 前缀覆盖 SRT 注入的 `/tmp/claude`；Windows 装配宿主执行 port（`backend: "host-execution"`、`enforcement: "unavailable"`），不加载 SRT、不要求 provision、不做系统变更，`prepare` 无条件以 `SANDBOX_UNAVAILABLE` 拒绝，`status()` / `setup()` 返回停用报告，`release()` / `shutdown()` 为空操作且幂等。初始化失败、网络未就绪与 danger-full-access 均 fail-closed；`status().enforcement=full` 仅表示本次会话 OS 约束就绪，不代表完整兼容性或发布验收。错误映射不透传 SRT 原始文案。`AgentRuntime.shutdown()` 顺序为 `jobs.shutdown()` → `sandboxPort.shutdown()`（幂等）。
-- 前台与后台命令的执行范围与审批：`run_command` 与 `start_background_job` 是仅有的两个进程类工具入口，除宿主可信配置的 `danger-full-access` 单次直执（见下条）外执行路径不存在裸 spawn——`ToolExecutor` 对这两个工具强制解析执行范围并注入执行事实：沙箱装配下解析沙箱范围（绑定缺失或 `status()` 能力不可执行时以 `sandbox.available=false` fail-closed deny `SANDBOX_UNAVAILABLE`，不转普通审批、不裸跑），确认可执行后注入带 port 与冻结 policy 的 `SandboxExecutionScope`；Windows 宿主装配（`status().backend === "host-execution"`）注入无 port 的宿主范围（`execution: "host"`），不注入 `sandbox.available`，改由 `PolicyEngine` 的 `hostExecution` 事实返回 `approval_required` 并把 `allowedApprovalDecisions` 收窄为 `["allow_once", "deny"]`——该分支先于只读自动放行、grant、`full_access`、`auto_approve` 与 Trust，只有 hard deny、Skill 白名单与显式外部 deny 仍先于它拒绝，已有 grant 与宽权限模式不代替本次确认。批准后前台以 `sandboxExecutionOverride: "direct"` 宿主直执一次，后台把宿主范围交给 `JobService.start`。前台：`run-command-tool` 先用 `getPlatformExecutable` 完成平台可执行名解析，再经 `SandboxPort.prepare({ commandId, program, args, cwd, policy })` 生成包装 argv 后 spawn（`env` 为 `process.env` 与 prepare 输出合并），close/error/超时/取消全部终态幂等 `release(executionId)`，成功结果携带安全沙箱事实 `sandbox: { enforcement, mode }`。后台：`start-background-job-tool` 缺少已解析范围时同样抛 `SANDBOX_UNAVAILABLE`，并把范围交给 `JobService.start`（见 2.3：沙箱形态受信解析 → `prepare` → spawn，宿主形态受信解析 → spawn；两者全终态释放执行资源，durable 记录只保存安全 policy 摘要）；prepare 失败不产生 running Job，稳定 `SANDBOX_*` 错误码原样投影为工具错误。`PolicyEngine` 的 G4 分支：仅当调用已确认可在沙箱内执行（`sandbox.available === true`）且 `auto_approve + workspaceTrusted` 时，外部副作用/未知风险命令才自动放行；ask 模式保持 `allow_once-only` 逐次审批，hard deny、Skill、grant、`full_access` 与既有收紧分支顺序不变。绑定注入链：`turn-runtime-config-resolver.buildAgentOptions` 仅在 Work Turn 注入 `{ port: RuntimePorts.sandboxPort, mode: FrozenRunConfig.sandboxMode（缺省 fail-safe 为 read-only）, tempRoot: sandboxTempRoot }`，经 `RunContext.sandbox` 传入 Kernel；Chat 不注入。
-- 沙箱启动失败降级与拒绝终态：沙箱装配下，进程类调用执行前对沙箱范围做最多 3 次探测（探测只读 `status()`，不启动目标命令，重试安全），仍失败按模式分流（Windows 宿主装配不进入本分支：探测到 `status().backend === "host-execution"` 即直接构造宿主范围，审批由 `hostExecution` 逐次确认）——`read-only` 与 `workspace-write` 一律维持 fail-closed deny（沙箱不可用时不存在受控执行通道，无法证明授权状态保护与外部写门禁，无沙箱直执不提供任何权限豁免，`start_background_job` 与外部写命令同等 fail-closed）；`danger-full-access` 是宿主可信配置的明确无隔离授权，直接执行不经过沙箱失败流程（PolicyEngine 沙箱事实注入 `available:true` 维持与沙箱可用时一致的放行行为，执行结果 `enforcement: "unavailable"` 不得展示为隔离）；Windows 下 `npm`/`npx`/`pnpm` 直接执行前与沙箱路径共用同一受信解析——转换为可信 `node.exe` + 对应 CLI 脚本 + 结构化 argv，不经 shell 拼接，受信 CLI 不可用时命令不启动（`SANDBOX_UNAVAILABLE`）。workspace-write 的无沙箱降级审批（稳定约束 `no-sandbox-exec:v1`、卡片展示完整命令与脱敏诊断、批准后 `sandboxExecutionOverride: "direct"` 直执一次）已从执行链撤下：命令已记住（grant）、任务文件集合已批准、工作区已信任、`full_access`/`auto_approve` 均不能改变 fail-closed 结果；其冻结/原子消费权威底座（`SandboxDegradeApproval` + `consumeDegradeApproval`，跨重启经 `validateApproval` 核对 constraint 与 TTL）保留休眠，供未来受控执行方式（如独立执行身份＋宿主持有授权状态）复用。拒绝与诊断：deny 结果按 `errorCode` 区分环境阻塞（`SANDBOX_UNAVAILABLE`/`NOT_PROVISIONED`/`RUNNER_FAILED`，诊断以结构化 display 事实 `diagnostics` 投影，error message 只保留策略原因）与用户拒绝（`APPROVAL_REQUIRED`）；进程类调用的结果展示事实携带结构化 `executionMode`（`sandboxed`/`unisolated`/`unavailable`），展示层不得把 `unisolated`/`unavailable` 宣称隔离。命令审批展示事实（`ApprovalDisplayFacts`）另冻结可识别工作目录 `cwd`（本地 facts 提供 canonical 目录，未绑定 workspaceRoot 时为输入原文）与 `unknownScope`（命令声明外部效果但未声明精确目标时为 true，展示层给出"修改范围无法精确限定"提示，不得宣称"仅覆盖精确目标"）；`actionPreview` 保留既有长度预算与凭据脱敏，触达预算时附截断提示。Kernel 对一切 denied 终止写 `turn_failed`（checkpoint `status: "failed"`），文案按 errorCode 区分（沙箱→"沙箱不可用，无法提供已隔离执行，本次任务已停止"，用户拒绝→既有"不会尝试其他命令"），任务受阻不得显示为 `turn_completed`。用户拒绝不得触发自动重试。
-- 文件工具 mutation 名义层：`write_file` / `edit_file` 按已确认的选项 A 直接修改真实工作区，不进入 OS 进程沙箱；两者在执行锁内、真实 mutation 前读取 Turn 冻结 `sandbox` 绑定模式——`read-only` 一律拒绝并返回 `FS_SANDBOX_DENIED`（文件工具域稳定错误码，区别于进程域 `SANDBOX_POLICY_DENIED`），且不产生任何磁盘变化，判定只消费冻结 mode、不依赖 SandboxPort capability；`workspace-write` 与 `danger-full-access` 均维持既有工作区围栏（锁内 canonicalize-then-contain、审批、mutation WAL、写后 hash、Undo 不回退），`danger-full-access` 不放宽工具 schema 与允许范围；tempRoot 只属于进程沙箱策略，不构成文件工具写白名单；缺沙箱绑定的旧上下文不虚构 read-only，沿用既有围栏行为。
+- 前台与后台命令的执行范围与审批：`run_command` 与 `start_background_job` 是仅有的两个进程类工具入口，除宿主可信配置的 `danger-full-access` 单次直执（见下条）外执行路径不存在裸 spawn——`ToolExecutor` 对这两个工具强制解析执行范围并注入执行事实：沙箱装配下解析沙箱范围（绑定缺失或 `status()` 能力不可执行时以 `sandbox.available=false` fail-closed deny `SANDBOX_UNAVAILABLE`，不转普通审批、不裸跑），确认可执行后注入带 port 与冻结 policy 的 `SandboxExecutionScope`；Windows 宿主装配（`status().backend === "host-execution"`）注入无 port 的宿主范围（`execution: "host"`），不注入 `sandbox.available`，由 `PolicyEngine` 按风险、显式限制与权限模式分流。`ask` 的宿主命令逐次确认，`auto_approve` 对已确认只读和受信工作区变更自动放行，未知或外部副作用仍询问。`full_access` 放行更广普通调用，危险风险、显式 ask、全模式外部修改授权仍先于普通 grant 和模式。需要宿主审批时决定范围为 `["allow_once", "deny"]`。策略允许或单次批准后前台以 `sandboxExecutionOverride: "direct"` 宿主直执一次，后台把宿主范围交给 `JobService.start`。前台：`run-command-tool` 先用 `getPlatformExecutable` 完成平台可执行名解析，再经 `SandboxPort.prepare({ commandId, program, args, cwd, policy })` 生成包装 argv 后 spawn（`env` 为 `process.env` 与 prepare 输出合并），close/error/超时/取消全部终态幂等 `release(executionId)`，成功结果携带安全沙箱事实 `sandbox: { enforcement, mode }`。后台：`start-background-job-tool` 缺少已解析范围时同样抛 `SANDBOX_UNAVAILABLE`，并把范围交给 `JobService.start`（见 2.3：沙箱形态受信解析 → `prepare` → spawn，宿主形态受信解析 → spawn；两者全终态释放执行资源，durable 记录只保存安全 policy 摘要）；prepare 失败不产生 running Job，稳定 `SANDBOX_*` 错误码原样投影为工具错误。沙箱可用只证明执行隔离，不能把未知风险或外部副作用变成 `auto_approve` 自动放行。明确危险风险在普通 grant 与模式之前要求单次确认，硬拒绝继续拒绝。未解析的 npm 项目脚本保持 unknown，不能仅凭 build/test 名称认定安全。绑定注入链：`turn-runtime-config-resolver.buildAgentOptions` 仅在 Work Turn 注入 `{ port: RuntimePorts.sandboxPort, mode: FrozenRunConfig.sandboxMode（缺省 fail-safe 为 read-only）, tempRoot: sandboxTempRoot }`，经 `RunContext.sandbox` 传入 Kernel；Chat 不注入。
+- 沙箱启动失败降级与拒绝终态：沙箱装配下，进程类调用执行前对沙箱范围做最多 3 次探测（探测只读 `status()`，不启动目标命令，重试安全），仍失败按模式分流（Windows 宿主装配不进入本分支：探测到 `status().backend === "host-execution"` 即直接构造宿主范围，审批按 `hostExecution` 的风险与权限分流）——`read-only` 与 `workspace-write` 一律维持 fail-closed deny（沙箱不可用时不存在受控执行通道，无法证明授权状态保护与外部写门禁，无沙箱直执不提供任何权限豁免，`start_background_job` 与外部写命令同等 fail-closed）；`danger-full-access` 是宿主可信配置的明确无隔离授权，直接执行不经过沙箱失败流程（PolicyEngine 沙箱事实注入 `available:true` 维持与沙箱可用时一致的放行行为，执行结果 `enforcement: "unavailable"` 不得展示为隔离）；Windows 下 `npm`/`npx`/`pnpm` 直接执行前与沙箱路径共用同一受信解析——转换为可信 `node.exe` + 对应 CLI 脚本 + 结构化 argv，不经 shell 拼接，受信 CLI 不可用时命令不启动（`SANDBOX_UNAVAILABLE`）。workspace-write 的无沙箱降级审批（稳定约束 `no-sandbox-exec:v1`、卡片展示完整命令与脱敏诊断、批准后 `sandboxExecutionOverride: "direct"` 直执一次）已从执行链撤下：命令已记住（grant）、任务文件集合已批准、工作区已信任、`full_access`/`auto_approve` 均不能改变 fail-closed 结果；其冻结/原子消费权威底座（`SandboxDegradeApproval` + `consumeDegradeApproval`，跨重启经 `validateApproval` 核对 constraint 与 TTL）保留休眠，供未来受控执行方式（如独立执行身份＋宿主持有授权状态）复用。拒绝与诊断：deny 结果按 `errorCode` 区分环境阻塞（`SANDBOX_UNAVAILABLE`/`NOT_PROVISIONED`/`RUNNER_FAILED`，诊断以结构化 display 事实 `diagnostics` 投影，error message 只保留策略原因）与用户拒绝（`APPROVAL_REQUIRED`）；进程类调用的结果展示事实携带结构化 `executionMode`（`sandboxed`/`unisolated`/`unavailable`），展示层不得把 `unisolated`/`unavailable` 宣称隔离。命令审批展示事实（`ApprovalDisplayFacts`）另冻结可识别工作目录 `cwd`（本地 facts 提供 canonical 目录，未绑定 workspaceRoot 时为输入原文）与 `unknownScope`（命令声明外部效果但未声明精确目标时为 true，展示层给出"修改范围无法精确限定"提示，不得宣称"仅覆盖精确目标"）；`actionPreview` 保留既有长度预算与凭据脱敏，触达预算时附截断提示。Kernel 对一切 denied 终止写 `turn_failed`（checkpoint `status: "failed"`），文案按 errorCode 区分（沙箱→"沙箱不可用，无法提供已隔离执行，本次任务已停止"，用户拒绝→既有"不会尝试其他命令"），任务受阻不得显示为 `turn_completed`。用户拒绝不得触发自动重试。
+- 文件工具 mutation 名义层：`write_file` / `edit_file` 直接修改真实工作区，不进入 OS 进程沙箱；两者在执行锁内、真实 mutation 前读取 Turn 冻结 `sandbox` 绑定模式——`read-only` 一律拒绝并返回 `FS_SANDBOX_DENIED`（文件工具域稳定错误码，区别于进程域 `SANDBOX_POLICY_DENIED`），且不产生任何磁盘变化，判定只消费冻结 mode、不依赖 SandboxPort capability；`workspace-write` 与 `danger-full-access` 均维持既有工作区围栏（锁内 canonicalize-then-contain、审批、mutation WAL、写后 hash、Undo 不回退），`danger-full-access` 不放宽工具 schema 与允许范围；tempRoot 只属于进程沙箱策略，不构成文件工具写白名单；缺沙箱绑定的旧上下文不虚构 read-only，沿用既有围栏行为。
 
 #### Chat 只读 capability
 
@@ -788,22 +872,22 @@ RAG 正文在证据核验前缓冲，工具前叙述和推理摘要不作为事�
 
 | API | 签名 | 使用规范 |
 |---|---|---|
-| `parseMcpConfig` | `(raw: unknown) => McpCapability` | 纯解析 `.autopilot/mcp.json` 的对象或数组形式，不读文件、不启动 MCP 子进程；非法 server 会被跳过。`env` 仅允许非敏感固定值或 `{ credentialRef }`。server 可设置 `execution: "sandbox" | "host"`，缺省为 `host`；直接传入 Core 的 `McpServerConfig` 若省略该字段也按 `host` 处理。只有显式 `execution: "sandbox"` 才经 `SandboxPort`，且初始化失败保持 fail-closed。`host` 以宿主权限运行，状态与工具审批均显示 `unisolated`，并使用受控环境：PATH、显式 env/凭据与已存在的 Windows `SystemRoot`、`SystemDrive`、`ComSpec`、`PATHEXT`。Windows 缺失的 libuv required vars（`HOMEDRIVE`、`HOMEPATH`、`LOGONSERVER`、`PATH`、`SYSTEMDRIVE`、`SYSTEMROOT`、`TEMP`、`USERDOMAIN`、`USERNAME`、`USERPROFILE`、`WINDIR`）及 `TMP` 会以空字符串中和，防止 libuv 从宿主补回；Windows 环境键按大小写不敏感规则合并，显式配置/凭据覆盖默认值。其他宿主环境变量不继承。沙箱准备环境中的同名变量也按平台规则覆盖配置值。两种模式都要求 Workspace Trust、绑定当前有效配置的精确 grant 与逐次 MCP 工具审批。 |
+| `parseMcpConfig` | `(raw: unknown) => McpCapability` | 纯解析 `.autopilot/mcp.json` 的对象或数组形式，不读文件、不启动 MCP 子进程；非法 server 会被跳过。`env` 仅允许非敏感固定值或 `{ credentialRef }`。server 可设置 `execution: "sandbox" \| "host"`，缺省为 `host`；直接传入 Core 的 `McpServerConfig` 若省略该字段也按 `host` 处理。只有显式 `execution: "sandbox"` 才经 `SandboxPort`，且初始化失败保持 fail-closed。`host` 以宿主权限运行，状态与工具审批均显示 `unisolated`，并使用受控环境：PATH、显式 env/凭据与已存在的 Windows `SystemRoot`、`SystemDrive`、`ComSpec`、`PATHEXT`。Windows 缺失的 libuv required vars（`HOMEDRIVE`、`HOMEPATH`、`LOGONSERVER`、`PATH`、`SYSTEMDRIVE`、`SYSTEMROOT`、`TEMP`、`USERDOMAIN`、`USERNAME`、`USERPROFILE`、`WINDIR`）及 `TMP` 会以空字符串中和，防止 libuv 从宿主补回；Windows 环境键按大小写不敏感规则合并，显式配置/凭据覆盖默认值。其他宿主环境变量不继承。沙箱准备环境中的同名变量也按平台规则覆盖配置值。两种模式都要求 Workspace Trust、绑定当前有效配置的精确 grant 与逐次 MCP 工具审批。 |
 | `getMcpServerConfigHash` | `(server: McpServerConfig) => string` | 为 name、command、args、cwd、受控 env 与有效执行方式（缺省按 `host`）生成稳定 hash；`execution: "host"` 与 `execution: "sandbox"` 均参与 hash。模式切换会使 grant 失效；旧算法未包含模式的 grant 不匹配新 hash，迁移后需重新授权。 |
 | `getMcpServerGrantConstraint` | `(server: McpServerConfig) => string` | 返回绑定 `serverName + configHash` 的 `mcp_server_start` 持久授权约束；只有 Trust 和当前模式/配置对应的精确 grant 命中后才尝试启动。 |
 | `createEventEnvelope` | `(input: CreateEventEnvelopeInput) => AgentEventEnvelope` | 纯工厂；同一 durable Turn 的 start/continue/recovery 由 Runtime 保持单调 `seq`，调用方提供 ISO 时间戳。 |
 | `sanitizeCheckpoint` | `(checkpoint: AgentCheckpoint) => PublicCheckpointView` | 只投影生命周期字段、空消息/调用数组、安全 Skill 身份及可选 `consumedInputIds`；canonical 消息和工具事实不进入宿主状态。 |
 | `sanitizeEventForExternal` | `(event: AgentLoopEvent) => AgentEvent` | 对终态与非终态 checkpoint 统一应用严格白名单；另将 `todo_write` 结果降为 counts、Web 工具结果降为安全事实、`render_ui` 结果降为 `{ delivered: true }`，并对白名单 `ui_document` 重新校验投影；`turn_failed` 只保留白名单诊断类别/阶段/状态与 UUID 反馈 ID，错误正文使用固定安全文案。 |
 | `sanitizeAgentTerminationView` | `(value: unknown, recoverableOverride?: boolean) => AgentTerminationView \| undefined` | 只接受终态原因、Core 恢复布尔值及与原因匹配的有限预算数值；未知字段或非法预算不会被复制。 |
-| `resolveRunConfig` | `(input: ResolveRunConfigInput) => FrozenRunConfig` | 按 Turn > Session > Project > Runtime 默认值解析，并保持 Trust 只来自 Runtime 默认值。 |
+| `resolveRunConfig` | `(input: ResolveRunConfigInput) => FrozenRunConfig` | 模型、推理、凭据、权限及执行预算按 Turn > Session > Project > Runtime 解析；其他字段按各自契约解析，Trust/沙箱只来自 Runtime 默认值。 |
 | `resolveAgentRuntimeLimits` | `(request?: Partial<ResolvedAgentRuntimeLimits>) => ResolvedAgentRuntimeLimits` | 统一解析 `maxSteps` 和 `maxToolRetries`；未配置 `maxSteps` 时保持 `undefined`，不启用总 step 闸门。 |
 | `resolveAgentRuntimeSafetyLimits` | `(request?: Partial<AgentRuntimeSafetyLimits>) => AgentRuntimeSafetyLimits` | 解析显式时长/Token 安全预算；时长不封顶，Token 仍受硬上限约束，不负责 Goal 跨 Turn 聚合。 |
 | `resolveLimitConfig` | `(config: LimitConfig) => number \| undefined` | 非正数回退已配置默认值；请求值与默认值都缺省时返回 `undefined`，配置了 `hardLimit` 时才封顶。 |
-| `AGENT_RUNTIME_LIMIT_DEFAULTS` / `AGENT_RUNTIME_LIMIT_HARD_LIMITS` | 常量 | `maxSteps` 默认关闭，显式正整数无固定平台封顶；`maxToolRetries` 硬上限为 `10`、默认值为 `5`。 |
+| `AGENT_RUNTIME_LIMIT_DEFAULTS` / `AGENT_RUNTIME_LIMIT_HARD_LIMITS` | 常量 | `maxSteps` 默认关闭，显式正整数无固定平台封顶；`maxToolRetries` 硬上限为 `10`，环境变量 `AGENT_MAX_TOOL_RETRIES` 未提供合法值时默认 `5`；`maxSteps` 可由 `AGENT_MAX_STEPS` 显式启用。 |
 | `AGENT_RUNTIME_SAFETY_DEFAULTS` / `AGENT_RUNTIME_SAFETY_HARD_LIMITS` | 常量 | 执行段时长和 Turn 累计 Token 默认关闭；时长无固定平台封顶，Token 硬上限为 `10,000,000`；不替代 Goal 域预算。 |
 | `SANDBOX_ERROR_CODES` / `SANDBOX_POLICY_VERSION` | 常量 | 6 个稳定沙箱错误码与沙箱冻结语义版本（当前 `1`）；`isSandboxPolicyDenialCode` / `isSandboxAvailabilityFailureCode` 区分两类失败语义。 |
 | `resolveSandboxMode` | `(value: unknown) => SandboxMode` | 只接受 `read-only` / `workspace-write` / `danger-full-access`；未知值抛 `SANDBOX_MODE_INVALID`，不静默回退。 |
-| `computeSandboxPolicyDigest` | `({ mode, workspaceRoot?, tempRoot? }) => string` | 冻结 policy 的 SHA-256 安全摘要；确定且不泄露路径明文。 |
+| `computeSandboxPolicyDigest` | `({ mode, workspaceRoot?, tempRoot?, externalWriteCapability? }) => string` | 冻结 policy 的 SHA-256 安全摘要；外部写能力存在时还纳入其版本和 capabilityDigest，不复制目标路径明细。 |
 | `createUnavailableSandboxPort` / `SandboxPortError` | 工厂 / 错误类 | fail-closed 默认 Port（一切进程执行 `SANDBOX_UNAVAILABLE`）；错误 `code` 必须来自 `SANDBOX_ERROR_CODES`。 |
 
 受管后台执行扩展：`SandboxExecutionRequest.managed?: boolean` 请求可选控制能力；`SandboxPreparedCommand.control?: ManagedExecutionControl` 只属于本次执行，不持久化。`protocolVersion: 1`、一次性 `bind(ManagedExecutionChannel)` 和 `stop(): Promise<{ evidence: "container_empty" }>` 使用宿主创建的私有双向字节流，不能用目标 stdin/stdout/stderr 或任意 PID 代替。重复 stop 复用进行中的能力调用；容器空回执与包装 `close` 都满足才落 `stopped`，失败保留 `stopping`/执行资源。缺少该能力时 taskkill 成功不能认证容器已清空。这是可选的公开 Port 扩展：内置 Node Adapter 当前不提供实现，外部 Port 仍可提供；宿主执行形态不使用控制协议，其停止证据为进程树终止加 `close` 观察。
@@ -946,7 +1030,7 @@ interface IngestResult {
   columns: string[];
   previewRows: Record<string, unknown>[];
   resourceId?: string;
-  status?: "completed" | "partial";
+  status?: KnowledgeResourceStatus;
   failedPages?: number[];
 }
 ```
@@ -955,8 +1039,8 @@ interface IngestResult {
 |---|---|
 | `type` | 必填。当前运行时支持 `excel`、`text`、`pdf`、`image`；`video` 仍是声明预留值，不得作为前端可选项。 |
 | `tableName` / `clearFirst` | 仅保留给旧入库 helper 的兼容类型；统一 `rag.ingest()` 会忽略调用方表名与清表请求，由 Core 根据随机 `resourceId + embeddingSpaceId` 派生物理表，partial 重试也不会删除已成功页。 |
-| `headerRow` / `sheetName` | Excel 专属；`headerRow` 为 0-based。 |
-| `chunkSize` / `chunkOverlap` | Text/PDF 分块参数；默认由 Core 分块器决定。 |
+| `headerRow` / `sheetName` | Excel 专属；`headerRow` 为 0-based，缺省为 `1`；`sheetName` 缺省取首表。 |
+| `chunkSize` / `chunkOverlap` | Text 分块默认 `chunkSize: 512`、`chunkOverlap: 128`；Excel 也把这两个参数传给同一分块器。PDF 使用页级管线，不读取这两个分块参数。 |
 | `onProgress` | 仅用于宿主进度展示；不要把 `chunkText` 原文输出到不可信日志。 |
 | `signal` | 传播到 PDF worker、OCR、Embedding 与写入边界；取消终态为 `cancelled`，不得继续计费或写入。 |
 | `displayName` | 经应用层校验的原始展示名；资源身份始终使用 Core 生成的 `resourceId`。 |
@@ -1005,10 +1089,10 @@ const parsed = await parseDocument({ bytes: uploadedBytes, mimeType: "applicatio
 #### `rag.search(query, topK?, tableName?)`
 
 ```ts
-const rows = await rag.search("退款流程", 8, "product_handbook");
+const rows = await rag.search("退款流程", 8, ingestResult.tableName);
 ```
 
-返回 `Promise<VectorOutput[]>`。它只在一个表中执行语义搜索，适合调用方明确知识表的场景。
+返回 `Promise<VectorOutput[]>`，`topK` 缺省为 `5`。它只在一个表中执行 Dense 语义搜索；未传 `tableName` 时沿用旧默认 `employee_test`，不会自动选择刚入库的资源。目标必须有当前知识根的 manifest 且 Embedding 空间匹配，否则抛 `RAG_VECTOR_SPACE_MISMATCH`。新调用方应使用入库结果的 `tableName`，或改用多表检索。
 
 #### `rag.searchAcrossTables(query, topK?, tableName?)`
 
@@ -1017,7 +1101,7 @@ const search = await rag.searchAcrossTables("退款流程", 8);
 console.log(search.searchedTables, search.results);
 ```
 
-未显式传表时，Core 从当前 Workspace 的 completed/partial manifest 做有界资源预路由；同一 query 在同一 `embeddingSpaceId` 只生成一次向量。每张候选表分别执行 Dense 与持久关键词索引召回，再仅按名次用 RRF 融合，不比较不同向量空间或检索器的原始分数。普通查询不会调用 `listVectorTextRecords()` 回读整张 LanceDB 表；缺失/损坏的关键词索引只降级为 Dense，不在查询热路径自动重建。
+`topK` 缺省为 `5`。未显式传表时，Core 从当前绑定知识根的 completed/partial manifest 做有界资源预路由；同一 query 在同一 `embeddingSpaceId` 只生成一次向量。每张候选表分别执行 Dense 与持久关键词索引召回，再仅按名次用 RRF 融合，不比较不同向量空间或检索器的原始分数。普通查询不会调用 `listVectorTextRecords()` 回读整张 LanceDB 表；缺失/损坏的关键词索引只降级为 Dense，不在查询热路径自动重建。
 
 ```ts
 interface SearchAcrossTablesResult {
@@ -1039,7 +1123,7 @@ interface SearchAcrossTablesResult {
 const answer = await rag.ask(
   "退款多久到账？",
   5,
-  "product_handbook",
+  ingestResult.tableName,
   [{ role: "user", content: "我刚申请了退款。" }],
 );
 console.log(answer.answer, answer.sources);
@@ -1088,16 +1172,16 @@ export async function POST(request: Request) {
 |---|---|---|
 | `getResourcePreview` | `(resourceId: string, signal?: AbortSignal) => Promise<{ buffer: Buffer; mimeType: string }>` | 用户管理预览：只读 completed/partial；PDF 首页 PNG、image 规范 PNG、Text/Excel/DOCX 有界文本（最多 16,000 字符，复用 20 MiB 解析上限）。拒绝路径/链接及删除态；错误由既有 RagError 收敛。 |
 | `getStoredImage` | `(fileName: string) => Promise<{ buffer: Buffer; mimeType: string }>` | 仅供宿主从受控存储读取 PDF 来源图；浏览器只能传逻辑文件名，Route 必须做会话/资源边界校验。 |
-| `rebuildLexicalIndexes` | `(tableName?: string) => Promise<{ tableName: string; recordCount: number }[]>` | 显式维护操作：从当前 Workspace 的 LanceDB 受控正文快照重建持久关键词索引；普通查询不调用。 |
+| `rebuildLexicalIndexes` | `(tableName?: string) => Promise<{ tableName: string; recordCount: number }[]>` | 显式维护操作：从当前绑定知识根的 LanceDB 受控正文快照重建持久关键词索引；普通查询不调用。 |
 | `getToolDefinitions` | `() => ToolModelDefinition[]` | 兼容工具入口仅返回 `read_file`；私有检索不再通过无产品绑定的工具执行器暴露。 |
 | `executeTool` | `(request, options?) => Promise<ToolExecutionResult>` | 见[工具执行与权限](#5-工具执行与权限)；不能做成浏览器匿名执行端点。 |
 | `getRagCapability` | `() => RagCapability` | 供受信 Chat 知识适配复用 canonical 检索；不直接注入 Work Runtime，也不是通用工具执行入口。 |
 
 `RunConfig.rag/ragSourcePolicy/rerankPolicy/focusedPdfFileName` 保留旧宿主的类型兼容，但 Runtime 会清除它们，不触发检索或 Rerank。Chat 检索通过 `chatLoader` 的知识端口。canonical RAG 服务仍可使用 `RAGAgentOptions.rerank.defaultPolicy/resolveApiKey`；真实 Key 不进入持久化和浏览器。
 
-文本候选只调用专用 `qwen3.7-text-rerank` endpoint；视觉条件成立时，Core 从当前 Workspace 原始 PDF 按需渲染有限候选页并调用 `qwen3-vl-rerank`。请求固定 `return_documents=false`，响应必须完整覆盖本批候选且每个 `index` 唯一、为整数并未越界；任何空、不完整、重复、越界或非法分数响应都会整体降级并保持上游顺序，不接受 Provider 回显正文，也不回退 `askLoopLLM()` / `askLLMWithImages()` 做 Chat Prompt 精排。429/5xx 只做一次小预算重试，4xx 不盲重试，取消会继续向上抛出。
+文本与视觉候选交给 `rerank.adapter` 的相应角色专用接口；内置百炼默认分别使用 `qwen3.7-text-rerank` 和 `qwen3-vl-rerank`。视觉条件成立时，Core 从当前绑定知识根原始 PDF 按需渲染有限候选页。内置适配器请求固定 `return_documents=false`，响应必须完整覆盖本批候选且每个 `index` 唯一、为整数并未越界；任何空、不完整、重复、越界或非法分数响应都会整体降级并保持上游顺序，不接受 Provider 回显正文，也不回退 `askLoopLLM()` / `askLLMWithImages()` 做 Chat Prompt 精排。429/5xx 只做一次小预算重试，4xx 不盲重试，取消会继续向上抛出。
 
-canonical `prepareRagSearch` 返回能回查当前知识根 completed/partial manifest 的证据；无效候选移除，全部无效返回不足。`RagEvidence.sourceType` 支持 image，可选 `sufficient` 为保守质量判断：有专用精排分数时须 >= 0.5 且有可读文字或图像，否则须正文命中问题至少一个长度 >= 2 的词项；纯图片可用展示名匹配，再经实际视觉观察取证。PDF evidence.text 仅含当前页正文，不把文件名/标题/相邻摘要当成事实。词项门可能拒绝同义改写，并不证明事实相关性或源内容真实性；Chat 仍逐字校验摘录。空候选不触发 HyDE；检索 I/O/Provider 故障按 RAG_SEARCH_FAILED 收敛，不记录原始错误或冒充空库；查询 Embedding/HyDE 传递取消。Chat 知识适配负责将它们绑定到 Knowledge Space、Session、Turn 和批次，并按 Chat 证据门验证。PDF 底层使用 `rag-resource:<resourceId>:page:<pageNumber>`、图片使用 `rag-resource:<resourceId>:image` 引用，受信适配可映射为 Chat 受控视觉引用；Work `vision_analyze` 不再消费该来源。
+canonical `prepareRagSearch` 返回能回查当前知识根 completed/partial manifest 的证据；无效候选移除，全部无效返回不足。`RagEvidence.sourceType` 支持 image，可选 `sufficient` 为保守质量判断：专用适配器提供 `relevant` 时须为 true 且有可读文字或图像，否则按正文命中问题至少一个长度 >= 2 的词项判断；内置百炼两种已知模型采用 0.5 门槛；纯图片可用展示名匹配，再经实际视觉观察取证。PDF evidence.text 仅含当前页正文，不把文件名/标题/相邻摘要当成事实。词项门可能拒绝同义改写，并不证明事实相关性或源内容真实性；Chat 仍逐字校验摘录。空候选不触发 HyDE；检索 I/O/Provider 故障按 RAG_SEARCH_FAILED 收敛，不记录原始错误或冒充空库；查询 Embedding/HyDE 传递取消。Chat 知识适配负责将它们绑定到 Knowledge Space、Session、Turn 和批次，并按 Chat 证据门验证。PDF 底层使用 `rag-resource:<resourceId>:page:<pageNumber>`、图片使用 `rag-resource:<resourceId>:image` 引用，受信适配可映射为 Chat 受控视觉引用；Work `vision_analyze` 不再消费该来源。
 
 ### 3.7 RAG 统一错误
 
@@ -1163,7 +1247,7 @@ const runtime = createAgentRuntime({
 | `sync` | `() => Promise<DatabaseSyncResult>` | 同步并原子发布快照；失败不替换最后一次成功快照。 |
 | `getReadCapability` | `() => DatabaseSnapshotReadCapability` | 为独立数据库 Adapter 提供只读 capability；不含 MySQL connection。 |
 
-`snapshotRoot` 由宿主在 Trust 后解析；Web 默认使用当前 Workspace `stateRoot/database-snapshots`，SQLite manifest 与数据库语义 LanceDB 均位于该根下。未显式传入时，兼容入口才使用服务端 `DATABASE_SNAPSHOT_PATH` / `LANCE_DB_PATH`。数据源注册项必须通过 `allowedTables` 显式允许同步表；字段敏感规则仍会在 allowlist 之后继续排除危险表列，缺少 allowlist 时不开放任何表。
+`snapshotRoot` 由宿主在 Trust 后解析；Web 默认使用当前绑定知识根 `stateRoot/database-snapshots`，SQLite manifest 与数据库语义 LanceDB 均位于该根下。未显式传入时，兼容入口才使用服务端 `DATABASE_SNAPSHOT_PATH` / `LANCE_DB_PATH`。数据源注册项必须通过 `allowedTables` 显式允许同步表；字段敏感规则仍会在 allowlist 之后继续排除危险表列，缺少 allowlist 时不开放任何表。
 
 `DatabaseSnapshotReadCapability` 提供 `getStatus()`、`describeSnapshotTables()`、`search(query, topK?)` 和 `snapshotQuery(sql)`。`describeSnapshotTables()` 只返回已发布 manifest 中的安全表名、表注释及列名/类型/注释；`snapshotQuery` 只接受单条只读 `SELECT` / JOIN / 聚合 SQL，拒绝修改、DDL、多语句、注释绕过、系统表和跨快照访问。执行结果统一读取至 201 行后最多返回 200 行，因此只有真实超限时 `truncated=true`。`queryTimeoutMs` 默认 10 秒、最大 30 秒；SQL.js/WASM 在服务端 Node Worker 中执行，超时会终止 Worker，不阻塞 Node 主事件循环或浏览器渲染线程。
 
@@ -1217,13 +1301,13 @@ interface DatabaseQueryProfile {
 
 公开辅助包括 `DATABASE_ERROR_CODES`、`readDatabaseErrorCode()` 和 `toDatabaseError()`。稳定分类分别覆盖配置缺失、JSON 非法、不是数组、数据源项不完整，来源名非法、未登记、默认来源为空或多来源歧义，连接认证失败、连接超时、连接失败，标识符非法、同步账号非只读、快照未同步/清单损坏/本地文件缺失、SQL 非只读/系统访问/表越界/超时，以及各操作的未知失败 fallback；底层 `cause` 不进入模型或浏览器响应。
 
-### 4.3 `getDefaultDatabaseSource()`
+### 4.4 `getDefaultDatabaseSource()`
 
 签名：`() => Pick<MySQLSourceConfig, "database" | "displayName">`。
 
 返回唯一已注册源的安全标识；当前注册表不是唯一源时会抛错。仅服务端可信管理流程可使用；不要用它推导或暴露连接配置。
 
-### 4.4 知识资源管理
+### 4.5 知识资源管理
 
 ```ts
 const resources = await listKnowledgeResources();
@@ -1281,6 +1365,7 @@ interface ToolExecutionOptions {
 |---|---|
 | `success` | 含 `output`、执行 `meta` 与安全 `display`。 |
 | `approval_required` | 含冻结的 `ToolApprovalRequest` 与安全 `display`；应交给 Runtime 审批服务处理。 |
+| `question_required` | 含持久化的 `UserQuestionRequest`；只在已启用结构化问答的 Runtime 工具链产生，随后暂停等待答案。 |
 | `denied` / `error` | 含受控 `ToolError` 与可用时的安全 `display`。 |
 | `cancelled` / `timeout` | 含 `error`、`meta`、可否重试的 `interruption` 与可用时的安全 `display`。 |
 
@@ -1295,9 +1380,9 @@ type ToolApprovalDecision = "allow_once" | "allow_session" | "allow_workspace" |
 
 | 模式 | 是否弹卡 | 可提交的审批决定 |
 |---|---|---|
-| `ask` | 除只读操作外都需要人工审批。 | 普通工具为四选一 `allow_once` / `allow_session` / `allow_workspace` / `deny`；`run_command` 只允许 `allow_once` / `deny`；当前归属精确 Job 停止免额外审批。 |
-| `auto_approve` | 只自动放行 `read_only`，以及工作区可信（`workspaceTrusted === true`）时的 `write` / `workspace_mutating`；`external_side_effect`、`unknown`、`destructive` 仍人工审批。 | 当前归属精确 Job 停止免额外审批；其余需审批工具四选一。 |
-| `full_access` | 跳过全部一般审批，但不改变下方任何硬门禁。 | 不适用，该模式不产生审批。 |
+| `ask` | 需要审批的操作在无有效授权时询问。 | 普通工具四选一；精确 `cmd:v2` 普通命令可选 `allow_once` / `allow_workspace` / `deny`；Windows 宿主命令及受单次保护的动作仅 `allow_once` / `deny`。当前归属精确 Job 停止免额外审批。 |
+| `auto_approve` | 只自动放行 `read_only`，以及工作区可信（`workspaceTrusted === true`）时的 `write` / `workspace_mutating`；`external_side_effect`、`unknown`、`destructive` 仍人工审批。 | 危险、未知进程、MCP 和一般外部副作用仅单次确认；其他范围以冻结的 `allowedDecisions` 为准。当前归属精确 Job 停止免额外审批。 |
+| `full_access` | 跳过一般审批。删除、丢弃已有修改、`git push`、效果不明的进程和其他精确授权边界仍需人类确认。 | 受保护动作仅接受 `allow_once` 或 `deny`，明确拒绝继续生效。 |
 
 各模式在具体操作上的行为：
 
@@ -1307,18 +1392,20 @@ type ToolApprovalDecision = "allow_once" | "allow_session" | "allow_workspace" |
 | 工作区写入（`write_file` / `edit_file`） | 弹卡 | 工作区可信则自动执行，否则弹卡 | 直接执行 |
 | 已识别只读命令（`pwd` / `rg` / `git status` / `git diff` / `git log`） | 弹卡 | 自动执行 | 直接执行 |
 | 已识别工作区变更命令（`mkdir` / `touch` / `git add`） | 弹卡 | 工作区可信则自动执行，否则弹卡 | 直接执行 |
-| 网络或外部副作用命令（`curl` / `wget` / `npm install`） | 弹卡 | 仍弹卡 | 直接执行 |
-| 未知命令或含工作区外路径参数的命令 | 弹卡 | 仍弹卡 | 直接执行 |
+| 已确认效果的一般外部动作 | 弹卡 | 仍弹卡 | 直接执行 |
+| 删除、`git push`、脚本或效果不明的命令 | 弹卡 | 仍弹卡 | 仅单次确认 |
+| 工作区外修改 | 精确授权 | 精确授权 | 精确授权 |
 | 硬拒绝命令（`rm` / `del` / `rmdir` / `git clean` / `git reset --hard` / `format` / `shutdown`） | `deny` | `deny` | `deny` |
-| `web_fetch` | 首次访问该域名弹卡 | 仍弹卡 | 直接执行 |
+| `web_fetch` | 按域名审批 | 初始公开读取与同域跳转免普通审批，跨域另行审批 | 初始公开读取与同域跳转免普通审批，跨域另行审批 |
 | `vision_analyze` | 弹卡 | 自动执行 | 直接执行 |
 | `stop_background_job` | 当前归属精确 Job 免额外审批 | 当前归属精确 Job 免额外审批 | 仍校验归属 |
-| `web_search` | 直接执行 | 直接执行 | 直接执行 |
+| `web_search` | 审批后搜索 | 已启用时免普通审批 | 已启用时免普通审批 |
+| AP `browser` | Core 审批后进入桌面浏览器授权 | 公开导航与观察免 Core 通用审批，继续检查桌面浏览器授权 | 公开导航与观察免 Core 通用审批，继续检查桌面浏览器授权 |
 
 注意事项：
 
-- `ask` 的语义是「对标记为需要审批的操作询问」，不是「所有工具逐次询问」。只读工具自报 `requiresApproval: false`，在所有模式下都不弹卡。
-- `ask` 模式下 `run_command` 仅接受绑定 canonical 工作目录、平台、平台解析后的程序身份与完整 argv 的精确命令约束（`cmd:v2:<sha256>`）参与持久授权：用户选择「记住此命令」后，完全相同的命令（程序身份、参数与工作目录一致）在本工作区自动放行，参数或目录不同必须重新确认；审批范围冻结为 `["allow_once", "allow_workspace", "deny"]`。程序身份按平台解析：Windows 上 `.cmd`/`.exe` 后缀与大小写属同一等价解析，其余平台扩展名与大小写都是实际可执行文件身份的一部分，不折叠。无精确约束（旧 `program:` 宽约束或缺失）时保持逐次确认且不查询命中；历史 `cmd:v1` 约束不再签发，**其授权也不再命中**。记住命令不涉及无沙箱降级：沙箱连续启动失败一律 fail-closed deny，无沙箱降级审批已撤下。`stop_background_job` 不使用持久授权，当前归属精确 Job 免额外审批，外部或不确定 owner 不能控制。
+- `ask` 的语义是「对标记为需要审批的操作询问」，不是「所有工具逐次询问」。普通只读工具的可信本地事实若为 `requiresApproval: false`，可跳过一般审批；显式外部 ask、能力/Skill 限制及其他前置门禁仍优先。
+- 非宿主直执的普通 `ask` 模式 `run_command` 仅接受绑定 canonical 工作目录、平台、平台解析后的程序身份与完整 argv 的精确命令约束（`cmd:v2:<sha256>`）参与持久授权：用户选择「记住此命令」后，完全相同的命令（程序身份、参数与工作目录一致）通过更高优先级安全门后在本工作区可自动放行，参数或目录不同必须重新确认；审批范围冻结为 `["allow_once", "allow_workspace", "deny"]`。程序身份按平台解析：Windows 上 `.cmd`/`.exe` 后缀与大小写属同一等价解析，其余平台扩展名与大小写都是实际可执行文件身份的一部分，不折叠。无精确约束（旧 `program:` 宽约束或缺失）时保持逐次确认且不查询命中；历史 `cmd:v1` 约束不再签发，**其授权也不再命中**。记住命令不涉及无沙箱降级：沙箱连续启动失败一律 fail-closed deny，无沙箱降级审批已撤下。`stop_background_job` 不使用持久授权，当前归属精确 Job 免额外审批，外部或不确定 owner 不能控制。
 - `full_access` 只放宽审批交互，不绕过工作区路径解析、Schema 校验、read-before-edit、命令硬拒绝、destructive guard、命令 `shell: false` 与 program/args 校验，以及 `web_fetch` 的 URL/DNS/重定向安全门。
 - 持久授权（`allow_session` / `allow_workspace`）只可由 `approvals.submit()` 建立，宿主不得自行写入授权存储。
 
@@ -1331,14 +1418,17 @@ type ToolApprovalDecision = "allow_once" | "allow_session" | "allow_workspace" |
 | 1 | 工具本地 `ActionFacts` 与 Registry `metadata` 的安全边界不一致 | `deny` |
 | 2 | 已完成的本地硬门禁（`hardDenyReason`，例如破坏性命令） | `deny` |
 | 3 | 当前激活 Skill 的 `allowedTools` 交集不含本次工具 | `deny` |
-| 4 | 进程类工具处于宿主执行装配（`hostExecution`） | `approval_required`，`allowedDecisions` 冻结为 `["allow_once", "deny"]` |
-| 5 | `requiresApproval` 不为真（只读操作） | `allow` |
-| 6 | 命中 Runtime 持久授权 | `allow` |
-| 7 | `permissionMode === "full_access"` | `allow` |
-| 8 | `permissionMode === "auto_approve"` 且风险被自动放行矩阵接受 | `allow` |
-| 9 | 以上都不成立 | `approval_required`，同时冻结 `allowedDecisions` |
+| 4 | 注入的沙箱事实不可用，或外部修改被显式 deny | `deny` |
+| 5 | `resume_thread`、显式外部 ask、单次保护，或非 full_access 的一般外部副作用 | `approval_required`，仅 `allow_once` / `deny` |
+| 6 | `requiresApproval` 不为真且无外部修改 | `allow` |
+| 7 | 外部修改缺少精确授权 | `approval_required`；宿主执行只允许单次决定 |
+| 8 | `ask` 模式的宿主进程执行 | 单次确认，先于 grant |
+| 9 | 命中 Runtime 持久授权 | `allow` |
+| 10 | `permissionMode === "full_access"` | `allow` |
+| 11 | `permissionMode === "auto_approve"` 且风险被自动放行矩阵接受 | `allow` |
+| 12 | 以上都不成立 | `approval_required`，同时冻结 `allowedDecisions` |
 
-宿主执行分支排在只读放行、持久授权、`full_access`、`auto_approve` 与 Trust 自动放行之前，因此 `run_command` 与 `start_background_job` 的每次调用都需要本次确认；已有 grant、`danger-full-access` 与历史审批都不替代它。硬门禁、Skill 白名单与显式外部 deny 的拒绝仍先于该分支。
+Windows 无隔离宿主执行在询问档保持逐次确认。完全访问与为我审批仍保留已核实命令的模式分流。删除、丢弃修改、`git push` 以及未知进程的单次确认排在持久授权之前，作用于 `run_command` 与 `start_background_job`。硬门禁、Skill 白名单、沙箱失败和显式外部拒绝继续优先。
 
 自动放行矩阵只有一条：`read_only` 恒放行；`write` 与 `workspace_mutating` 仅在 `workspaceTrusted === true` 时放行；其余风险（含 `external_side_effect`、`unknown`、`destructive`）一律不自动放行。
 
@@ -1356,11 +1446,12 @@ type ToolApprovalDecision = "allow_once" | "allow_session" | "allow_workspace" |
 |---|---|---|
 | `pwd`、`rg`、`git status`、`git diff`、`git log` | `read_only` | 需要审批 |
 | `mkdir`、`touch`、`git add` | `workspace_mutating` | 需要审批 |
-| `curl`、`wget`、`npm install` | `external_side_effect` | 需要审批 |
+| `curl`、`wget`、`npm install`、`npm publish`、`git push` | `external_side_effect` | 所有模式均需单次确认 |
+| `git restore`、非 hard 的 `git reset`、`git rebase`、`git commit --amend` 及已识别的 Git 删除/丢弃动作 | `destructive` | 所有模式均需单次确认 |
 | `rm`、`del`、`rmdir`、`git clean`、`git reset --hard`、`format`、`shutdown` | `destructive` | 硬拒绝 |
 | 未匹配任何规则 | `unknown` | 需要审批 |
 
-匹配按结构化 argv 逐段精确比较，不使用字符串前缀；参数中出现绝对路径、UNC 路径或 `..` 时，即使已识别命令也降级为 `unknown`。命令始终使用 `program + args` 与 `shell: false`，不支持 Shell 解释、管道或多命令。`ToolMetadata` 只声明副作用、并发、重试和超时，不是授权凭证。
+普通规则按结构化 argv 前缀匹配；Git 保护还识别子命令前的全局选项及关键选项。受限 `git clean` dry-run 与只读分支列举归为只读，真正删除仍硬拒绝。可能执行程序或写文件的选项，以及绝对/UNC/`..` 路径，会把原只读或工作区变更判断降为 `unknown`；已确定的 destructive/外部副作用不因这些参数降级。命令始终使用 `program + args` 与 `shell: false`，不支持 Shell 解释、管道或多命令。`ToolMetadata` 只声明副作用、并发、重试和超时，不是授权凭证。
 
 #### 5.2.3 持久授权的作用域与匹配
 
@@ -1386,7 +1477,7 @@ type ToolApprovalDecision = "allow_once" | "allow_session" | "allow_workspace" |
 
 #### 5.2.4 已有装配工具的当前行为
 
-已装配的 `web_search` 仅外发有界 `query`，用户级启用即构成该最小公开搜索外发的授权，不逐次审批；它串行使用 `web:search` 资源键、默认 15 秒/最大 30 秒且不自动重试。`web_fetch` 只接受无 userinfo 的 HTTP(S) URL，按小写目标域名生成审批与持久 grant 约束，在 `ask` 模式首次访问该域名需要审批；它按域名最多并发 2 个、默认 20 秒/最大 45 秒且不自动重试。Work `vision_analyze` 只读取工作区相对图片并外发给冻结的视觉 Provider：`ask` 仍可逐次审批，`allow_session` / `allow_workspace` 使用稳定约束 `vision-analyze:workspace`，`auto_approve` 按只读风险自动执行，`full_access` 也不再显示一般审批；所有模式仍保留工作区路径、Schema、能力和 Provider 失败门禁。 系统安排的会话图片回退在公开事件及历史重放中仅投影安全状态和审批身份，不暴露存储路径、原始工具参数或视觉观察；模型私有消息和 checkpoint 保持完整。
+已装配的 `web_search` 仅外发有界 `query`，用户级启用是能力装配条件。Work 的 `auto_approve` 和 `full_access` 对已启用的公开搜索放行普通审批；它串行使用 `web:search` 资源键、默认与最大均为 300 秒且不自动重试。`web_fetch` 只接受无 userinfo 的 HTTP(S) URL，按小写目标域名生成审批与持久 grant 约束，在 `ask` 模式按域名审批。Work 的 `auto_approve` 和 `full_access` 对初始公开读取和同域跳转放行普通审批，跨域目标重新审批。它按域名最多并发 2 个、默认与最大均为 60 秒且不自动重试。Work `vision_analyze` 只读取工作区相对图片并外发给冻结的视觉 Provider：`ask` 仍可逐次审批，`allow_session` / `allow_workspace` 使用稳定约束 `vision-analyze:workspace`，`auto_approve` 按只读风险自动执行，`full_access` 也不再显示一般审批；所有模式仍保留工作区路径、Schema、能力和 Provider 失败门禁。 系统安排的会话图片回退在公开事件及历史重放中仅投影安全状态和审批身份，不暴露存储路径、原始工具参数或视觉观察；模型私有消息和 checkpoint 保持完整。
 
 #### 5.2.5 决策链路与展示边界
 
@@ -1405,6 +1496,46 @@ type ToolApprovalDecision = "allow_once" | "allow_session" | "allow_workspace" |
 - `open_preview`：只含 `previewId`、`hostLabel`、`copyUrl`、`openWhen` 与 `state: "prepared"`，以及仅在宿主核验并绑定受管 Job 后出现的 `jobId`、仅在无法证明服务归属时出现的 `autoOpen: false`；`hostLabel` 为安全主机标签，`copyUrl` 等于宿主批准的实际页面地址，不含凭据、query、宿主文件路径或内部映射。该明细由工具自带的 `projectDisplayDetail` 从原始结果生成（`previewId`/`jobId` 格式非法、`hostLabel` 或 `copyUrl` 越界、`state` 非 `prepared` 时整体 fail-closed 省略），不来自 serialized output。
 
 `totalCount` / `totalMatchedLineCount` / `totalFileCount` 只在工具执行阶段没有丢弃结果时出现，禁止由 `shown*`、数组长度或 `truncated` 推断；`displayTruncated: true` 是 Core display 预算已裁剪的独立事实，即使总数未知也必须保留，与执行截断和 Web 局部折叠相互独立。旧 transcript 缺少该新增字段时保持兼容回退。
+
+#### 5.2.6 受限 PowerShell 单文件删除
+
+`run_command` 可可靠识别以下结构化入参为 `destructive`，`auto_approve` 与 `full_access` 均要求 `allow_once` 或 `deny`，普通持久 grant 不代替本次确认。
+
+```json
+{
+  "program": "powershell.exe",
+  "args": [
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "Remove-Item -LiteralPath 'r001-permissions-lollipop-auto.html' -ErrorAction Stop"
+  ],
+  "cwd": "."
+}
+```
+
+`pwsh` 使用相同参数也可识别。三个启动参数的顺序固定，命令与参数名大小写不敏感。单引号内仅接受单一相对叶文件名，须以 ASCII 字母、数字或下划线起始，其余可含字母、数字、下划线、点、空格或连字符，不接目录分隔符、父目录、通配、盘符/流、变量展开或额外命令。`-LiteralPath` 保持字面目标，`-ErrorAction Stop` 使删除错误终止调用。宿主仍无 OS 沙箱，本识别器只提供可信危险事实，不把任意 PowerShell 脚本变成安全命令，也不保证目标实际文件类型。超出该精确格式仍沿现有 unknown 路径。已有 `rm`、`del`、`rmdir`、`git clean` 与 `git reset --hard` 等 hard deny 继续拒绝。
+
+#### 5.2.7 外部权限规则辅助函数
+
+以下默认入口 API 只操作规则语法或覆盖关系，不 canonicalize 文件、不核验存在性、不产生 grant 或放行。
+
+| API | 签名 | 返回与限制 |
+|---|---|---|
+| `EXTERNAL_FILE_CONSTRAINT_PREFIX` | 常量 `"ext-file:"` | 外部文件约束前缀。 |
+| `isExternalFileConstraint` | `(constraint: string \| undefined) => boolean` | 只检查前缀，不证明后缀是安全 canonical 路径。 |
+| `externalFileConstraintTarget` | `(constraint: string \| undefined) => string \| undefined` | 提取前缀后目标，非外部约束返回 `undefined`。 |
+| `formatExternalFileRule` | `(toolName: string, constraint: string) => string` | read/glob/grep→`Read`、write→`Write`、edit→`Edit`；不支持的工具或空目标抛错。错误正文可能包含参数，宿主不要直接展示。 |
+| `parseExternalPermissionRule` | `(rule: string) => ParsedExternalPermissionRule \| null` | 解析 `Read/Write/Edit(绝对路径)` 与末尾 `/**` / `\**` 递归形式，拒绝 UNC、Windows 备用流、NUL/换行等；纯语法检查不替代路径解析。 |
+| `isValidExternalPermissionRule` | `(rule: string) => boolean` | 等价于 parse 结果非 `null`。 |
+| `externalRuleCoversRule` | `(denyRule: string, grantRule: string) => boolean` | 相同操作、精确目标或递归目录覆盖；Windows 盘符路径大小写不敏感。非法规则返回 `false`。 |
+
+```ts
+const rule = formatExternalFileRule("write_file", "ext-file:/external/report.txt");
+const parsed = parseExternalPermissionRule(rule);
+const covered = externalRuleCoversRule("Write(/external/**)", rule);
+// rule/parsed/covered 只描述规则；实际写入仍走 Runtime 审批链。
+```
 
 ### 5.3 `read_file` 分页读取与 `edit_file` 安全编辑
 
@@ -1425,7 +1556,7 @@ const result = await rag.executeTool({
 | `content`、`startLine`、`endLine`、`totalLines`、`truncated` | 仅为请求行区间的正文和分页元数据；模型不会收到未请求区间。 |
 | `sha256` | 仅完整读取时返回完整原始字节 hash；部分读取返回 `null`。Core 仍在内部保存完整 hash 与已观察行区间，供后续 stale/read-before-edit 校验；`versionSha256` 标识实际扫描的版本，不代表已观察未返回的正文。 |
 
-文件必须是工作区内的普通 UTF-8/UTF-16 文本。`read_file` 流式扫描原始字节：单次最多 `8 MiB`、单行最多 `64 Ki` 个 UTF-16 code units、单次 `content` 最多 `256 KiB`（UTF-8 编码字节）。超出扫描或单行上限时返回 `FILE_TOO_LARGE`；正文按 `256 KiB` 及约 `25,000` token 的本地保守估算预算选择连续完整行前缀（包含 JSON/canonical 工具结果包络，不是 Provider 精确计数，不调用计数 API），超预算时返回 `budgetTruncated` / `nextOffset` 供续读。首行本身无法放入预算时明确拒绝，不记录为已观察。非法编码或二进制返回 `BINARY_FILE`；取消返回 `EXECUTION_CANCELLED`。读取期间文件发生变化返回 `FILE_STALE`，宿主必须重新读取，不能把该结果用于编辑。
+文件必须是经 canonical 路径检查的普通 UTF-8/UTF-16 文本。工作区外读取仍须通过既有外部读取权限与 deny/ask 收窄；绝对路径本身不构成授权。`read_file` 流式扫描原始字节：单次最多 `8 MiB`、单行最多 `64 Ki` 个 UTF-16 code units、单次 `content` 最多 `256 KiB`（UTF-8 编码字节）。超出扫描或单行上限时返回 `FILE_TOO_LARGE`；正文按 `256 KiB` 及约 `25,000` token 的本地保守估算预算选择连续完整行前缀（包含 JSON/canonical 工具结果包络，不是 Provider 精确计数，不调用计数 API），超预算时返回 `budgetTruncated` / `nextOffset` 供续读。首行本身无法放入预算时明确拒绝，不记录为已观察。非法编码或二进制返回 `BINARY_FILE`；取消返回 `EXECUTION_CANCELLED`。读取期间文件发生变化返回 `FILE_STALE`，宿主必须重新读取，不能把该结果用于编辑。
 
 同一文件版本、同一 `offset/limit`，且旧成功结果的完整对应正文仍在当前模型可见上下文时，`read_file` 返回 `unchanged: true` 和明确复用提示，省略重复 `content`。每次仍扫描实际字节核对版本；换范围、外部变更或旧正文因压缩/裁剪丢失时重新返回正文，不以 mtime 或持久 read state 代替可见性证据。
 
@@ -1443,7 +1574,7 @@ const result = await rag.executeTool({
 
 | API | 签名 | 用途 |
 |---|---|---|
-| `createDefaultModelSamplerFactory` | `(options?: ModelSamplerFactoryOptions) => ModelSamplerFactory` | 创建默认 Provider sampler 工厂；可通过 `options.adapters` 注入协议 Adapter，未提供时注册内置 Anthropic Messages 与 OpenAI Chat Completions Adapter。带 `ModelRef` 的创建请求必须提供受支持且已冻结的 `providerConfig.apiProtocol`；未配置 `ModelRef` 时才使用 headless 回退。 |
+| `createDefaultModelSamplerFactory` | `(options?: ModelSamplerFactoryOptions) => ModelSamplerFactory` | 创建默认 Provider sampler 工厂；可通过 `options.adapters` 注入协议 Adapter，未提供时注册内置 Anthropic Messages、OpenAI Chat Completions 与 OpenAI Responses Adapter。带 `ModelRef` 的创建请求必须提供受支持且已冻结的 `providerConfig.apiProtocol`；未配置 `ModelRef` 时才使用 headless 回退。 |
 | `createFirstPartyModelSampler` | `(input) => ModelSampler` | 按冻结的 firstParty endpoint、认证和模型创建 Anthropic Messages sampler。 |
 | `createConfiguredModelSampler` | `(sampleOptions?: ModelSampleOptions, behaviorProfile?: ModelBehaviorProfile) => ModelSampler` | 使用给定采样选项和行为规范创建 OpenAI Chat Completions sampler；这是兼容旧内部调用路径的直接构造函数，不接收或解析 `apiProtocol`。需要按冻结协议选择 Adapter 时使用 `createDefaultModelSamplerFactory()`。 |
 | `createDefaultModelSampler` | `() => ModelSampler` | 默认入口公开的 headless 回退 sampler；不读取 Settings/CredentialStore，也不负责生产凭据装配。未配置 `ModelRef` 时，Factory 会使用它。 |
@@ -1465,13 +1596,22 @@ class ProviderProtocolAdapterRegistry {
 
 | API | 签名 | 说明 |
 |---|---|---|
-| `listModelCapabilities` | `() => readonly ModelCapability[]` | 列出内建通用模型能力。 |
+| `listModelCapabilities` | `() => readonly ModelCapability[]` | 保留旧三项能力目录（DeepSeek v4 flash/pro 与 qwen3-vl-flash）；不列出新 Responses route 的完整目录。 |
 | `getModelCapability` | `(provider, modelId) => ModelCapability \| undefined` | 精确查询模型能力。 |
 | `resolveModelSampleOptions` | `(input) => ModelSampleOptions` | 从冻结模型引用解析协议层采样选项。 |
 | `resolveFirstPartyModelSampleOptions` | `(modelRef, reasoningProfile, options?) => ResolvedFirstPartyModelSample` | 将 requested effort 解析为实际 Messages payload，并冻结 effective effort。 |
 | `createDefaultModelBehaviorProfile` | `() => ModelBehaviorProfile` | 创建默认 Agent 行为规范。 |
 
-`ModelSampleOptions.reasoningEffort` 只允许 `low | medium | high | max`。firstParty 对来自 CC `env.CLAUDE_CODE_EFFORT_LEVEL` 的明确 `max` 请求冻结并原样发送为 Messages `output_config.effort: "max"`；目标兼容端点不支持时必须返回其明确错误，Runtime 不得伪装回退为 `high`。
+`ApiProtocol` 为 `anthropic-messages | openai-chat-completions | openai-responses`。`ProviderRouteProfile` 包含 `id/apiProtocol/baseUrl/credentialRef/models`，可带 `protocolProfile` 与 `compatibilityPreset: "openai" | "deepseek" | "generic"`；模型条目可带 `contextWindowTokens`、`capabilities` 与独立 profile。Profile 是整对象选择，不按字段混合。
+
+| API | 签名 | 契约与示例 |
+|---|---|---|
+| `resolveRouteModelCapability` | `(route: ProviderRouteProfile, modelId: string) => 能力声明 & { contextWindowTokens?: number }` | 合并精确目录与 route 模型覆盖，再应用预设硬限制/协议收窄。非法 effort、默认 effort 不在列表或放宽已知硬限制时拒绝。例：`const capability = resolveRouteModelCapability(route, modelId);`。返回结构可从函数返回类型推导，不是单独导出的命名类型。 |
+| `resolveRouteProtocolProfile` | `(route: ProviderRouteProfile, modelId: string) => ProtocolProfile \| undefined` | 模型 profile 优先于 route；Responses 再校验兼容预设并补缺省 profile，冲突抛 `INVALID_PROTOCOL_PROFILE`。例：`const profile = resolveRouteProtocolProfile(route, modelId);`。 |
+
+Responses profile 为 `{ apiProtocol: "openai-responses", reasoningReplay: "none" | "encrypted" | "content" }`；该分支通过公开 `ProtocolProfile` 使用，分支命名类型没有从根入口单独导出。Responses Adapter 由工厂按冻结协议选择；不因 endpoint 或模型名猜测协议。
+
+`ModelSampleOptions.reasoningEffort` 为 `none | low | medium | high | xhigh | max`，实际可用值由冻结 route 的模型能力与协议共同收窄；Anthropic 不支持 `xhigh`。firstParty 对来自 CC `env.CLAUDE_CODE_EFFORT_LEVEL` 的明确 `max` 请求冻结并原样发送为 Messages `output_config.effort: "max"`；目标兼容端点不支持时必须返回其明确错误，Runtime 不得伪装回退为 `high`。
 
 `ModelCapability.promptCacheMode` 是逐模型的提示缓存策略声明，也是唯一允许发送协议缓存标记的来源：`explicit` 表示必须由本端在协议允许的稳定前缀边界发送 `cache_control`（Anthropic Messages 的最后一个工具定义、`system` 与对话前缀末尾，最多三个断点）；`server-auto` 表示服务端自动前缀缓存、本端不发标记（DeepSeek 官方上下文缓存默认开启）；`none` 表示未确认或不启用客户端标记，不代表服务端一定没有缓存。未登记模型一律按 `none` 处理，不得因厂商品牌或“兼容 Anthropic”推断支持。只有 `explicit` 才规范化非 assistant 的字符串 content 与断点位置，其余模式保持既有请求形状。
 
@@ -1486,15 +1626,16 @@ const normalizedBaseUrl = normalizeProviderBaseUrl("https://provider.example/v1/
 |---|---|
 | `resolveAutopilotSettings(sources)` | 按 User、Project、Local scope 归一化 Claude Code 风格的可信设置源，返回 `ResolvedAutopilotSettings` 和诊断。 |
 
-User scope 可通过顶层 `maxOutputTokens` 配置单次模型输出上限，只接受 `1..1,000,000` 的安全整数。该值由新 Turn 冻结为 Provider `maxTokens`；Project/Local 不能覆盖，缺失时由 Provider Adapter 使用 `8192` 兼容兜底，且它与 Turn 累计预算 `maxTotalTokens` 无关。
 | `normalizeProviderBaseUrl(value)` | 接受 `unknown`，规范化合法 HTTP(S) Provider base URL；不合法时返回 `undefined`。 |
 | `createMutationCompletionPolicy(maxRecoveryAttempts = 1)` | 创建默认完成策略；`write_file` / `edit_file` 只有真实磁盘字节读回与预期 hash 一致后才返回 `diskVerified: true`，正常可靠写入无需额外模型 `read_file`；旧未验证路径仍要求绑定版本及完整范围读回，不从用户自然语言推断写入意图；用于 Agent 完成判断，不是 UI 规则。 |
 
-`ResolvedAutopilotSettings` 只消费顶层 `env`、`model`、`availableModels`、`modelOverrides`、`alwaysThinkingEnabled`、`effortLevel` 与 User-only `webSearch`、`visionModel`、`rag` 子集。`webSearch:false` 显式禁用并产生 `webSearchDisabled:true`，阻止默认继承；连接对象必须精确为 `{ provider, baseUrl, model, credentialRef: { provider, key } }`，其中 provider 当前只接受 `deepseek | openai-compatible | xiaomi-mimo` 且必须与凭据引用一致；Project/Local 覆盖拒绝。快照产生不含明文 Key 的完整 `ResolvedWebSearchSettings`，旧的 DS-only `{ credentialRef }` 形状兼容规范化为官方 Anthropic 地址和 deepseek-flash 模型，具体 provider 是否受支持仍由 Node Adapter 注册边界判断。User `env` 白名单包含 `ANTHROPIC_BASE_URL`、二选一的 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`、模型 alias、`CLAUDE_CODE_EFFORT_LEVEL`、compact window、timeout 及三个 Search 固定凭据字段；Project/Local 不得提供这些 `env` 字段。`ANTHROPIC_MODEL` 优先于顶层 `model`；Opus/Sonnet/Haiku alias、单跳 `modelOverrides` 和 User allowlist 会在同一快照中收敛。`modelCandidates` 是不含凭据的内部候选目录：显式 `availableModels` 优先，缺失时由主模型、三个默认 alias 与 subagent 模型稳定去重生成；Project/Local 不能向其中注入候选。认证原文不会进入快照，只有受控 `credentialRef` 可供受信任 Node 宿主延迟解析。顶层 `effortLevel` 只接受 `low | medium | high`；显式 `max` 必须来自 `env.CLAUDE_CODE_EFFORT_LEVEL`，并在 Messages payload 中原样冻结。`CLAUDE_CODE_SUBAGENT_MODEL`、自动压缩阈值和 Provider timeout 会冻结到 Turn 私有配置；当前 Runtime 未创建子 Agent，不会拿该字段替换主模型。`schemaVersion`、`providers.*`、`models.primary`、`models.vision` 等旧结构一律返回诊断且不转换；未知 Claude Code 顶层字段不进入 Runtime 快照。
+User scope 可通过顶层 `maxOutputTokens` 配置单次模型输出上限，只接受 `1..1,000,000` 的安全整数。该值由新 Turn 冻结为 Provider `maxTokens`；Project/Local 不能覆盖，新 Turn 优先采用 `reasoningProfile.maxTokens`，再取此设置；未指定则取解析后模型能力的 `maxOutputTokens`，未知能力才回退 `8192`，同时受模型能力输出上限约束，且它与 Turn 累计预算 `maxTotalTokens` 无关。
+
+`ResolvedAutopilotSettings` 消费顶层 `env`、`model`、`availableModels`、`modelOverrides`、`alwaysThinkingEnabled`、`effortLevel`、`maxTurns`，以及受 scope 限制的 `providerRoutes`、`maxOutputTokens`、`webSearch`、`visionModel`、`rag`、`sandbox` 与 `permissions` 子集。`webSearch:false` 显式禁用并产生 `webSearchDisabled:true`，阻止默认继承；连接对象必须精确为 `{ provider, baseUrl, model, credentialRef: { provider, key } }`，其中 provider 当前只接受 `deepseek | openai-compatible | xiaomi-mimo` 且必须与凭据引用一致；Project/Local 覆盖拒绝。快照产生不含明文 Key 的完整 `ResolvedWebSearchSettings`，旧的 DS-only `{ credentialRef }` 形状兼容规范化为官方 Anthropic 地址和 deepseek-flash 模型，具体 provider 是否受支持仍由 Node Adapter 注册边界判断。User `env` 白名单包含 `ANTHROPIC_BASE_URL`、二选一的 `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`、模型 alias、`CLAUDE_CODE_EFFORT_LEVEL`、compact window、timeout 及三个 Search 固定凭据字段；Project/Local 不得提供这些 `env` 字段。`ANTHROPIC_MODEL` 优先于顶层 `model`；Opus/Sonnet/Haiku alias、单跳 `modelOverrides` 和 User allowlist 会在同一快照中收敛。`modelCandidates` 是不含凭据的内部候选目录：显式 `availableModels` 优先，缺失时由主模型、三个默认 alias 与 subagent 模型稳定去重生成；Project/Local 不能向其中注入候选。认证原文不会进入快照，只有受控 `credentialRef` 可供受信任 Node 宿主延迟解析。顶层 `effortLevel` 只接受 `low | medium | high`；显式 `max` 必须来自 `env.CLAUDE_CODE_EFFORT_LEVEL`，并在 Messages payload 中原样冻结。`CLAUDE_CODE_SUBAGENT_MODEL`、自动压缩阈值和 Provider timeout 会冻结到 Turn 私有配置；当前 Runtime 未创建子 Agent，不会拿该字段替换主模型。`schemaVersion`、`providers.*`、`models.primary`、`models.vision` 等旧结构一律返回诊断且不转换；未知 Claude Code 顶层字段不进入 Runtime 快照。
 
 User-only `visionModel` 可为受信 `providerRoutes` 中的 `route/model` 字符串或 `false`，产生 `ResolvedAutopilotSettings.visionModelRef?: ModelRef | false`。显式旧视觉 route 当前只接受 OpenAI Chat Completions；视觉分析器支持该协议及主连接 Anthropic Messages（含 anthropic-version 头）；非法模型/协议安全关闭并返回诊断，Project/Local 不能覆盖。未声明时 Web/CLI 默认继承主连接，Web 仅在缺少主连接时兼容旧 env；false 明确关闭。Web/CLI 将该角色映射到既有 `providerSettings.visionModelRef/vision`，Core 对当前 Turn 冻结路由；Chat 继续运行仍使用冻结路由，且当前 Host 撤销能力仍能阻断访问。
 
-User route 的 `models[]` 条目可声明可选 `contextWindowTokens`（1..10_000_000 的安全整数；越界、浮点或字符串等非法值按既有风格整体拒绝该 route 并报 `SETTINGS_PROVIDER_ROUTE_INVALID`；缺省保持原快照形状）。冻结链以内置能力目录为权威，目录未登记的第三方模型以 route 声明兜底生成 `FrozenProviderConfig.contextWindowTokens`，窗口到位后 Context 预算与 `turns.getContextUsage()` 投影自动恢复，缺省或窗口不足（不大于输出预留加安全缓冲）时仍 fail closed 为 unknown。
+User route 的 `models[]` 条目可声明可选 `contextWindowTokens`（1..10_000_000 的安全整数；越界、浮点或字符串等非法值按既有风格整体拒绝该 route 并报 `SETTINGS_PROVIDER_ROUTE_INVALID`；缺省保持原快照形状）。冻结链以解析后的 route 模型能力为依据：目录、route 的 `models[].capabilities` 与 `contextWindowTokens` 合并，再应用预设硬限制及协议收窄，生成 `FrozenProviderConfig.contextWindowTokens`，窗口到位后 Context 预算与 `turns.getContextUsage()` 投影自动恢复，缺省或窗口不足（不大于输出预留加安全缓冲）时仍 fail closed 为 unknown。
 
 ### 6.4 Node Web capability loader
 
@@ -1530,7 +1671,7 @@ interface WebFetchCapability {
 
 - `query` 是公开搜索文本；builtin 限制 1–4,000 字符，结果最多 10 个来源、answer 24 KiB、总输出 64 KiB。Search 执行超时默认值与上限均为 300 秒，覆盖请求和完整响应读取。`signal` 贯穿实际请求与读取，取消后不得继续跳转或自动重试。
 - `url` 是明确的 HTTP(S) 地址；builtin 与 Node URL policy 均限制 2,000 字符且禁止 userinfo；`prompt` 可选、1–4,000 字符。`redirectsRemaining` 仅由 Core 的进程内重定向绑定提供，缺省 10，模型 Schema 不暴露该字段。Node Adapter 拒绝非 0–10 整数预算。`url` 是本次已批准调用的起始地址（跨域重新审批后更新为目标），`finalUrl` 是最终地址。Fetch 每次执行段的默认超时与上限均为 60 秒，覆盖 DNS、同域跳转与响应读取；跨域审批等待不计入执行段，批准后开启新执行段，但保留剩余跳数。
-- `WebSearchCapabilityError(code, message)` 的 code 为 `CAPABILITY_UNAVAILABLE | WEB_SEARCH_PROVIDER_REJECTED | WEB_SEARCH_RATE_LIMITED`。`WebFetchCapabilityError(code, message, redirect?)` 的 code 为 `WEB_URL_BLOCKED | WEB_REDIRECT_REQUIRES_APPROVAL | WEB_RESPONSE_TOO_LARGE | WEB_CONTENT_TYPE_UNSUPPORTED`，可选 `redirect: { url: string; remainingRedirects: number }` 只用于跨域重新审批；它是进程内数据，不能序列化进错误、事件或 checkpoint。Core 不采用 Adapter message，始终输出固定安全文案。
+- `WebSearchCapabilityError(code, message)` 的 code 为 `CAPABILITY_UNAVAILABLE | WEB_SEARCH_PROVIDER_REJECTED | WEB_SEARCH_RATE_LIMITED`。`WebFetchCapabilityError(code, message, redirect?, blockReason?)` 的 code 为 `WEB_URL_BLOCKED | WEB_REDIRECT_REQUIRES_APPROVAL | WEB_RESPONSE_TOO_LARGE | WEB_CONTENT_TYPE_UNSUPPORTED`，可选 `redirect: { url: string; remainingRedirects: number }` 只用于跨域重新审批；它是进程内数据，不能序列化进错误、事件或 checkpoint。可选的 `WebFetchBlockReason` 仅为 `WEB_URL_BLOCKED` 区分 `url_not_allowed`、`dns_failed`、`non_public_address` 和 `redirect_rejected`。Core 将这些原因映射为固定安全文案，未识别的原因使用通用提示。
 - Web capability 错误按 Error 名称、稳定码与重定向字段形状识别，不依赖某一份 CJS/ESM 构造器身份；未知码与畸形载荷仍返回通用失败。跨域 URL 必须再次通过工具 Schema/Policy 与 Adapter DNS 校验，剩余跳数不得增长。
 - Node Search Adapter 在独立请求中附加 UTC 日期与来源核验指令，只接受包含已完成搜索动作的完成态响应，返回最后一条完整消息及其结构化引用。无引用仍可以返回答案，但展示明确说明“搜索服务未返回结构化引用”，不能据此推导公开资料不存在或答案已完成时效核验。
 - 原始搜索结果/网页正文只供当前进程采样。公开成功 `tool_result.output` 分别收窄为 `{ sourceCount, truncated }` / `{ host, contentType, truncated }`，无安全 detail 时只返回 `{ redacted: true }`。旧 transcript 的公开读取出口会再次应用当前脱敏规则，原存储记录保持不变。durable checkpoint 的 Web tool-call/pendingCalls 输入为 `{ redacted: true }`，结果保留安全占位及配对。
@@ -1601,7 +1742,7 @@ interface WorkPreviewPrepareResult {
 ```
 
 - `open_preview` 工具仅在受信宿主经 `CapabilityLoader.loadWorkPreview` 注入能力且存在 `{workspaceId, sessionId, turnId}` Turn 绑定的 Work Turn 注册；Chat 与 CLI 永不注册，override 注入能力或 loader 不生效。工具 metadata 为有副作用、串行（`workspace:open-preview`）、有界超时 35s、不自动重试；默认需要审批，URL模式审批预览只含 `url`、`jobId`、`openWhen`；静态模式改为相对 `staticPath`、固定服务动作及 `openWhen`。
-- `open_preview` 输入支持 `url` 与 `staticPath` 二选一；`staticPath` 仅已存在的工作区内规范相对 `.html/.htm`，拒绝路径逃逸/隐藏段及外部canonical目标，不接受模型提供jobId。有Jobs能力时，经现有ToolExecutor沙箱/Windows宿主逐次确认后，仅复用同Session、同HTML、同固定服务脚本的自有Job，或以固定Node单文件服务启动一个Job；端口由系统分配，不猜默认端口。服务仅loopback并仅公开所选HTML（不提供目录/相邻资源），不接收任意命令。实际origin+文件名经既有PreviewService归属/就绪核验后prepared，停止和生命周期仍归同一Job；启动/归属不明失败不盲重启。CLI/Chat不新增该能力。
+- `open_preview` 输入支持 `url` 与 `staticPath` 二选一；`staticPath` 仅已存在的工作区内规范相对 `.html/.htm/.md/.markdown`，拒绝路径逃逸/隐藏段及外部canonical目标，不接受模型提供jobId。有Jobs能力时，经现有ToolExecutor沙箱/Windows宿主逐次确认后，仅复用同Session、同文件、同固定服务脚本的自有Job，或以固定Node单文件服务启动一个Job；端口由系统分配，不猜默认端口。服务仅loopback并仅公开所选HTML或安全渲染的Markdown（不提供目录/相邻资源），不接收任意命令。实际origin+文件名经既有PreviewService归属/就绪核验后prepared，停止和生命周期仍归同一Job；启动/归属不明失败不盲重启。CLI/Chat不新增该能力。
 - `workPreviewEnabled` 在新 Turn 冻结进 `FrozenRunConfig`（缺省 false），只由受信宿主 `runtimeDefault.workPreview` 的存在性计算，override 不可开启；旧 Turn 继续时不开新能力。`workPreviewLoader` 在每个 Work Turn 开始前重新解析，宿主内部复查 Trust，失效即抛 `WorkspaceTrustError`。
 - `preparePreview` 的身份四元组由 Runtime 绑定注入，宿主负责目标策略校验、Job 归属与本地就绪；Core 在审批前拒绝确定无效的 HTTP(S) 参数，并调用宿主可选纯 validatePreviewTarget；不发网络，完整目标策略仍由宿主复核。URL模式的Core不读取网页或执行进程。静态单文件模式见下文，经同一ToolExecutor进程边界和JobService准备。成功结果只表示"预览请求已准备"，实际显示由用户端处理。
 - 模型可见输出仅为 `{ previewId, state: "prepared", openWhen }`（无法证明服务归属时附带 `autoOpen: false`）；`hostLabel` 与 `copyUrl`（等于实际页面地址）只通过受控展示明细 `ToolDisplayDetail.kind = "open_preview"` 进入展示层，任一字段非法时明细 fail-closed 省略。durable checkpoint 对 `open_preview` 输入使用与 Web 工具相同的 `{ redacted: true }` 占位，原始参数只在当前 Runtime 短期暂存用于审批恢复。
@@ -1620,6 +1761,28 @@ const loader = {
   },
 };
 ```
+
+### 6.6 Desktop BrowserCapability
+
+Core公开BrowserCapability、BrowserBinding与BrowserOperation宿主中立类型，以及严格单动作解析函数parseBrowserOperation；CapabilityLoader.loadBrowser在Trust后注入，RunConfig.browser/browserLoader仅从runtimeDefault装配。browserEnabled 记录冻结能力，旧回合缺失时不能在恢复阶段新增能力。Chat 恒不装配。受管 Work Session 从可信 hostToolsLoader 的精确绑定结果取得 browser capability，忽略 Runtime 的通用浏览器装配。Turn override 无法替换能力。
+
+`BrowserBinding` 为 `{ sessionId: string; turnId: string }`。`BrowserCapability.request(binding, callId, operation, signal?, authorization?)` 返回宿主动作结果。`BrowserRequestAuthorization` 来自可信 Runtime 执行上下文，携带当前权限档。`approvedOnce` 仅在消费当前动作的单次批准后传入。声明 `managesApprovals: true` 的宿主处理网页动作和 document 的确认，前提是已有完整的实际目标与归属校验。`confirmsDocument: true` 继续兼容只接管完全访问 document 确认的原宿主。`endTurn(binding)` 撤销回合授权和占用。`parseBrowserOperation(value)` 只接受固定单动作。`isPublicBrowserUrl(url)` 与 `isPublicBrowserRead(operation, pageUrl?)` 通过地址文本识别公开目标候选，宿主用真实页面 URL 复核观察目标。仍由 Core 负责的网页审批显示同标签、同代次的站点和元素引用，隐藏路径、查询和片段。
+
+```ts
+import { parseBrowserOperation } from "@autopilot-agent/core";
+
+const operation = parseBrowserOperation({ type: "open", url: "https://example.com" });
+// capability、binding、callId 和 signal 均由受信宿主/工具上下文提供。
+const result = await capability.request(binding, callId, operation, signal);
+```
+
+原生browser工具限定一次结构化动作并使用真实sessionId/turnId/toolCallId及取消信号，不接受模型自报身份、任意JS/CDP或批量脚本。宿主负责统一once/本回合always审批；Core仍保留工具目录与策略边界。endTurn在真实终态调用；awaiting_approval/awaiting_user_input暂停不撤销同回合授权。CLI在Trust后以Desktop原生凭据装配该能力，连接和会话身份不进入模型参数。截图复用会话图片Store，原始base64不进入transcript；Store不可用时返回图片缺失说明。
+
+原生模型工具 `browser` 的本地文档入口为 `{type:"open",staticPath:"工作区相对.md/.markdown/.html路径"}`，与URL二选一；仅在受信Job绑定存在时，经原进程沙箱/审批复用既有单文件预览Job，再以Runtime真实身份调用浏览器open。该兼容字段不进入宿主线协议。共享 `BrowserOperation` 另支持 `{type:"document",path:"所选文件"}`：相对路径按受管工作区解析，允许明确指定的外部绝对Windows/macOS路径；Desktop先解析canonical单文件，再由既有BrowserAccess确认。当前turn对同一canonical文件的授权可复用，既有浏览器always不放开其他文件。HTTP(S)动作保持原契约。Markdown仅渲染基础标题、段落、列表、代码与强调，原始HTML转义，CSP禁止脚本和远程资源；仅提供所选文件，Markdown最多2MiB。
+
+Node宿主可消费公开常量 `STATIC_PREVIEW_SCRIPT` 复用固定单文件服务；它不是模型脚本入口，调用者负责精确文件授权与服务生命周期。既有Job按原端口/文件名路由使用；Desktop页拥有Worker可申请随机端口和不透明单文件路由，关页/清空/初始化取消时回收。`parseBrowserOperation` 对file URL抛出 `BROWSER_FILE_URL_USE_DOCUMENT`（先document，再以返回的pageId/revision截图），document扩展名不是md/markdown/htm/html时抛出 `BROWSER_DOCUMENT_UNSUPPORTED`，其他非法动作抛出 `BROWSER_ACTION_INVALID`，不暴露Zod参数正文。
+
+浏览器固定单动作补充支持 wait(pageId,revision,condition="load",timeout)，timeout 为 1–30000 毫秒，返回 loaded/timedOut。downloads(pageId,revision) 仅返回该页下载摘要，cancel-download(pageId,revision,id) 仅取消该页指定下载，均复用原生身份、单动作审批及占用校验。pageId为UUID，revision为非负整数，使用当前宿主结果中的身份及新鲜snapshot引用。Desktop宿主的list仅列调用者所属工作区页面，跨工作区pageId拒绝；后台操作保留当前选中页，显式open/select只在所属工作区切页/展开。工作区归属和审批由宿主负责，不由中立BrowserBinding新增字段。完整动作参数见 [CLI浏览器命令](CLI-Reference.md#13-desktop-浏览器browser)。同页在途动作的所属调用者和回合可经审批应答当前 JS 对话框，原执行位保持占用；人工应答先撤销授权并取消原动作，再直接应答以解除阻塞，停止结果仍需确认。弹窗打开/关闭使旧 revision 失效。
 
 ## 7. Bootstrap 与工作区 Trust
 
@@ -1740,6 +1903,8 @@ V2 `tool-result` 可选携带 `images`，每项为与普通图片相同的 `{ ty
 
 枚举工作区文件，返回稳定排序的工作区相对路径列表；供 CLI `@文件` 候选索引等宿主能力复用。它不是模型工具，不进入工具目录，也不经过审批链。
 
+枚举使用固定 ripgrep 参数，保留工作区内的忽略规则并跳过目录链接。环境中的 ripgrep 配置不会更改候选范围。
+
 ```ts
 import { listWorkspaceFiles } from "@autopilot-agent/core";
 
@@ -1782,6 +1947,12 @@ interface ListWorkspaceFilesResult {
 
 ---
 
+### 8.8 `resolveWindowsPackageManagerCommand(program, args)`
+
+签名：`(program: string, args: readonly string[]) => { executable: string; args: string[] } | null`。受信 Node 宿主在准备结构化进程调用时复用；例如 `const command = resolveWindowsPackageManagerCommand("npm", ["--version"]);`。非 Windows 或非 npm/npx/pnpm（可带 `.cmd`）返回 `null`；Windows 匹配时在当前 Node 安装及受限系统安装位置查找固定 CLI，核对 realpath 后返回当前 Node executable 与 CLI argv，不执行命令。
+
+可信 CLI 不可用时通常抛 `SandboxPortError` / `SANDBOX_UNAVAILABLE`，部分非 ENOENT 文件系统错误仍可能原样拒绝；调用方不得回退 shell 拼接，也不得直接展示底层错误。解析成功不等于工具审批或沙箱准备成功。
+
 ## 9. 公开类型索引
 
 以下类型均从默认入口导出。使用时优先 `import type`；字段很多的 DTO 以 TypeScript 声明为准，本手册在相关 API 小节说明其输入输出语义。
@@ -1790,15 +1961,18 @@ interface ListWorkspaceFilesResult {
 |---|---|
 | 基础 RAG | `VectorInput`、`VectorOutput`、`ChatMessage`、`AgentToolCall`、`IngestOptions`、`IngestResult`、`IngestProgressEvent`、`ParseExcelOptions`、`ExcelIngestOptions`、`ExcelIngestResult`、`SheetInfo`、`AskStreamOptions`、`RAGAgent`、`RAGAgentOptions`、`RAGQuerier`、`RagErrorCode`、`RagStorageOptions`、`KnowledgeResource`、`DeleteKnowledgeResourceResult`、`KnowledgeResourceManifest`、`KnowledgeResourceStatus`、`PdfPageMetadata`、`RagEvidence`、`TableProfile` |
 | Runtime facade | `AgentRuntime`、`AgentRuntimeFacade`、`CreateAgentRuntimeOptions`、`RuntimePorts`、`ThreadStore`、`ThreadHostContext`、`ThreadFacade`、`ThreadActor`、`ThreadControl`、`ThreadEvent`、`ThreadMessage`、`ThreadProgressEntry`、`ThreadProgressKind`、`ThreadProgressView`、`AgentThreadProgressPage`、`SessionStore`、`CheckpointStore`、`TranscriptStore`、`CredentialStore`、`ProjectStore`、`EventSink`、`Clock`、`WorkspaceAdapter`、`WorkspaceInfo`、`TurnStore`、`ApprovalStore`、`InputInbox`、`LeaseStore`、`JobStore`、`JobStoreWriteCondition`、`JobOwnerProbe`、`FileMutationStore`、`SessionResourceStore`、`UserQuestionStore`、`GetUserQuestionInput`、`SaveUserQuestionAnswerInput`、`SaveUserQuestionAnswerResult`、`ProjectService`、`SessionService`、`CreateSessionInput`、`TurnService`、`TurnState`、`ApprovalService`、`InputInboxService`、`UserQuestionService`、`UserQuestionSubmissionService`、`AgentUserQuestionCapability`、`CreateUserQuestionRequestInput`、`SubmitUserQuestionAnswerInput`、`JobService`、`SessionJobService`、`UndoService`、`UndoPreview`、`UndoResult` |
-| Runtime domain | `ProductMode`、`ChatRetrievalMode`、`CapabilityCeiling`、`Session`、`SessionPersistenceMode`、`SessionStatus`、`Project`、`CreateProjectInput`、`Turn`、`TurnStatus`、`Job`、`JobStatus`、`JobOwner`、`JobOwnerLiveness`、`JobControlState`、`JobLastControl`、`JobView`、`JobListView`、`JobReadView`、`JobOutputSnapshot`、`JobSafeOutputSnapshot`、`JobSafeOutputStreamSnapshot`、`JobSafeOutputStreamView`、`JobOutputView`、`JobSandboxSummary`、`StartJobInput`、`PollJobInput`、`JobPollResult`、`FileMutation`、`FileMutationOperation`、`FileMutationStatus`、`PrepareFileMutationInput`、`UndoTransaction`、`UserQuestionOption`、`UserQuestionItem`、`UserQuestionAnswerItem`、`UserQuestionRequest`、`UserQuestionAnswer`、`StoredUserQuestion`、`TodoStatus`、`TodoItem`、`TodoCounts`、`TodoSnapshot`、`TodoWriteResult`、`ModelRef`、`ReasoningEffort`、`ReasoningProfile`、`SessionRunConfig`、`FrozenRunConfig`、`CredentialRef`、`ResolvedCredential` |
+| Runtime domain | `ProductMode`、`ChatRetrievalMode`、`CapabilityCeiling`、`Session`、`SessionPersistenceMode`、`SessionStatus`、`Project`、`CreateProjectInput`、`Turn`、`TurnStatus`、`Job`、`JobStatus`、`JobOwner`、`JobOwnerLiveness`、`JobControlState`、`JobLastControl`、`JobView`、`JobListView`、`JobReadView`、`JobOutputSnapshot`、`JobSafeOutputSnapshot`、`JobSafeOutputStreamSnapshot`、`JobSafeOutputStreamView`、`JobOutputView`、`StartJobInput`、`PollJobInput`、`JobPollResult`、`FileMutation`、`FileMutationOperation`、`FileMutationStatus`、`PrepareFileMutationInput`、`UndoTransaction`、`UserQuestionOption`、`UserQuestionItem`、`UserQuestionAnswerItem`、`UserQuestionRequest`、`UserQuestionAnswer`、`StoredUserQuestion`、`TodoStatus`、`TodoItem`、`TodoCounts`、`TodoSnapshot`、`TodoWriteResult`、`ModelRef`、`ReasoningEffort`、`ReasoningProfile`、`SessionRunConfig`、`FrozenRunConfig`、`CredentialRef`、`ResolvedCredential` |
 | Turn 协议 | `ChatCapabilityBinding`、`ChatCapability`、`ChatAttachmentGrant`、`ChatKnowledgeCapability`、`ChatRagEvidenceBatch`、`ChatRagEvidence`、`UiDocument`、`RunConfig`、`ResolveRunConfigInput`、`CompactPolicy`、`ProviderRuntimeSettings`、`LimitConfig`、`ResolvedAgentRuntimeLimits`、`AgentRuntimeSafetyLimits`、`StartTurnInput`、`ContinueTurnInput`、`CancelTurnInput`、`SteerTurnInput`、`CompactTurnInput`、`CompactTurnResult`、`AgentEvent`、`AgentEventEnvelope`、`CreateEventEnvelopeInput`、`AgentMessage`、`AgentMessageRole`、`AgentJsonObject`、`AgentContentBlock`、`AgentToolPairingScan`、`AgentCheckpoint`、`PublicCheckpointView`、`FrozenRunConfigView`、`AgentTerminationBudget`、`AgentTerminationReason`、`AgentTerminationView`、`RecoverableTurnStatus`、`RecoverableApprovalView`、`RecoverableTurnView`、`AgentMessageMigrationSuccess`、`AgentMessageMigrationFailure`、`AgentMessageMigrationResult`、`AgentErrorCode` |
 | 审批与输入 | `ApprovalDecision`、`PersistentGrant`、`SubmitApprovalInput`、`FindPersistentGrantInput`、`InboxInput`、`InboxDelivery`、`InboxStatus`、`InboxBoundary`、`InboxAttachmentRef`、`InboxSkillRef`、`PostInboxInput`、`DrainInboxInput`、`ClaimNextInboxInput`、`ConsumeInboxInput`、`ListInboxInput` |
 | 工具 | `ToolPermissionMode`、`ToolApprovalDecision`、`ApprovalDisplayFacts`、`ToolDisplayFacts`、`ToolDisplayDetail`、`ToolJobDisplayFacts`、`ToolApprovalRequest`、`ToolExecutionRequest`、`ToolExecutionOptions`、`ToolExecutionResult`、`ToolExecutionMeta`、`ToolInterruptionState`、`ToolError`、`ToolEvent`、`ToolModelDefinition`、`ToolActionFacts`、`ToolPolicyResult` |
 | Context/Skill/MCP/Web | `AgentContextSnapshot`、`ContextBudgetSnapshot`、`ContextUsageView`、`ContextUsageBreakdownView`、`ContextUsageCategoryKind`、`ContextUsageCategoryView`、`TurnUsageSummaryView`、`FrozenInstruction`、`FrozenMemorySnippet`、`AgentSkillsCapability`、`SkillCatalogEntry`、`SkillDiscoveryCandidate`、`LoadedSkill`、`SkillResource`、`PreparedSkillCommand`、`McpCapability`、`McpServerConfig`、`WebCapability`、`WebSearchCapability`、`WebSearchCapabilityError`、`WebSearchCapabilityErrorCode`、`WebSearchResult`、`WebSearchSource`、`WebFetchCapability`、`WebFetchCapabilityError`、`WebFetchCapabilityErrorCode`、`WebFetchResult`、`WorkPreviewCapability`、`WorkPreviewPrepareRequest`、`WorkPreviewPrepareResult`、`WorkPreviewOpenWhen` |
-| Provider/设置 | `ModelSampler`、`ModelSamplerFactory`、`CreateModelSamplerInput`、`ModelSamplerFactoryOptions`、`CreateFirstPartyModelSamplerInput`、`ModelSampleOptions`、`ModelCapability`、`PromptCacheMode`、`FirstPartyEffortSource`、`ResolvedFirstPartyModelSample`、`ModelBehaviorProfile`、`VisionAnalyzer`、`FrozenProviderConfig`、`ApiProtocol`、`ProtocolProfile`、`ProviderRouteProfile`、`AnthropicMessagesProtocolProfile`、`OpenAiChatCompletionsProtocolProfile`、`ProviderProtocolAdapter`、`ProviderProtocolAdapterInput`、`CompletionDecision`、`CompletionIntentSignal`、`CompletionPolicy`、`CompletionPolicyState`、`AutopilotSettingsScope`、`AutopilotSettingsSource`、`ResolvedAutopilotSettings`、`ResolvedFirstPartySettings`、`ResolvedRagConnectionSettings`、`ResolvedRagSettings`、`RagConnectionRole`、`ResolvedWebSearchSettings`、`SettingsDiagnostic` |
+| Provider/设置 | `ModelSampler`、`ModelSamplerFactory`、`CreateModelSamplerInput`、`ModelSamplerFactoryOptions`、`CreateFirstPartyModelSamplerInput`、`ModelSampleOptions`、`ModelCapability`、`PromptCacheMode`、`FirstPartyEffortSource`、`ResolvedFirstPartyModelSample`、`ModelBehaviorProfile`、`VisionAnalyzer`、`FrozenProviderConfig`、`ApiProtocol`、`ProtocolProfile`、`ProviderRouteProfile`、`ProviderProtocolAdapter`、`ProviderProtocolAdapterInput`、`CompletionDecision`、`CompletionIntentSignal`、`CompletionPolicy`、`CompletionPolicyState`、`AutopilotSettingsScope`、`AutopilotSettingsSource`、`ResolvedAutopilotSettings`、`ResolvedFirstPartySettings`、`ResolvedRagConnectionSettings`、`ResolvedRagSettings`、`RagConnectionRole`、`ResolvedWebSearchSettings`、`SettingsDiagnostic` |
 | Trust/Bootstrap | `SafeBootstrapConfig`、`WorkspaceTrustEntry`、`WorkspaceTrustStatus`、`WorkspaceTrustPolicy`、`CapabilityLoader`、`CreateRuntimeBootstrapServiceOptions`、`RuntimeBootstrapService` |
 | 快照、资源与 Rerank | `DatabaseError`、`DatabaseErrorCode`、`MySQLSourceConfig`、`DatabaseSnapshotConfig`、`DatabaseInspection`、`DatabaseSyncResult`、`DatabaseSnapshotReadCapability`、`SnapshotColumnDescription`、`SnapshotTableDescription`、`SnapshotQueryResult`、`DatabaseSearchCapability`、`CreateDatabaseSearchCapabilityOptions`、`DatabaseSearchPolicy`、`DatabaseSearchRequest`、`DatabaseSearchResult`、`DatabaseAggregationKeyword`、`DatabaseFilterOperatorKeyword`、`DatabaseQueryProfile`、`DatabaseQueryPlan`、`DatabaseQueryPlannerInput`、`RagSourcePolicy`、`KnowledgeResource`、`DeleteKnowledgeResourceResult`、`RerankPolicy`、`RerankRuntime`、`RerankOutcome`、`RerankResult`、`RerankVisionImage`、`RerankRole`、`RerankDocument`、`RerankProviderRequest`、`RerankProviderResult`、`RerankProviderAdapter` |
 | 兼容 Agent | `AgentOptions`、`AgentInstance`、`PublicCompactInput`、`AgentCompactionResult`、`AgentInjectedInput`、`AgentInputInboxCapability`、`AgentLease`、`AgentRunInput`、`RagCapability` |
+| 执行事实与协作 | `RuntimeFact`、`RuntimeFactSnapshot`、`RuntimeFacts`、`TurnExecutionView`、`ThreadEventActor`、`ThreadGroup`、`ThreadMember`、`ThreadReceipt`、`ThreadCreateIntent`、`ThreadDelivery`、`ThreadDeliveryReason`、`ThreadControlIntent`、`ThreadHandoffInput`、`ThreadHandoffRef`、`ThreadHandoffDocumentInput`、`ThreadHandoffDocument`、`ThreadHandoffWriter`、`WaitResult`、`WaitTargetResult`、`ThreadsCapability`、`AgentThreadsCapability`、`AgentThreadMemberView`、`AgentThreadMessageView`、`AgentThreadReadResult`、`ThreadDeliveryHostContext`、`ThreadDeliveryService`、`ThreadStartDelivery`、`ThreadReconcileResult` |
+| 沙箱、外部权限与宿主保护 | `SandboxMode`、`SandboxEnforcement`、`SandboxPolicy`、`SandboxCapabilityReport`、`SandboxExecutionRequest`、`SandboxPreparedCommand`、`SandboxErrorCode`、`SandboxPort`、`ManagedExecutionControl`、`ManagedExecutionChannel`、`SandboxDegradeApproval`、`ExternalPermissionProjector`、`ExternalPermissionSnapshot`、`ExternalFileOperation`、`ParsedExternalPermissionRule`、`ExternalFileApproval`、`ExternalExecutionTarget`、`ExternalExecutionApproval`、`ExternalExecutionAuthorization`、`ExternalWriteCapability`、`HostMutationProtection`、`ProtectedMutationTarget`、`ResolvedExternalPermissionSettings`、`ResolvedSandboxSettings` |
+| 图片、目录与浏览器 | `SessionImageStore`、`SessionImageRef`、`SessionDirectoryPage`、`SessionDirectoryQuery`、`SessionDirectoryEntry`、`BrowserCapability`、`BrowserBinding`、`BrowserOperation`、`BrowserRequestAuthorization`、`InboxOrigin`、`JobExecutionFacts`、`WebFetchBlockReason`、`AgentProviderFailureReason` |
 | 工作区文件枚举 | `ListWorkspaceFilesInput`、`ListWorkspaceFilesResult` |
 
 ---
@@ -1842,11 +2016,12 @@ const kernel = createAgentKernel({
 });
 
 for await (const event of kernel.run()) {
-  // 投影已脱敏的 Kernel 事件；持久化由调用方负责。
+  // Kernel 原始事件尚未脱敏；跨宿主展示前调用 sanitizeEventForExternal(event)。
+  // 持久化及 lease 仍由调用方负责。
 }
 ```
 
-`RunContext` 是 Kernel 的完整依赖注入对象，字段如下：
+`RunContext` 是 Kernel 的依赖注入对象，主要字段如下；完整结构以实验性入口类型声明为准：
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
@@ -1891,14 +2066,15 @@ function createDefaultModelSampler(): ModelSampler;
 | `createReadFileTool()` | `read_file` | `{ path, offset?: number, limit?: 1..2000 }` | 默认从第 1 行读取最多 2000 行；已知目标位置时按 offset/limit 定位。只读；支持 UTF-8/UTF-16 文本，单次扫描最多 8 MiB、返回正文最多 256 KiB，按约25K token保守估算及字节预算返回连续完整行前缀与续读位置；同版本同范围且旧正文可见时返回短提示；二进制拒绝。 |
 | `createEditFileTool()` | `edit_file` | `{ path, oldString, newString, replaceAll?: boolean }` | 写入；必须先由 `read_file` 建立可信观察范围，限制在已观察行内编辑并校验文件未变化。 |
 | `createWriteFileTool()` | `write_file` | `{ path, content, expectedSha256? }` | 写入；新建可不传 hash，覆写已有文件必须回传 `read_file` 给出的 SHA-256。 |
-| `createRunCommandTool()` | `run_command` | `{ program, args?: string[], cwd?: ".", timeoutMs?: 1..120000 }` | 以 `shell: false` 执行单个前台命令；不支持管道、多命令或交互输入，stdout/stderr 固定内存保留。任一路输出首次超过 30KB 时全文落盘到工作区相对路径 `.autopilot/tmp/<turnId>/<安全 callId>-<哈希>.<stdout\|stderr>.log`，结果追加 `spilledOutput`（按流给出相对路径）与 `spillHint`（提示用 `read_file` 分段回读）；未超限不生成临时文件；冻结 read-only 不落盘并提示截断内容无法回读；落盘失败照常返回内存结果，不把成功调用变成 `isError`。 |
+| `createRunCommandTool()` | `run_command` | `{ program, args?: string[], cwd?: ".", timeoutMs?: 1..120000 }` | 默认超时 30 秒，最大 120 秒；以 `shell: false` 执行单个前台命令；不支持管道、多命令或交互输入，stdout/stderr 固定内存保留。任一路输出首次超过 30KB 时全文落盘到工作区相对路径 `.autopilot/tmp/<turnId>/<安全 callId>-<哈希>.<stdout\|stderr>.log`，结果追加 `spilledOutput`（按流给出相对路径）与 `spillHint`（提示用 `read_file` 分段回读）；未超限不生成临时文件；冻结 read-only 不落盘并提示截断内容无法回读；落盘失败照常返回内存结果，不把成功调用变成 `isError`。 |
 
-工具构造函数不是浏览器 API。调用方必须只注入已 canonicalize 的 `workspaceRoot`，传递 `AbortSignal`，并将 `ToolExecutionContext` 中的 `agentFlow`、授权回调和 mutation store 绑定到可信宿主状态。不得直接调用工具 `execute()` 以绕过 `ToolExecutor`；写入、外部命令和动态命令仍必须先经审批。
+工具构造函数不是浏览器 API。调用方必须只注入已 canonicalize 的 `workspaceRoot`，传递 `AbortSignal`，并将 `ToolExecutionContext` 中的授权回调和 mutation store 绑定到可信宿主状态。不得直接调用工具 `execute()` 绕过 `ToolExecutor`；写入和进程调用仍须经统一能力、Policy 与适用审批链。
 
 ### 10.4 `ToolRegistry`
 
 ```ts
 class ToolRegistry {
+  constructor(ceiling?: CapabilityCeiling);
   register<TInput, TOutput>(definition: AgentToolDefinition<TInput, TOutput>): void;
   unregister(toolName: string): void;
   get(toolName: string): AgentToolDefinition<unknown, unknown>;
@@ -1906,37 +2082,9 @@ class ToolRegistry {
 }
 ```
 
-- `register()` 拒绝非法或重复的工具名，以及缺少/放宽调度 metadata 的定义。
+- `register()` 先按产品能力上限过滤（不在上限内时不注册），再拒绝非法/重复工具名、非法 metadata 或缺少本地 `createActionFacts` 的定义。
 - `unregister()` 只供受控 capability 生命周期在 shutdown 后移除临时工具；不要在运行中替换工具实现。
 - `get()` 未找到时抛稳定 `TOOL_NOT_FOUND` 错误。
-- `getModelDefinitions()` 仅投影名称、说明和 JSON Schema，不包含 handler、权限、路径或凭据。
+- `getModelDefinitions()` 过滤 `isAvailable() === false` 的定义，仅投影名称、说明和 JSON Schema，不包含 handler、权限、路径或凭据。
 
 `@autopilot-agent/core/internal/*` 不属于公共契约。不得为了获取私有 checkpoint、Provider 请求、工具 handler、数据库连接或文件路径而引用它；任何输出到浏览器的数据仍须经过 Runtime 的脱敏 DTO/事件边界。
-
-### 写后验证可恢复边界
-
-`write_file` / `edit_file` 在有 WAL 和无 mutation store 的 headless 路径都读取实际落盘原始字节并核对预期 hash，只有校验成功才返回 `diskVerified: true` 并满足物理写入完成条件；保存/落盘/校验失败不返回伪成功。模型仍需按任务复杂度审阅差异、按需读回和执行定向验证；物理确认不能替代业务或运行正确性。
-
-默认完成策略依据真实 changedPaths/verifiedPaths，兼容旧 checkpoint 的未验证路径；一次有限提醒仍未读回时以 interrupted_recoverable/write_verification 暂停，不强制完成。Continue 保留原 Turn、canonical messages、真实写入与 completedCallIds；该恢复段仅暴露/允许 read_file 与最终总结，Skill 限制仍取交集。回读绑定固定版本并累计本次验证段已返回的完整行范围，写前观察范围不能充作写后验证，任意一行不能验证整个文件；旧缺版本快照由首次真实读回固定版本。版本失配不会标记已验证。私有 `verificationTargets` 与 `mutationGate.verificationOnly` 随安全批次 checkpoint 保留，拒绝重复写入不会走 completed 捷径。其他 failed 仍不可 Continue，不改旧 failed 记录或真实文件。
-
-### 执行观察的增量读取与取消
-
-`readTurnExecutionView(ports, { sessionId, turnId?, signal? })` 与 `runtime.turns.getExecutionState` 接受受信进程内可选 AbortSignal。取消在各异步边界阻止后续读取与结果返回，分页返回后先检查取消再提交派生摘要。该参数只用于宿主调用。
-
-投影按原 Store 实例、Session、Turn 与字节游标保留当前执行段的 started、审批、终态及 thread_wait 边界，最多8个Session，每项最多1024条、2MiB。替换边界事件按实际保留字节计费。提交核对读取起点仍为当前摘要，迟到旧查询不会覆盖新的游标或执行段。lease、checkpoint代次、决定及control继续实时核对。游标过期只重建一次，旧超大/损坏事件沿getEvents原审计兼容规则回读，异常路径不缓存该摘要。
-
-Node Transcript分页使用原16KiB读取块中的多条完整行，游标保留文件身份并增加可选size/stamp，接受旧游标。替换、截断及同尺寸时间戳变化使新游标过期。getEvents保持相邻同字节信封去重与损坏行诊断，返回数据保持调用方隔离。追加索引同样核对文件身份与同尺寸变化。
-
-Node Checkpoint最新与历史Turn读取逐行异步审计完整JSONL，只保留目标最后记录，每条解析后让出事件循环。最新/历史副本共用8项、8MiB上限，写入清除该Session缓存，读取每次核对纳秒文件身份，返回独立副本。损坏行继续诊断且文件原样保留，底层流打开/中途错误会拒绝、关闭迭代器与流，并由原文件锁finally释放。Node Thread control解析副本另受8项、8MiB限制，实时文件身份变化/异常使缓存失效，CAS与外部更新仍以durable记录为准。
-
-
-旧缺省目标的completed绑定在原Session短锁内使用既有lease acquire/release保护，组revision CAS仍是领取/绑定竞争的提交边界。最新Turn、checkpoint、终态投影必须共同确认同一completed身份，Session为idle/completed且无activeTurnId，checkpoint无pendingCalls/pendingUserQuestion，控制无claimed/executing。新鲜owner阻止绑定。已知档位冲突继续拒绝，模型actor不具备入口。此动作只选择之后新Turn的执行宿主，原Turn、冻结配置、答案/决定及结果保留。Work start在取得lease后再次校验档位，准备期间迟到的旧Runtime无法越过人类绑定，拒绝时释放lease且不创建伪Turn。
-
-
-### 内部汇报约定与普通协作输入（2026-11-05）
-- `ToolExecutionOptions.reportingAgreement?: {taskId: string; explicit: boolean}` 是 Kernel 发起内部 send_thread 时的受信执行元数据，经过原 Executor 验证/Policy 后仅交给该工具；不在模型 Schema 内，不能由工具参数生成。`AgentThreadsCapability.send` 可由该受信路径携带同名字段，绑定层复用 ThreadService.send；公开 ThreadFacade.send 拒绝 reportingAgreement/purpose。
-- ThreadService 在原组 CAS/messageIntents 中按来源会话、目标 task 和最新有效约定去重，task 必须映射精确 expectedTurnId。相同约定复用原 message/request/delivery 身份；未提交意图失败后沿原身份重试。内容真实变更（包括改回曾用内容）产生新意图；默认约定沿用已有值，跨父 Turn 不无故覆盖。Kernel 仅在成功接受后清 agreementPending，重复 wait 与 checkpoint 恢复不重设同值 pending。
-- 可选 `ThreadMessage.purpose = {kind: "reporting_agreement", taskId}` 沿原桥接投影为 `InboxOrigin` thread 分支的可选 `purpose: "reporting_agreement"`；旧记录缺省兼容，不升级 schema。内部约定以有明确来源的上下文进入模型，不作为人类写入需求重置写入意图/工具护栏；input_joined/input_consumed 与原投递审计保留。
-- 普通用户需求沿原 send 身份幂等，两个不同来源请求即使正文完全相同也分别接受、投递；不做全局文本去重/限流，不新增提醒调度器。
-
-已保存交互的失败重试复用原controlId与决定，仍须原暂停checkpoint摘要一致；pauseSeq缺失、已观察启动或原边界后存在turn_started时拒绝重放。wait_threads摘要带interactionState、continuationState、interactionDecision，关注游标随交互/恢复状态变化；Kernel仅把interactionState=pending计入待审批，不修改真实暂停checkpoint。

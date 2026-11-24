@@ -1,7 +1,7 @@
 /** 瘦身后的 Ink 应用组件：编排 store 订阅、dispatchAction、动画时钟与渲染。 */
 
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Box, measureElement, type DOMElement, useInput, useStdin, useStdout, type Key } from "ink";
+import { Box, Text, measureElement, type DOMElement, useInput, useStdin, useStdout, type Key } from "ink";
 import { TuiInlineOutput } from "./inline-output.js";
 import { TuiActivityLine } from "../activity-animation.js";
 import { createTuiAnimationClock, type TuiAnimationClock } from "../animation-clock.js";
@@ -37,6 +37,8 @@ import type {
 import { getTuiSelectedText } from "./viewport/selection.js";
 import { createTuiViewportSourceCache } from "./viewport/sources.js";
 import { TuiViewportTimeline } from "./viewport/viewport.js";
+
+import wrapAnsi from "wrap-ansi";
 
 const EMPTY_VIEWPORT_SOURCES: TimelineLineSource[] = [];
 const EMPTY_VIEWPORT_LINES: TimelineVisualLine[] = [];
@@ -90,6 +92,7 @@ export function CliTuiApp(props: {
   const jobRequestGeneration = useRef(0);
   /** /context 覆盖视图；打开时取代时间线渲染，Esc 关闭后回到正常聊天。 */
   const [contextView, setContextView] = useState<NonNullable<CliControllerResult["contextView"]> | undefined>(undefined);
+  const [infoReport, setInfoReport] = useState<{ text: string; offset: number }>();
   const rawInputSequenceRef = useRef("");
   const busy = useRef(false);
   const keepOpenAfterCancel = useRef(false);
@@ -108,6 +111,7 @@ export function CliTuiApp(props: {
   const columns = props.availableColumns ?? terminalSize.columns;
   const inputEnabled = props.visible !== false && props.inputActive !== false;
   const rows = props.availableRows ?? terminalSize.rows;
+  const maximumFrameRows = isViewportMode ? rows : Math.max(1, rows - 1);
 
   const { statusView, refreshStatusView } = useStatusView(props.controller);
 
@@ -130,13 +134,22 @@ export function CliTuiApp(props: {
     });
   }, []);
   const infoMessages = snapshot.transcript
-    .filter(function isNotice(item): item is Extract<CliTuiTranscriptItem, { kind: "notice" }> { return item.kind === "notice"; })
+    .filter(function isNotice(item): item is Extract<CliTuiTranscriptItem, { kind: "notice" }> { return item.kind === "notice" && !item.persistent; })
     .slice(-4)
     .map(function getNoticeMessage(item): string { return item.message; });
+  const reportLines = infoReport ? wrapAnsi(infoReport.text, Math.max(1, columns - 2), { hard: true, trim: false }).split("\n") : [];
+  // 有配置视图时为状态、配置、Context、工作区四行和上边距留空间。
+  const statusHeight = (statusView ? 5 : 1) + (props.sessionTitle ? 1 : 0);
+  const reportHeight = Math.max(1, rows - statusHeight - 4);
+  const reportMaximum = Math.max(0, reportLines.length - reportHeight);
+  const reportOffset = Math.min(infoReport?.offset ?? 0, reportMaximum);
   const [approvalOffset, setApprovalOffset] = useState(0);
   const [approvalDetails, setApprovalDetails] = useState(false);
+  const [submittedFeedback, setApprovalFeedback] = useState<string>();
+  const hostStatus = props.controller.getHostApprovalStatus?.();
+  const approvalFeedback = hostStatus ? undefined : submittedFeedback;
   const approvalMaximumRef = useRef(0);
-  const approvalCardHeight = snapshot.pendingApproval ? Math.max(createTuiApprovalOptions(snapshot.pendingApproval).length + 4, Math.min(Math.floor(rows / 2), rows - inputLayout.promptHeight - (statusView ? 8 : 3))) : 0;
+  const approvalCardHeight = snapshot.pendingApproval ? Math.max(createTuiApprovalOptions(snapshot.pendingApproval).length + 4, Math.min(Math.floor(rows / 2), rows - inputLayout.promptHeight - statusHeight - 2)) : 0;
   /** 主会话普通审批与原地卡片使用同一详情滚动/固定决定组件。 */
   function handleApprovalKey(value: string, key: Key): boolean {
     if (key.pageUp || key.pageDown) { setApprovalOffset(function move(current) { return Math.max(0, Math.min(approvalMaximumRef.current, current + (key.pageDown ? 1 : -1) * Math.max(1, approvalCardHeight - 5))); }); return true; }
@@ -149,17 +162,26 @@ export function CliTuiApp(props: {
   // Todo 展开态最多占 10 行；矮终端为输入框、状态栏和活动文案至少保留 6 行。
   const todoRowLimit = Math.max(2, Math.min(10, rows - 6));
   const activeTodoForm = getTuiTurnTodo(snapshot.liveEvents, snapshot.liveTurnId ?? "")?.todos.find(function active(todo) { return todo.status === "in_progress"; })?.activeForm;
-  const fixedHeight = inputLayout.promptHeight + inputLayout.pickerHeight + approvalHeight + infoMessages.length + (infoMessages.length ? 1 : 0) + 1 + (statusView ? 6 : 1) + (props.sessionTitle ? 1 : 0);
+  const fixedHeight = inputLayout.promptHeight + inputLayout.pickerHeight + approvalHeight + infoMessages.length + (infoMessages.length ? 1 : 0) + (approvalFeedback ? 1 : 0) + 1 + statusHeight;
   const fixedRef = useRef<DOMElement>(null);
+  const inputAreaRef = useRef<DOMElement>(null);
+  const approvalBoxRef = useRef<DOMElement>(null);
   const inlineBodyRef = useRef<DOMElement>(null);
   const [inlineHeight, setInlineHeight] = useState<number>();
+  const [reservedInputRows, setReservedInputRows] = useState(0);
+  /** 量出输入之外的固定行，避免活动行、状态栏折行和审批卡侵占命令窗口。 */
+  useLayoutEffect(function measureSpaceAroundInput() {
+    if (!fixedRef.current || !inputAreaRef.current) return;
+    const approvalRows = approvalBoxRef.current ? measureElement(approvalBoxRef.current).height : 0;
+    const reserved = measureElement(fixedRef.current).height - measureElement(inputAreaRef.current).height + approvalRows;
+    setReservedInputRows(reserved);
+  });
   // Ink 6 不支持 maxHeight；测量未收缩正文，给动态帧设置自然高度与窗口上限。
   useLayoutEffect(function measureInlineLayout() {
     if (isViewportMode || !inlineBodyRef.current || !fixedRef.current) return;
     const height = measureElement(inlineBodyRef.current).height + measureElement(fixedRef.current).height + approvalCardHeight;
     setInlineHeight(function update(previous) { return previous === height ? previous : height; });
   });
-  const approvalBoxRef = useRef<DOMElement>(null);
   const [measuredFixedHeight, setMeasuredFixedHeight] = useState<number>();
   useLayoutEffect(function measureFixedLayout() {
     if (!isViewportMode || !fixedRef.current) return;
@@ -190,19 +212,20 @@ export function CliTuiApp(props: {
     viewportHeight,
     stdout,
     onCopyText: props.onCopyText,
+    onCopyError: function copyFailed() { props.store.addNotice("复制失败，请检查系统剪贴板后重试。"); },
   });
 
   derivedRef.current.handleTuiViewportKey = handleTuiViewportKey;
 
   const selectedText = isViewportMode ? getTuiSelectedText(viewportLines, selection) : "";
-  const animationActive = snapshot.status === "running" && !snapshot.threadWait && props.visible !== false && isRawModeSupported && stdout.isTTY !== false && terminalFocused;
+  const animationActive = (snapshot.compacting || snapshot.status === "running" && !snapshot.threadWait) && props.visible !== false && isRawModeSupported && stdout.isTTY !== false && terminalFocused;
 
   /** 把用户动作交给 Controller；结束后刷新状态栏并按投影结果打开对应 picker。 */
   async function dispatchAction(action: CliAction, prompt?: string, preserveSkillPickerQuery = false): Promise<void> {
     if (action.type === "exit") { props.onAppExit(0); return; }
     const answeringQuestion = action.type === "submit_prompt" && props.store.getSnapshot().status === "waiting_user_input";
     const allowWhileRunning = action.type === "cancel_turn" || (action.type === "submit_prompt" || action.type === "open_permissions" || action.type === "set_permission_mode" || action.type === "open_model_picker" || action.type === "set_model" || action.type === "open_effort_picker" || action.type === "set_effort" || action.type === "list_jobs" || action.type === "show_job" || action.type === "read_job_output" || action.type === "stop_job") && isActiveTuiStatus(props.store.getSnapshot().status);
-    if (busy.current && !allowWhileRunning) return;
+    if (props.store.getSnapshot().compacting || busy.current && !allowWhileRunning) return;
     const isJobAction = action.type === "list_jobs" || action.type === "show_job" || action.type === "read_job_output" || action.type === "stop_job";
     const jobGeneration = isJobAction ? ++jobRequestGeneration.current : undefined;
     const inputPosition = prompt && allowWhileRunning ? props.store.captureInputPosition() : undefined;
@@ -211,16 +234,20 @@ export function CliTuiApp(props: {
       props.store.recordPrompt(prompt, !allowWhileRunning);
     }
     if (action.type === "approve") props.store.recordApprovalSubmission(action.decision);
+    const hostApproval = action.type === "approve" && props.controller.hostApprovalFeedback;
+    if (hostApproval) setApprovalFeedback("正在提交审批决定…");
+    else setApprovalFeedback(undefined);
     if (!allowWhileRunning) busy.current = true;
     // D2/D5：仅交互 TUI 在发送前把 @ 引用的工作区文件内容以 <system-reminder> 附加块并入 action.content；
     // start/steer/queue/initial 四条 TUI 提交路径都经过此处，时间线与 Esc 恢复仍使用原文 prompt。
     let dispatchedAction = action;
-    if (action.type === "submit_prompt" && !answeringQuestion && prompt && props.workspaceRoot) {
+    if (action.type === "submit_prompt" && !answeringQuestion && prompt && props.workspaceRoot && !props.controller.resolveFileMentionsInHost) {
       const resolved = await resolveFileMentionContext(action.content, props.workspaceRoot);
       for (const message of resolved.notices) props.store.addNotice(message);
       if (resolved.content !== action.content) dispatchedAction = { ...action, content: resolved.content };
     }
     let result: CliControllerResult;
+    if (action.type === "compact") props.store.setCompacting(true);
     try {
       result = await props.controller.dispatch(dispatchedAction);
     } catch (error) {
@@ -233,10 +260,16 @@ export function CliTuiApp(props: {
         projection: props.controller.getProjection(),
       };
     } finally {
+      if (action.type === "compact") props.store.setCompacting(false);
       if (!allowWhileRunning) busy.current = false;
     }
     lastResult.current = result;
     props.onResult(result);
+    if (hostApproval) setApprovalFeedback(result.kind === "ok" && props.controller.getHostApprovalStatus ? undefined : result.lines[0] ?? result.message ?? "审批提交未确认，请核查原决定。");
+    const reportText = result.infoReport ?? result.lines.join("\n");
+    const dedicatedView = hostApproval || result.jobView || result.contextView || result.skillOptions || result.permissionOptions || result.modelOptions || result.effortOptions || jobViewRef.current || contextView || pickers.isPickerActive || props.store.getSnapshot().pendingApproval;
+    if (dedicatedView) setInfoReport(undefined);
+    else if (result.infoReport || result.lines.length > 1 || reportText.includes("\n") || reportText.length > columns - 6) setInfoReport({ text: reportText, offset: 0 });
     if (result.jobView && jobGeneration === jobRequestGeneration.current) {
       jobViewRef.current = result.jobView;
       setJobView(result.jobView);
@@ -253,6 +286,7 @@ export function CliTuiApp(props: {
       }
     }
     if (result.contextView) setContextView(result.contextView);
+    if (result.hostRecordedPrompt && allowWhileRunning) props.store.recordPrompt(result.hostRecordedPrompt, "history");
     if (prompt && result.submittedInput) props.store.addPendingPrompt(prompt, result.submittedInput, inputPosition);
     await refreshStatusView();
     if (result.skillOptions) {
@@ -322,7 +356,8 @@ export function CliTuiApp(props: {
   useEffect(function resetApprovalSelection() {
     pickers.updateApprovalPickerIndex(0);
     setApprovalOffset(0); setApprovalDetails(false);
-  }, [snapshot.pendingApproval?.approvalId]);
+    if (snapshot.pendingApproval || hostStatus || snapshot.status !== "waiting_approval") setApprovalFeedback(undefined);
+  }, [snapshot.pendingApproval?.approvalId, hostStatus, snapshot.status]);
 
   useEffect(function disposeTuiAnimationClock() {
     return function disposeAnimationClock(): void {
@@ -415,6 +450,18 @@ export function CliTuiApp(props: {
     }
   }, [props.closeWhenIdle, snapshot.status, snapshot.requestedExitCode]);
 
+  /** 长报告独占按键，Esc 只关闭报告；输入组件保持挂载以保留草稿。 */
+  useInput(function handleInfoReport(value: string, key: Key): void {
+    if (props.canReceiveInput?.(value, key) === false) return;
+    if (!infoReport) {
+      if (key.ctrl && value === "g") setInfoReport({ text: snapshot.transcript.filter(function notice(item): item is Extract<CliTuiTranscriptItem, { kind: "notice" }> { return item.kind === "notice"; }).map(function message(item) { return item.message; }).join("\n\n") || "暂无提示", offset: 0 });
+      return;
+    }
+    if (key.escape || value === "\u001b") { setInfoReport(undefined); return; }
+    const delta = key.pageDown ? reportHeight : key.pageUp ? -reportHeight : key.downArrow ? 1 : key.upArrow ? -1 : 0;
+    if (delta) setInfoReport({ ...infoReport, offset: Math.max(0, Math.min(reportMaximum, reportOffset + delta)) });
+  }, { isActive: inputEnabled && isRawModeSupported && (infoReport !== undefined || !jobView && !contextView && !pickers.isPickerActive && !snapshot.pendingApproval) });
+
   /** 在 Job 视图内复用 Ink 输入路由；Esc 只返回视图，不取消 Turn 或退出进程。 */
   useInput(function handleJobInput(value: string, key: Key): void {
     if (props.canReceiveInput?.(value, key) === false) return;
@@ -440,26 +487,28 @@ export function CliTuiApp(props: {
     if (value === "o") void dispatchAction({ type: "read_job_output", jobId: current.job.jobId });
     else if (value === "s" && current.job.canStop) void dispatchAction({ type: "stop_job", jobId: current.job.jobId });
     else if (value === "r") void dispatchAction({ type: current.output ? "read_job_output" : "show_job", jobId: current.job.jobId });
-  }, { isActive: inputEnabled && isRawModeSupported && jobView !== undefined });
+  }, { isActive: inputEnabled && isRawModeSupported && jobView !== undefined && !infoReport });
 
   /** 在 Context 覆盖视图内复用 Ink 输入路由；Esc 只关闭视图回到聊天，不取消 Turn 或退出进程。 */
   useInput(function handleContextInput(value: string, key: Key): void {
     if (props.canReceiveInput?.(value, key) === false) return;
     if (contextView === undefined) return;
     if (key.escape || value === "\u001b") setContextView(undefined);
-  }, { isActive: inputEnabled && isRawModeSupported && contextView !== undefined });
+  }, { isActive: inputEnabled && isRawModeSupported && contextView !== undefined && !infoReport });
 
   // Ctrl+O 只切换 Todo 展开视图；picker 与审批等待打开时让位，避免按键语义冲突。
   useInput(function handleTodoExpandInput(input: string, key: Key): void {
     if (props.canReceiveInput?.(input, key) === false) return;
     if (key.ctrl && input === "o") setTodoExpanded(function toggleTodoExpanded(previous): boolean { return !previous; });
-  }, { isActive: inputEnabled && isRawModeSupported && !pickers.isPickerActive && !snapshot.pendingApproval });
+  }, { isActive: inputEnabled && isRawModeSupported && !pickers.isPickerActive && !snapshot.pendingApproval && !infoReport });
 
   const isLiveTurnTerminal = Boolean(snapshot.liveTurnId && isTerminalStatus(snapshot.status));
+  const archiveActivePrompt = Boolean(snapshot.activePrompt?.turnId && snapshot.activePrompt.turnId === snapshot.liveTurnId && (snapshot.status === "completed" || snapshot.status === "failed"));
   const inlineHistoryItems: TuiInlineHistoryItem[] = isViewportMode ? [] : [
     TUI_BRAND_HISTORY_ITEM,
     ...snapshot.transcript.filter(function selectInlineHistoryItem(item): boolean {
-      if (item.kind === "notice") return false;
+      if (item.kind === "notice") return item.persistent === true;
+      if (item.kind === "prompt" && item.key === snapshot.activePrompt?.key && !archiveActivePrompt) return false;
       if (item.kind === "turn") return item.turnId !== snapshot.liveTurnId || isLiveTurnTerminal;
       return true;
     }),
@@ -473,20 +522,21 @@ export function CliTuiApp(props: {
       } };
     }
     return { key: `${props.inlineOutputKey ?? "session"}:${item.key}`, node: item.kind === "brand"
-      ? <TuiBrandHeader statusView={statusView} columns={columns} useColor={props.useColor} screenReader={props.screenReader} reducedMotion animationActive={false} />
+      ? <TuiBrandHeader columns={columns} useColor={props.useColor} screenReader={props.screenReader} reducedMotion animationActive={false} />
       : <MemoizedTuiTranscriptItem item={item} columns={columns} useColor={props.useColor} screenReader={props.screenReader} /> };
   });
 
   return (
     <>
     {!isViewportMode ? <TuiInlineOutput items={inlineOutput} /> : null}
-    <Box flexDirection="column" width={columns} height={isViewportMode ? rows : Math.max(1, Math.min(inlineHeight ?? rows - 1, rows - 1))} overflow="hidden" aria-role="list">
-      <Box flexDirection="column" flexGrow={1} flexShrink={1} overflow="hidden" justifyContent={!isViewportMode && !jobView && !contextView ? "flex-end" : "flex-start"}>
+    <Box flexDirection="column" width={columns} height={isViewportMode ? rows : Math.max(1, Math.min(inlineHeight ?? maximumFrameRows, maximumFrameRows))} overflow="hidden" aria-role="list">
+      <Box flexDirection="column" flexGrow={1} flexShrink={1} overflow="hidden" justifyContent={!isViewportMode && !jobView && !contextView && !infoReport ? "flex-end" : "flex-start"}>
       <Box ref={inlineBodyRef} position={isViewportMode ? "relative" : "absolute"} width={columns} flexDirection="column" flexShrink={0}>
-      {jobView ? <TuiJobs view={jobView} selectedIndex={jobSelectedIndex} useColor={props.useColor} screenReader={props.screenReader} /> : contextView ? <TuiContextReport usage={contextView.usage} expanded={contextView.expanded} columns={columns} useColor={props.useColor} screenReader={props.screenReader} /> : isViewportMode ? <>
+      {infoReport ? <Box flexDirection="column" width={columns}>{reportLines.slice(reportOffset, reportOffset + reportHeight).map(function line(text, index) { return <Text key={index}>{text || " "}</Text>; })}<Text dimColor={props.useColor}>Esc 返回聊天 · ↑↓ / PgUp PgDn · {reportOffset + 1}/{reportLines.length}</Text></Box> : jobView ? <TuiJobs view={jobView} selectedIndex={jobSelectedIndex} useColor={props.useColor} screenReader={props.screenReader} /> : contextView ? <TuiContextReport usage={contextView.usage} expanded={contextView.expanded} columns={columns} useColor={props.useColor} screenReader={props.screenReader} /> : isViewportMode ? <>
         <TuiViewportTimeline lines={viewportLines} state={viewportState} columns={columns} useColor={props.useColor} selection={selection} />
         {snapshot.pendingApproval ? <Box ref={approvalBoxRef} flexDirection="column" flexShrink={0}><TuiApprovalPrompt height={approvalCardHeight} offset={approvalOffset} onMaximumOffset={function rememberMaximum(maximum) { approvalMaximumRef.current = maximum; }} details={approvalDetails} pendingApproval={snapshot.pendingApproval} selectedIndex={pickers.approvalPickerIndex} useColor={props.useColor} screenReader={props.screenReader} /></Box> : null}
       </> : <Box flexDirection="column" flexShrink={0}>
+        {snapshot.activePrompt && !archiveActivePrompt ? <TuiPromptLine content={snapshot.activePrompt.content} keyValue={snapshot.activePrompt.key} columns={columns} useColor={props.useColor} /> : null}
         <TuiLiveTurn
           turnId={isLiveTurnTerminal ? undefined : snapshot.liveTurnId}
           events={snapshot.liveEvents}
@@ -502,14 +552,15 @@ export function CliTuiApp(props: {
           maximumWidth={Math.max(1, columns - 2)}
         />
         {snapshot.pendingInputs.map(function renderPendingInput(item): ReactNode {
-          return item.delivery === "queue" ? <TuiPendingInputItem key={item.key} item={item} useColor={props.useColor} /> : null;
+          return item.delivery === "queue" ? <TuiPendingInputItem key={item.key} item={item} useColor={props.useColor} columns={columns} /> : null;
         })}
       </Box>}
       </Box>
       </Box>
-      {!isViewportMode && snapshot.pendingApproval ? <TuiApprovalPrompt height={approvalCardHeight} offset={approvalOffset} onMaximumOffset={function rememberMaximum(maximum) { approvalMaximumRef.current = maximum; }} details={approvalDetails} pendingApproval={snapshot.pendingApproval} selectedIndex={pickers.approvalPickerIndex} useColor={props.useColor} screenReader={props.screenReader} /> : null}
+      {!isViewportMode && snapshot.pendingApproval ? <Box ref={approvalBoxRef} flexDirection="column" flexShrink={0}><TuiApprovalPrompt height={approvalCardHeight} offset={approvalOffset} onMaximumOffset={function rememberMaximum(maximum) { approvalMaximumRef.current = maximum; }} details={approvalDetails} pendingApproval={snapshot.pendingApproval} selectedIndex={pickers.approvalPickerIndex} useColor={props.useColor} screenReader={props.screenReader} /></Box> : null}
       <Box ref={fixedRef} flexDirection="column" flexShrink={0}>
       <TuiActivityLine
+        compacting={snapshot.compacting}
         threadWait={snapshot.threadWait}
         activity={snapshot.activity}
         status={snapshot.status}
@@ -522,12 +573,17 @@ export function CliTuiApp(props: {
         runningSince={snapshot.liveMetrics?.runningSince}
         activeForm={activeTodoForm}
       />
-      <Box height={infoMessages.length ? 2 : 0} overflow="hidden"><TuiInfoLines messages={infoMessages} useColor={props.useColor} /></Box>
+      {approvalFeedback && <Text wrap="truncate">{approvalFeedback}</Text>}
+      <Box height={!infoReport && infoMessages.length ? 2 : 0} overflow="hidden"><TuiInfoLines columns={columns} messages={infoMessages} useColor={props.useColor} /></Box>
+      <Box ref={inputAreaRef} flexDirection="column" flexShrink={0}>
       <TuiInputArea
+        parseInput={props.controller.parseInput}
+        suggestSlashCommands={props.controller.suggestSlashCommands}
         draftRef={props.viewState?.draftRef}
         store={props.store}
         columns={columns}
-        maximumPromptRows={Math.max(1, Math.min(4, rows - approvalCardHeight - (statusView ? 12 : 7)))}
+        availableRows={maximumFrameRows - reservedInputRows}
+        maximumPromptRows={Math.max(1, Math.min(4, rows - approvalCardHeight - statusHeight - 6))}
         busy={busy}
         keepOpenAfterCancel={keepOpenAfterCancel}
         lastSubmittedPromptRef={lastSubmittedPromptRef}
@@ -537,11 +593,11 @@ export function CliTuiApp(props: {
         onRequestInterrupt={props.onRequestInterrupt}
         onRequestCancel={props.onRequestCancel}
         isRawModeSupported={isRawModeSupported}
-        isInputActive={inputEnabled && jobView === undefined && contextView === undefined}
+        isInputActive={inputEnabled && jobView === undefined && contextView === undefined && infoReport === undefined}
         canReceiveInput={props.canReceiveInput}
         bindInputHandler={props.bindInputHandler}
         onAttachmentsChange={props.onDraftAttachmentsChange}
-        showInput={jobView === undefined && contextView === undefined}
+        showInput={jobView === undefined && contextView === undefined && infoReport === undefined}
         useColor={props.useColor}
         screenReader={props.screenReader}
         pickers={pickers}
@@ -549,7 +605,8 @@ export function CliTuiApp(props: {
         fileMentionIndex={snapshot.status === "waiting_user_input" ? { entries: [], ready: false } : fileMentionIndex}
         onLayoutChange={handleInputLayoutChange}
       />
-      <TuiStatusLine snapshot={snapshot} statusView={statusView} interactionLabel={props.interactionLabel} sessionTitle={props.sessionTitle} useColor={props.useColor} screenReader={props.screenReader} selectionCharacters={selectedText.length} escapeClosesPanel={props.escapeClosesPanel} />
+      </Box>
+      <TuiStatusLine snapshot={snapshot} statusView={statusView} interactionLabel={hostStatus ?? props.interactionLabel} sessionTitle={props.sessionTitle} useColor={props.useColor} screenReader={props.screenReader} selectionCharacters={selectedText.length} escapeClosesPanel={props.escapeClosesPanel} />
       </Box>
     </Box>
     </>

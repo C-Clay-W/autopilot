@@ -5,7 +5,24 @@
 
 本 npm 包分发 CLI，不包含 Web 或 Desktop 应用，也不提供私有知识库 RAG、AutoMemory 或内置浏览器预览。
 
-本手册以已发布 npm 0.3.0 的安装和配置为基础。推荐 Node 20.20.2 与 npm 10。
+本手册以已发布 npm 0.4.0 的安装和配置为基础。推荐 Node 20.20.2 与 npm 10。
+
+## 0.4.0 Desktop 示例截图
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/C-Clay-W/autopilot/main/.github/Autopilot-0.4.0-desktop-mode-selection.png" alt="Desktop 模式选择" width="960"><br>
+  <em>Desktop 模式选择</em>
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/C-Clay-W/autopilot/main/.github/Autopilot-0.4.0-desktop-orchestration.png" alt="Orchestration" width="960"><br>
+  <em>Orchestration</em>
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/C-Clay-W/autopilot/main/.github/Autopilot-0.4.0-desktop-parallel.png" alt="Parallel" width="960"><br>
+  <em>Parallel</em>
+</p>
 
 ## 0.3.0 示例截图
 
@@ -34,7 +51,7 @@
 需要 **Node.js >=20.11.0 且 <22** 和 npm。首次安装需要网络连接；部分依赖包含平台二进制或安装脚本。
 
 ```bash
-npm install -g autopilot-agent@0.3.0
+npm install -g autopilot-agent@0.4.0
 ap --help
 ```
 
@@ -82,7 +99,7 @@ CLI 不读取开发仓库的 Web `.env.local`，用户无需复制该文件。�
 
 示例域名和模型必须替换。route 的 id 必须等于字典 key，credentialRef.provider 必须等于该 id，key 对应用户文件 env 中的凭据名，models 非空且 id 不重复；Base URL 不追加 `/chat/completions`。不要同时设置 `env.ANTHROPIC_MODEL`，它会优先选择默认主连接。
 
-route 的 apiProtocol 只接受 `anthropic-messages` 或 `openai-chat-completions`。可选 displayName 是非空字符串，models 项可声明 1–10,000,000 的整数 contextWindowTokens。兼容 profile 需与实际服务匹配：Anthropic profile 只含 apiProtocol；Chat Completions profile 恰含 apiProtocol、assistantToolCallContent（empty-string/null）、supportsReasoningContent（布尔）、supportsUsageInStreaming（布尔）。profile 可放在 route 或 models 项上，不声明未经验证的能力。
+支持的协议为 `anthropic-messages`、`openai-chat-completions` 和 `openai-responses`。OpenAI Responses 的连接、模型和推理配置示例见 [CLI 参考](../../agent/doc/CLI-Reference.md)。
 
 ### 常用可选参数
 
@@ -93,7 +110,7 @@ route 的 apiProtocol 只接受 `anthropic-messages` 或 `openai-chat-completion
 | `availableModels` | User-only，非空且无重复的字符串数组；限制默认连接的主/子模型选择，不声明能力；route 模型仍使用其 models 清单 |
 | `modelOverrides` | User-only，字符串映射对象；只允许单跳替换，禁止自映射、链和循环；结果仍需属于合法模型目录 |
 | `effortLevel` | 顶层字符串 low/medium/high；最终效果受模型与协议能力限制 |
-| `env.CLAUDE_CODE_EFFORT_LEVEL` | 字符串 low/medium/high/max/auto/unset，优先于顶层；auto/unset 清除显式 effort，不等于关闭思考 |
+| `env.CLAUDE_CODE_EFFORT_LEVEL` | 根据模型能力选择的推理强度，优先于顶层；auto/unset 清除显式 effort，不等于关闭思考 |
 | `alwaysThinkingEnabled` | JSON 布尔值，不写成字符串；实际请求仍取决于模型能力 |
 | `maxOutputTokens` | User-only，JSON 整数 1–1,000,000；输出预算，不是上下文大小 |
 | `env.API_TIMEOUT_MS` | User-only，默认主连接超时的整数字符串，1,000–600,000 毫秒，例如 `"60000"` |
@@ -149,9 +166,9 @@ npm uninstall -g autopilot-agent
 
 卸载 npm 包不表示删除用户配置、凭据或会话数据。
 
-## npm 0.3.0 的已知限制
+## npm 0.4.0 的已知限制
 
-- Windows 不启用 OS 进程沙箱；命令、后台 Job 和 host MCP 经逐次审批后以当前用户权限直接执行，审批不提供隔离。`ap sandbox status` / `ap sandbox setup` 返回停用报告，不安装 Windows 沙箱。
+- Windows 不启用 OS 进程沙箱；命令和后台 Job 按权限模式与风险审批后以当前用户权限执行，host MCP 另按授权执行，审批不提供隔离。`ap sandbox status` / `ap sandbox setup --yes` 返回停用报告，不安装 Windows 沙箱。
 - 后台 Job 的完整进程树回收仍有真实环境验收边界；不要仅凭根进程退出判断整棵进程树已停止。macOS 继续使用 Seatbelt，沙箱不可用时受隔离保护的命令拒绝执行。
 - macOS 全链路验收尚未完成，Linux 未纳入本次支持验收。Provider 可用性、限额和调用费用由所配置的服务决定。
 - 当前为早期版本，重要工作区请保留版本控制或备份；不承诺任意平台、协议端点和外部工具的兼容性。
@@ -183,7 +200,7 @@ npm uninstall -g autopilot-agent
 | /undo | 先查看最近一轮可撤销文件改动，再确认撤销 |
 | /cancel、/exit | 取消任务或退出 |
 
-完整命令语法见 [CLI 参考](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/CLI-Reference.md)。该参考随源码更新，可能包含 npm 0.3.0 之后的能力；安装版先用 ap --help 确认可用命令。
+完整命令语法见 [CLI 参考](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/CLI-Reference.md)。该参考随源码更新，可能包含 npm 0.4.0 之后的能力；安装版先用 ap --help 确认可用命令。
 
 ## 脚本调用与会话管理
 
@@ -235,20 +252,20 @@ Windows 的进程执行不提供 OS 沙箱；macOS 的 Seatbelt 隔离依赖相�
 ## 五包组成与源码
 
 ```text
-autopilot-agent@0.3.0
-├── @autopilot-agent/cli@0.3.0
-│   └── @autopilot-agent/presentation@0.3.0
-├── @autopilot-agent/core@0.3.0
-└── @autopilot-agent/adapters@0.3.0
+autopilot-agent@0.4.0
+├── @autopilot-agent/cli@0.4.0
+│   └── @autopilot-agent/presentation@0.4.0
+├── @autopilot-agent/core@0.4.0
+└── @autopilot-agent/adapters@0.4.0
 ```
 
 CLI 也直接依赖 Core 和 Adapters，Adapters/Presentation 依赖 Core。主包的 bin 解析已安装的 CLI 并转发参数、标准流及退出结果；不重复实现 Agent Runtime。schema/cc-compatible-settings.schema.json 提供配置结构参考，实际允许字段仍受 Runtime 校验。
 
 源码仓库：https://github.com/C-Clay-W/autopilot 。源码还包含 Web；它不随 npm 主包安装。开发者可阅读各包 README、Core API 和 BUILD.md，从源码修改并验证。源码与 npm 分别交付；Web 不随 CLI 包安装，实际能力仍取决于宿主与平台。
 
-## 源码 0.3.0 与 npm 版本
+## 源码 0.4.0 与 npm 版本
 
-源码与五个 npm 包当前版本均为 0.3.0。Windows 不提供 OS 进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
+源码与五个 npm 包当前版本均为 0.4.0。Windows 不提供 OS 进程沙箱，命令和后台 Job 按权限模式与风险审批后以当前用户权限执行，host MCP 另按授权执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
 
 ## 许可证
 

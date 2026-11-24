@@ -18,6 +18,7 @@ import { isExternalFileConstraint } from "../../runtime/domain/external-permissi
 import { isExternalTaskFileSetConstraint } from "../../runtime/domain/approval";
 import type { ExternalExecutionAuthorization } from "../../runtime/domain/external-execution";
 import { AgentRuntimeError } from "../../runtime/protocol/error-code";
+import { WEB_FETCH_BLOCK_FALLBACK, WEB_FETCH_BLOCK_MESSAGES } from "../../runtime/protocol/web-capability";
 import { WebFetchRedirect, bindWebFetchRedirect, getWebFetchRedirectBudget } from "./web-fetch-redirect";
 import type {
   ToolApprovalRequest,
@@ -655,7 +656,7 @@ export class ToolExecutor {
       }
 
       // 策略事实与执行阶段使用同一个调用身份，供受信工具派生精确目标。
-      const policyContext = { ...this.context, signal, toolCallId: request.callId };
+      const policyContext = { ...this.context, signal, toolCallId: request.callId, webFetchRedirectsRemaining: getWebFetchRedirectBudget(request.input) };
       await definition.validateInput?.(parsed.data, policyContext);
       const facts = await definition.createActionFacts(parsed.data, policyContext);
       display = { ...createToolDisplayFacts(facts), observation: createThreadObservationDisplay(request.toolName, parsed.data) };
@@ -663,7 +664,7 @@ export class ToolExecutor {
       // 入口。先解析沙箱执行范围：绑定缺失或能力不可执行都得到 undefined，evaluate 时以
       // available:false fail-closed（G3/G7），不转普通审批，更不裸跑。其他工具不注入沙箱
       // 事实，行为与本字段引入前一致。
-      const sandboxEligible = request.toolName === "run_command" || request.toolName === "start_background_job" || (request.toolName === "open_preview" && facts.operation === "prepare_static_preview");
+      const sandboxEligible = request.toolName === "run_command" || request.toolName === "start_background_job" || (["open_preview", "browser"].includes(request.toolName) && facts.operation === "prepare_static_preview");
       // 进程类工具先解析沙箱执行范围。探测只读 status 不启动目标命令，重试安全；
       // 最多 3 次尝试，仍失败按模式分流（CR 20261016 R2 fail-closed）：read-only 与
       // workspace-write 一律 fail-closed deny——沙箱不可用即不存在受控执行通道，无法
@@ -740,7 +741,7 @@ export class ToolExecutor {
           // Talk-Plan1022 CR R1：Windows 宿主执行只认本调用新签发的 allow_once。旧 allow_session/
           // allow_workspace 授权会让 ApprovalService 在无 approval 时直接返回真实封印授权，若把它当作
           // 本次批准就会跳过逐次无隔离确认；沙箱平台继续沿用原有持久授权语义。
-          consumed = hostExecution
+          consumed = hostExecution || this.policyEngine.requiresSingleApproval(policyContext, facts)
             ? executionAuthorization !== null && request.approval?.decision === "allow_once"
             : executionAuthorization !== null;
         } else consumed = await this.consumeApproval(request, inputHash, policy.allowedApprovalDecisions, policy.constraint);
@@ -764,12 +765,13 @@ export class ToolExecutor {
         if (!sandboxScope || !executionAuthorization) throw createToolError("SANDBOX_UNAVAILABLE", "外部执行能力不可验证");
         sandboxScope.policy = { ...sandboxScope.policy, externalWriteCapability: issueExternalWriteCapability({ target: facts.externalExecutionTarget, toolName: request.toolName, callId: request.callId, inputHash, authorization: executionAuthorization }) };
       }
+      // 普通权限与审批已通过；宿主资源准入必须在每次真实执行（含重试/恢复）前重新核对。
+      await this.context.hostToolAdmission?.(definition);
+      if (signal?.aborted) throw createToolError("TOOL_CANCELLED", "工具执行已取消");
       const output = await definition.execute(parsed.data, {
-        ...this.context,
-        signal,
-        toolCallId: request.callId,
+        ...policyContext,
         reportingAgreement: request.toolName === "send_thread" ? options.reportingAgreement : undefined,
-        webFetchRedirectsRemaining: getWebFetchRedirectBudget(request.input),
+        browserApprovalConsumed: request.toolName === "browser" && policy.decision === "approval_required" && consumed && request.approval?.decision === "allow_once" ? true : undefined,
         ...(sandboxScope ? { sandboxPolicy: sandboxScope } : {}),
         ...(directSandboxBypass || sandboxScope?.execution === "host" ? { sandboxExecutionOverride: "direct" as const } : {}),
         // Talk-Plan1013 Stage5 R3：外部文件修改授权绑定——到达此处必已过外部 gate（deny 已拒绝、
@@ -860,6 +862,11 @@ export class ToolExecutor {
         return { status: "timeout", callId: request.callId, toolName: request.toolName, error: safeError, meta, interruption, display };
       }
       emitToolEvent(this.context, { type: "tool_error", callId: request.callId, toolName: request.toolName, inputHash, status: "error", durationMs, errorCode: safeError.code });
+      if (display && request.toolName === "web_fetch" && safeError.code === TOOL_ERROR_CODES.WEB_URL_BLOCKED) {
+        // 只允许固定诊断进入实时与历史展示，其他错误文本仍走通用提示。
+        const summary = Object.values(WEB_FETCH_BLOCK_MESSAGES).includes(safeError.message) ? safeError.message : WEB_FETCH_BLOCK_FALLBACK;
+        display = { ...display, summary };
+      }
       return { status: "error", callId: request.callId, toolName: request.toolName, error: safeError, meta: inputHash ? { durationMs, inputHash } : undefined, display };
     } finally {
       deadline?.cleanup();

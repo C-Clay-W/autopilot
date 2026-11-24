@@ -1,4 +1,4 @@
-/** useConversationSubmission.ts — 文件选择、拖拽、附件上传、创建 Session 与 handleSend 的连续逻辑；自原 page.tsx 原样迁入，不重排分支。 */
+/** 对话发送：共享草稿与展示，Chat 对话和 Work 任务使用各自的提交协议。 */
 "use client";
 
 import { useCallback, useMemo, useRef, useState } from "react";
@@ -61,6 +61,7 @@ interface UseConversationSubmissionOptions {
   onSessionStarting: () => void;
   onSessionCreated: (sessionId: string) => void;
   handleContinueTurn: (messageId: string) => Promise<void>;
+  cancelCurrentTurn?: () => Promise<void>;
   /** 只读发现宿主在上一轮之后启动的排队 Turn；页面不领取、不启动。 */
   requestFollowQueuedTurn: (previousTurnId: string | null) => Promise<void>;
   setMessages: Dispatch<SetStateAction<Message[]>>;
@@ -72,6 +73,7 @@ interface UseConversationSubmissionOptions {
   setPendingInputs: Dispatch<SetStateAction<PendingAgentInput[]>>;
   setInputDeliveryNotice: Dispatch<SetStateAction<import("../chat-page-types").InputDeliveryNotice | null>>;
   setStreamingMessageId: (streamingMessageId: string) => void;
+  setActiveTurnId?: (turnId: string) => void;
   setActivity: Dispatch<SetStateAction<WebActivityState | undefined>>;
   setTransportState: (transport: TransportState) => void;
   clearActiveTurn: () => void;
@@ -79,6 +81,7 @@ interface UseConversationSubmissionOptions {
   consumeAgentStream: (response: Response, messageId: string, sid: string) => Promise<SessionTaskStreamOutcome>;
   getSessionController: (sid: string) => SessionTaskController;
   requestAbortRef: RefObject<AbortController | null>;
+  chatStartPendingRef?: RefObject<boolean>;
   cancelRequestedRef: RefObject<boolean>;
   cancelInFlightRef: RefObject<Promise<void> | null>;
   locallyCreatedSessionRef: RefObject<string | null>;
@@ -101,7 +104,7 @@ function hasInputConfirmation(value: Partial<PendingAgentInput> | null): value i
   return Boolean(value && typeof value.inputId === "string" && value.inputId.trim() && (value.delivery === "steer" || value.delivery === "queue") && (value.status === "pending" || value.status === "claimed"));
 }
 
-/** 承接原 ChatPageContent 的发送链路；语句顺序、请求体与分支结构保持不变。 */
+/** 为共用输入框装配产品提交，草稿和实时展示仍使用同一组状态。 */
 export function useConversationSubmission(options: UseConversationSubmissionOptions) {
   const {
     isChat,
@@ -198,24 +201,30 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
 
   const isImage = (name: string) => /\.(png|jpe?g|webp|gif)$/i.test(name);
 
-  /** Upload one image as a session attachment without sending it to the RAG ingestion routes. */
-  async function uploadSessionImage(sid: string, file: File, persist: boolean): Promise<SessionImageAttachment> {
+  /** 复用 multipart 传输；具体附件响应由各产品解释。 */
+  async function uploadSessionAttachment<T>(sid: string, file: File, endpoint: "/attachments" | "/uploads"): Promise<T> {
     const formData = new FormData();
     formData.append("file", file);
-    if (persist && !isChat) formData.append("persist", "true");
-    const response = await fetch(getWorkspaceSessionUrl(workspaceId, sid, isChat ? "/attachments" : "/uploads")!, { method: "POST", body: formData });
+    const response = await fetch(getWorkspaceSessionUrl(workspaceId, sid, endpoint)!, { method: "POST", body: formData });
     console.log(response);
     if (!response.ok) {
       const payload = await response.json().catch(() => ({ error: "图片上传失败" }));
       throw new Error(payload.error || "图片上传失败");
     }
-    const payload = await response.json() as { attachment: SessionImageAttachment & ChatAttachmentView & { gifFirstFrame?: boolean } };
-    if (isChat) {
-      setChatAttachments((current) => [...current, payload.attachment]);
-      return { id: payload.attachment.ref, name: payload.attachment.displayName, mimeType: payload.attachment.mimeType };
-    }
-    if (payload.attachment.gifFirstFrame) notice.warning("GIF 图片仅发送静态首帧");
-    return payload.attachment;
+    return (await response.json() as { attachment: T }).attachment;
+  }
+
+  /** Chat 临时文件只进入会话附件目录，请求模型时由宿主加载。 */
+  async function uploadChatAttachment(sid: string, file: File): Promise<void> {
+    const attachment = await uploadSessionAttachment<ChatAttachmentView>(sid, file, "/attachments");
+    setChatAttachments(function append(current) { return [...current, attachment]; });
+  }
+
+  /** Work 任务图片通过上传接口生成供任务提交携带的附件 ID。 */
+  async function uploadWorkImage(sid: string, file: File): Promise<SessionImageAttachment> {
+    const attachment = await uploadSessionAttachment<SessionImageAttachment & { gifFirstFrame?: boolean }>(sid, file, "/uploads");
+    if (attachment.gifFirstFrame) notice.warning("GIF 图片仅发送静态首帧");
+    return attachment;
   }
 
   // 发消息：如果有 sessionId 直接发；如果没有先创建会话
@@ -226,10 +235,10 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
     }
     // 发送前置校验：只读/生成中、等待用户回答、空内容、取消收口中、竞态，任一命中都直接拦住
     // cr by clayw on 20260909
-    if (!canWrite || (isChat && loading)) return;
+    if (!canWrite || (isChat && (loading || transportDisconnectedRef.current))) return;
     if (awaitingUserInputRef.current) return;
     const content = (overrideContent ?? inputRef.current).trim();
-    const initialDraftId = new URLSearchParams(window.location.search).get("draft") || "";
+    const initialDraftId = isChat ? "" : new URLSearchParams(window.location.search).get("draft") || "";
     if (!content && selectedFiles.length === 0) return;
     if (!isChat && selectedFiles.length > 10) { notice.error("一次最多发送 10 张图片"); return; }
     if (cancelInFlightRef.current) {
@@ -239,7 +248,7 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
     }
 
     /** 检查异步请求仍属于当前工作区与会话，兼容首次创建尚未完成导航。 */
-    function isCurrentWorkDraft(): boolean {
+    function isCurrentDraft(): boolean {
       return options.currentWorkspaceIdRef.current === workspaceId && (options.currentSessionIdRef.current === sid || (!options.currentSessionIdRef.current && locallyCreatedSessionRef.current === sid));
     }
 
@@ -247,13 +256,13 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
     function isActiveWorkDraft(): boolean {
       const params = new URLSearchParams(window.location.search);
       const target = readConversationTarget(params);
-      return isCurrentWorkDraft() && target.productMode === "work" && target.scope === workspaceId
+      return isCurrentDraft() && target.productMode === "work" && target.scope === workspaceId
         && (target.sessionId === sid || (!sessionId && !target.sessionId && (params.get("draft") || "") === initialDraftId));
     }
 
     /** 迟到请求只能恢复到所属工作区和会话，并保留用户随后输入的新草稿。 */
     function restoreWorkDraft(): void {
-      if (isChat || !isCurrentWorkDraft()) return;
+      if (isChat || !isCurrentDraft()) return;
       if (content) setComposerInput(inputRef.current ? `${content}\n${inputRef.current}` : content);
       setSelectedFiles(function restore(previous) { return [...files, ...previous]; });
     }
@@ -360,9 +369,12 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
     const attachments: SessionImageAttachment[] = [];
     const attachmentFiles = isChat && currentRetrieval === "rag" ? [] : files;
     for (const [index, file] of attachmentFiles.entries()) {
-      try { attachments.push(await uploadSessionImage(sid, file.file, false)); }
+      try {
+        if (isChat) await uploadChatAttachment(sid, file.file);
+        else attachments.push(await uploadWorkImage(sid, file.file));
+      }
       catch (error) {
-        if (!isChat && !isCurrentWorkDraft()) return;
+        if (!isChat && !isCurrentDraft()) return;
         notice.error(error instanceof Error ? error.message : "附件上传失败");
         if (isChat) { setComposerInput(content); setSelectedFiles(attachmentFiles.slice(index)); }
         else restoreWorkDraft();
@@ -379,7 +391,7 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
       setMessages((prev) => [...prev, { id: optimisticUserId, role: "user", content: agentContent, attachments: isChat ? undefined : attachments, optimistic: true, createdAt: submittedAt }]);
     }
 
-    // 有文本统一提交 /messages：202 表示加入队列，SSE 表示流式回答；Chat/Work 与 RAG 的差异由请求体和服务端 session 元数据决定。
+    // Work 活动回合接收追加输入；新消息和新任务复用下方回答容器。
     if (agentContent) {
       if (isSubmittingToActiveTurn) {
         const position = inputPosition!;
@@ -452,9 +464,9 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
       const aiId = mkId("a");
       ownedExecutionEpoch = executionEpochRef.current + 1;
       executionEpochRef.current = ownedExecutionEpoch;
-      /** Work 回写必须仍属于发起会话及当前执行段；Chat 沿用原有行为。 */
+      /** 旧请求只写回发起会话及当前执行段，保活页面继续持有同一目标。 */
       function ownsExecution(): boolean {
-        return isChat || (isCurrentWorkDraft() && executionEpochRef.current === ownedExecutionEpoch);
+        return isCurrentDraft() && executionEpochRef.current === ownedExecutionEpoch;
       }
       const abortController = getSessionController(sid).createAbortController();
       requestAbortRef.current = abortController;
@@ -471,23 +483,26 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
       }]);
       setActivity(undefined);
       let responseReceived = false;
+      let reconcileChat = false;
       try {
         const clientMessageId = mkId("message");
+        if (isChat) {
+          await submitChatTurn(clientMessageId);
+          return;
+        }
         const res = await fetch(getWorkspaceSessionUrl(workspaceId, sid, "/messages")!, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           signal: abortController.signal,
-          body: JSON.stringify(isChat
-            ? { content: agentContent, clientMessageId }
-            : {
-              content: agentContent,
-              clientMessageId,
-              delivery: "auto",
-              attachmentIds: attachments.map((attachment) => attachment.id),
-              databaseSearchEnabled: databaseEnabled,
-              permissionMode,
-              selectedSkills: selectedSkillsForRequest,
-            }),
+          body: JSON.stringify({
+            content: agentContent,
+            clientMessageId,
+            delivery: "auto",
+            attachmentIds: attachments.map((attachment) => attachment.id),
+            databaseSearchEnabled: databaseEnabled,
+            permissionMode,
+            selectedSkills: selectedSkillsForRequest,
+          }),
         });
         console.log(res);
         responseReceived = true;
@@ -498,7 +513,7 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
           const payload = (await res.json().catch(function invalidResponse() { return null; })) as (Partial<PendingAgentInput> & { turnId?: string }) | null;
           if (!ownsExecution()) return;
           // Work 统一 Runner：202 只携带 turnId 表示执行已被宿主接受，页面改用只读观察流。
-          if (!isChat && payload && typeof payload.turnId === "string" && payload.delivery === undefined) {
+          if (payload && typeof payload.turnId === "string" && payload.delivery === undefined) {
             manager.beginSession(createWorkspaceSessionKey(workspaceId, sid));
             if (!uiTarget) {
               setSelectedSkills((current) => current.filter((skill) => skill.pinned));
@@ -520,7 +535,7 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
             return;
           }
           if (!hasInputConfirmation(payload)) {
-            if (!isChat && !uiTarget && isCurrentWorkDraft()) {
+            if (isCurrentDraft()) {
               restoreWorkDraft();
               notice.warning("提交状态未确认，草稿已恢复；请先检查会话记录再决定是否重发");
             }
@@ -558,17 +573,13 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
           if (!ownsExecution()) return;
           if (errData.code === "WORK_HISTORY_READ_ONLY") setReadOnlyReason("WORK_HISTORY_READ_ONLY");
           if (errData.code === "WORKSPACE_NOT_TRUSTED") setReadOnlyReason("工作区信任已失效，请重新选择并确认工作区");
-          if (!uiTarget && isCurrentWorkDraft()) {
+          if (isCurrentDraft()) {
             restoreWorkDraft();
             setMessages(function removeRejectedInput(current) { return current.filter(function keep(message) { return message.id !== optimisticUserId; }); });
           }
           setMessages((prev) => prev.map((m) => (m.id === aiId ? { ...m, content: `分析失败：${errData.error || `${res.status} ${res.statusText}`}`, activity: undefined, processSteps: undefined } : m)));
           setStreamingMessageId("");
           setLoading(false);
-          if (uiTarget && (errData.code === "CHAT_MESSAGE_ALREADY_SUBMITTED" || res.status >= 500)) {
-            setTransportState("disconnected");
-            await loadHistory(sid);
-          }
           return;
         }
 
@@ -576,7 +587,6 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
           setMessages((prev) => prev.map((m) => (m.id === aiId ? { ...m, content: "分析失败：响应体为空", activity: undefined, processSteps: undefined } : m)));
           setStreamingMessageId("");
           setLoading(false);
-          if (uiTarget) { setTransportState("disconnected"); await loadHistory(sid); }
           return;
         }
         manager.beginSession(createWorkspaceSessionKey(workspaceId, sid));
@@ -592,7 +602,7 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
         if (!ownsExecution()) return;
         const cancelled = cancelRequestedRef.current || abortController.signal.aborted;
         const disconnected = !cancelled && isTransportFailure(err);
-        if (!isChat && !uiTarget && !cancelled && !responseReceived && isCurrentWorkDraft()) {
+        if (!cancelled && !responseReceived && isCurrentDraft()) {
           restoreWorkDraft();
           notice.warning("提交状态未确认，草稿已恢复；请先检查会话记录再决定是否重发");
         }
@@ -606,15 +616,66 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
                 : { ...m, content: `分析失败：${err instanceof Error ? err.message : "未知错误"}`, activity: undefined, processSteps: undefined, sources: undefined }
             : m
         )));
-        if (uiTarget && !cancelled) { setTransportState("disconnected"); await loadHistory(sid); }
       } finally {
+        const ownsTurn = ownsExecution();
         if (requestAbortRef.current === abortController) requestAbortRef.current = null;
-        if (ownsExecution() && locallyCreatedSessionRef.current === sid) locallyCreatedSessionRef.current = null;
+        if (ownsTurn && locallyCreatedSessionRef.current === sid) locallyCreatedSessionRef.current = null;
         // 旧发送的收尾只清理自己认领的执行段，不覆盖后来续接的 loading/active（H2）。
-        if (ownsExecution() && executionEpochRef.current === ownedExecutionEpoch) {
+        if (ownsTurn) {
           setStreamingMessageId("");
           cancelRequestedRef.current = false;
           if (!awaitingApprovalRef.current && !awaitingUserInputRef.current && !transportDisconnectedRef.current) clearActiveTurn();
+          if (isChat && reconcileChat) await loadHistory(sid);
+          else if (isChat) setLoading(false);
+        }
+      }
+
+      /** Chat 普通消息和互动卡共用单一 POST；失联只读取权威快照，从不重投。 */
+      async function submitChatTurn(clientMessageId: string): Promise<void> {
+        const starting = options.chatStartPendingRef;
+        if (starting) starting.current = true;
+        let acknowledgedTurnId: string | null = null;
+        setMessages(function identify(current) { return current.map(function target(message) { return message.id === optimisticUserId ? { ...message, clientRecordId: `chat-message:${clientMessageId}` } : message; }); });
+        try {
+          const res = await fetch(getWorkspaceSessionUrl(workspaceId, sid, "/messages")!, {
+            method: "POST", headers: { "Content-Type": "application/json" }, signal: abortController.signal,
+            body: JSON.stringify({ content: agentContent, clientMessageId }),
+          });
+          console.log(res);
+          if (!ownsExecution()) return;
+          if (!res.ok) {
+            const error = await res.json().catch(function invalidResponse() { return {}; });
+            if (!ownsExecution()) return;
+            if (res.status === 409 || res.status >= 500) {
+              if (res.status === 409) notice.warning(typeof error.error === "string" ? error.error : "发送状态未确认，请核对会话记录");
+              markChatUnconfirmed();
+            } else setMessages(function failed(current) { return current.map(function show(message) { return message.id === aiId ? { ...message, content: `分析失败：${error.error || res.status}`, activity: undefined, processSteps: undefined } : message; }); });
+            return;
+          }
+          acknowledgedTurnId = res.headers.get("X-Autopilot-Turn-Id");
+          if (starting) starting.current = false;
+          if (acknowledgedTurnId) {
+            options.activeTurnRef.current = { sessionId: sid, turnId: acknowledgedTurnId };
+            options.setActiveTurnId?.(acknowledgedTurnId);
+            setMessages(function bind(current) { return current.map(function target(message) { return message.id === aiId ? { ...message, turnId: acknowledgedTurnId! } : message; }); });
+            if (cancelRequestedRef.current && options.cancelCurrentTurn) {
+              void options.cancelCurrentTurn();
+              return;
+            }
+          }
+          if (!res.body) { markChatUnconfirmed(); return; }
+          manager.beginSession(createWorkspaceSessionKey(workspaceId, sid), acknowledgedTurnId ?? undefined);
+          const result = await consumeAgentStream(res, aiId, sid);
+          if (ownsExecution() && result === "ended_without_terminal") markChatUnconfirmed();
+        } catch {
+          if (ownsExecution() && !abortController.signal.aborted) markChatUnconfirmed();
+        } finally { if (starting) starting.current = false; }
+
+        /** 未确认时交回持久快照恢复回答容器、活动身份和游标。 */
+        function markChatUnconfirmed(): void {
+          reconcileChat = true;
+          setTransportState("disconnected");
+          if (!acknowledgedTurnId) setMessages(function unconfirmed(current) { return current.filter(function keep(message) { return message.id !== aiId; }); });
         }
       }
       if (!ownsExecution()) return;
@@ -625,7 +686,7 @@ export function useConversationSubmission(options: UseConversationSubmissionOpti
     }
     // 旧发送结束后不得清掉后来续接的执行 loading（H2）。
     if (ownedExecutionEpoch === null || executionEpochRef.current === ownedExecutionEpoch) setLoading(false);
-    if (queuedFollowUpTurnIdRef.current) {
+    if (!isChat && queuedFollowUpTurnIdRef.current) {
       // 宿主已接管排队调度：页面只发现并观察它启动的 Turn，不再领取或启动。
       const completedTurnId = queuedFollowUpTurnIdRef.current;
       queuedFollowUpTurnIdRef.current = null;

@@ -53,7 +53,7 @@ export function resolveContextBudgetBounds(providerConfig: FrozenProviderConfig 
   const contextWindowTokens = providerConfig?.contextWindowTokens;
   const compactThresholdTokens = providerConfig?.compactThresholdTokens;
   const budgetWindowTokens = contextWindowTokens ?? compactThresholdTokens;
-  const outputReserveTokens = providerConfig?.sampleOptions?.maxTokens ?? 8_192;
+  const outputReserveTokens = providerConfig?.sampleOptions?.maxTokens ?? providerConfig?.maxOutputTokens ?? 8_192;
   if (!budgetWindowTokens) {
     return { budgetWindowTokens: undefined, contextWindowTokens, outputReserveTokens, triggerTokens: undefined };
   }

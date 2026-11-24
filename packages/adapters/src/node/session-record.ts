@@ -8,6 +8,8 @@ export function normalizeNodeSession(value: unknown, id: string): Session {
   const session = value as Session;
   if (session.id !== id || !Number.isFinite(session.createdAt) || !Number.isFinite(session.updatedAt)) throw new NodeStateError("STATE_SESSION_CORRUPTED");
   const source = session.creationSource;
+  const managed = session.managedExecution;
+  if (managed !== undefined && (!managed || managed.threadPolicy !== "disabled" || typeof managed.hostId !== "string" || !/^[\w-]{1,128}$/.test(managed.hostId) || typeof managed.requestId !== "string" || !/^[\w-]{1,128}$/.test(managed.requestId) || session.productMode !== "work" || session.persistenceMode !== "durable")) throw new NodeStateError("STATE_SESSION_CORRUPTED");
   if (source !== undefined) {
     const actor = source?.actor;
     if (!session.collaborationCreationId || !source || typeof source.requestId !== "string" || !source.requestId
@@ -26,6 +28,7 @@ export function normalizeNodeSession(value: unknown, id: string): Session {
 
 /** 磁盘写入也禁止产品、检索模式和既有 Project 归属改变。 */
 export function assertNodeSessionIdentity(previous: Session, next: Session): void {
+  if (JSON.stringify(previous.managedExecution) !== JSON.stringify(next.managedExecution)) throw createNodeIdentityError("SESSION_MODE_MISMATCH");
   if (JSON.stringify(previous.collaborationAllowedTools) !== JSON.stringify(next.collaborationAllowedTools)) throw createNodeIdentityError("SESSION_MODE_MISMATCH");
   if (JSON.stringify(previous.creationSource) !== JSON.stringify(next.creationSource)) throw createNodeIdentityError("SESSION_MODE_MISMATCH");
   if (previous.collaborationCreationId !== next.collaborationCreationId) throw createNodeIdentityError("SESSION_MODE_MISMATCH");

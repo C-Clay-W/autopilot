@@ -23,6 +23,93 @@ afterEach(function removeFixtures() {
 });
 
 describe("Node user settings service", function userSettingsServiceSuite() {
+  it.each(["openai-responses", "openai-chat-completions"] as const)("读取并保存 %s 主连接，保留受信模型声明和独立连接", async function preservesRoutedConnection(apiProtocol) {
+    const { homeDirectory, settingsPath } = fixture();
+    const route = { id: "gateway", apiProtocol, baseUrl: "https://main.fixture/v1", compatibilityPreset: "generic", credentialRef: { provider: "gateway", key: "USER_SETTINGS_GATEWAY_KEY" },
+      models: [{ id: "custom", capabilities: { supportedReasoningEfforts: ["none", "xhigh"], defaultReasoningEffort: "none" }, contextWindowTokens: 32000 }] };
+    const retained = { id: "retained", apiProtocol: "openai-chat-completions", baseUrl: "https://retained.fixture/v1", credentialRef: { provider: "retained", key: "USER_SETTINGS_RETAINED" }, models: [{ id: "other" }] };
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, JSON.stringify({ model: "gateway/custom", effortLevel: "none", availableModels: ["first-party-custom", "retained/other"], providerRoutes: { gateway: route, retained }, visionModel: "retained/other", env: { GATEWAY_KEY: "fixture-routed", USER_SETTINGS_RETAINED: "fixture-retained", ANTHROPIC_AUTH_TOKEN: "fixture-old" }, custom: { keep: true } }));
+    const service = createNodeUserSettingsService({ homeDirectory });
+    const status = service.getStatus();
+    expect(status.main).toMatchObject({ apiProtocol, compatibilityPreset: "generic", baseUrl: route.baseUrl, model: "custom", configured: true, effort: "none", availableModels: ["custom"] });
+    expect(JSON.stringify(status)).not.toContain("fixture-routed");
+    expect(JSON.stringify(status)).not.toContain("credentialRef");
+    expect(service.getMainModelCapabilities(status.main)).toEqual({ supportedReasoningEfforts: ["none", "xhigh"], supportsToolCalls: true });
+    await service.saveMain({ ...status.main, effort: "xhigh", compactWindow: 64000, timeoutMs: 120000 }, status.revision);
+    const saved = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    expect(saved).toMatchObject({ model: "gateway/custom", effortLevel: "xhigh", visionModel: "retained/other", custom: { keep: true } });
+    expect(saved.providerRoutes).toEqual({ gateway: route, retained });
+    expect(saved.availableModels).toEqual(["first-party-custom", "retained/other"]);
+    expect(saved.env.GATEWAY_KEY).toBe("fixture-routed");
+    expect(saved.env.ANTHROPIC_AUTH_TOKEN).toBe("fixture-old");
+    expect(service.getStatus().main).toMatchObject({ compactWindow: 64000, timeoutMs: 120000, effort: "xhigh" });
+  });
+
+  it("新建 Responses 主连接并按 Core 模型规则拒绝非法 effort 与 Chat 工具模型", async function validatesPresetCapabilities() {
+    const { homeDirectory, settingsPath } = fixture();
+    const service = createNodeUserSettingsService({ homeDirectory });
+    const main = { apiProtocol: "openai-responses" as const, compatibilityPreset: "openai" as const, baseUrl: "https://openai.fixture/v1", model: "gpt-6.1-sol", apiKey: "fixture-new", effort: "xhigh" as const };
+    await service.saveMain(main);
+    expect(service.getStatus().main).toMatchObject({ apiProtocol: "openai-responses", model: main.model, effort: "xhigh", configured: true });
+    expect(service.getMainModelCapabilities(main).supportedReasoningEfforts).toEqual(["low", "medium", "high", "xhigh", "max"]);
+    const before = fs.readFileSync(settingsPath, "utf8");
+    await expect(service.saveMain({ ...main, effort: "none" })).rejects.toMatchObject({ diagnostic: { field: "effortLevel" } });
+    await expect(service.saveMain({ ...main, apiProtocol: "openai-chat-completions", effort: "auto" })).rejects.toMatchObject({ diagnostic: { code: "MODEL_NOT_SUPPORTED" } });
+    expect(fs.readFileSync(settingsPath, "utf8")).toBe(before);
+    await service.saveMain({ ...main, apiProtocol: "openai-chat-completions", model: "gpt-6-luna", effort: "none" });
+    expect(service.getStatus().main).toMatchObject({ apiProtocol: "openai-chat-completions", model: "gpt-6-luna", effort: "none" });
+  });
+
+  it("现有 Anthropic route 显式保存保留连接并更新高级字段", async function preservesAnthropicRoute() {
+    const { homeDirectory, settingsPath } = fixture();
+    const route = { id: "messages", apiProtocol: "anthropic-messages", baseUrl: "https://anthropic.fixture", credentialRef: { provider: "messages", key: "USER_SETTINGS_MESSAGES" }, models: [{ id: "custom" }] };
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, JSON.stringify({ model: "messages/custom", providerRoutes: { messages: route }, env: { USER_SETTINGS_MESSAGES: "fixture-messages" } }));
+    const service = createNodeUserSettingsService({ homeDirectory });
+    await service.saveMain({ ...service.getStatus().main, effort: "none", opusModel: "opus-custom", compactWindow: 64000, alwaysThinkingEnabled: false });
+    const saved = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    expect(saved.providerRoutes.messages).toEqual(route);
+    expect(saved).toMatchObject({ model: "messages/custom", effortLevel: "none", env: { ANTHROPIC_DEFAULT_OPUS_MODEL: "opus-custom", CLAUDE_CODE_AUTO_COMPACT_WINDOW: "64000" }, alwaysThinkingEnabled: false });
+  });
+
+  it("协议切换清除旧 profile 和能力覆盖，地址变更必须提交新 Key", async function changesProtocolSafely() {
+    const { homeDirectory, settingsPath } = fixture();
+    const service = createNodeUserSettingsService({ homeDirectory });
+    await service.saveMain({ apiProtocol: "openai-responses", compatibilityPreset: "generic", baseUrl: "https://main.fixture/v1", model: "custom", apiKey: "fixture-main" });
+    const raw = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    const id = raw.model.split("/")[0];
+    raw.providerRoutes[id].protocolProfile = { apiProtocol: "openai-responses", reasoningReplay: "content" };
+    raw.providerRoutes[id].models[0].capabilities = { supportedReasoningEfforts: ["xhigh"], defaultReasoningEffort: "xhigh" };
+    fs.writeFileSync(settingsPath, JSON.stringify(raw));
+    const main = service.getStatus().main;
+    const before = fs.readFileSync(settingsPath, "utf8");
+    await expect(service.saveMain({ ...main, apiProtocol: "openai-chat-completions" })).rejects.toMatchObject({ code: "SETTINGS_KEY_REQUIRED" });
+    await expect(service.saveMain({ ...main, baseUrl: "https://changed.fixture/v1" })).rejects.toMatchObject({ code: "SETTINGS_KEY_REQUIRED" });
+    expect(fs.readFileSync(settingsPath, "utf8")).toBe(before);
+    await service.saveMain({ ...main, apiProtocol: "openai-chat-completions", effort: "auto", apiKey: "fixture-chat" });
+    const saved = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    expect(saved.providerRoutes[id].protocolProfile).toBeUndefined();
+    expect(saved.providerRoutes[id].models).toEqual([{ id: "custom" }]);
+    expect(saved.effortLevel).toBeUndefined();
+  });
+
+  it("现有 route 模型与预设不变时保留 route/model profile，并支持宿主环境凭据", async function preservesProfileAndAmbientCredentials() {
+    const { homeDirectory, settingsPath } = fixture();
+    const profile = { apiProtocol: "openai-responses", reasoningReplay: "encrypted" };
+    const route = { id: "openai", apiProtocol: "openai-responses", compatibilityPreset: "openai", baseUrl: "https://openai.fixture/v1", credentialRef: { provider: "openai", key: "API_KEY" }, protocolProfile: profile, models: [{ id: "gpt-6-luna", protocolProfile: profile }, { id: "gpt-6.1-sol" }] };
+    fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+    fs.writeFileSync(settingsPath, JSON.stringify({ model: "openai/gpt-6-luna", providerRoutes: { openai: route } }));
+    const service = createNodeUserSettingsService({ homeDirectory, env: { OPENAI_API_KEY: "fixture-ambient" } });
+    const status = service.getStatus();
+    expect(status.main.configured).toBe(true);
+    await service.saveMain({ ...status.main, model: "gpt-6.1-sol", effort: "xhigh" });
+    const saved = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+    expect(saved.providerRoutes.openai).toEqual(route);
+    expect(JSON.stringify(saved)).not.toContain("fixture-ambient");
+    expect(service.getMainModelCapabilities({ ...status.main, apiProtocol: "openai-chat-completions", model: "gpt-6.1-sol" }).supportsToolCalls).toBe(false);
+  });
+
   it("用三项主连接启动并迁移旧 route、动态凭据与视觉引用", async function migratesLegacyPrimaryConnection() {
     const { homeDirectory, settingsPath } = fixture();
     fs.mkdirSync(path.dirname(settingsPath), { recursive: true });

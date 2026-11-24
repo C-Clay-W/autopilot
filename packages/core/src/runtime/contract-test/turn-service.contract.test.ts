@@ -357,10 +357,10 @@ describe("TurnService contract test", function turnServiceContractSuite() {
 
   it("continue 拒绝新鲜 lease 下的重复运行", async function rejectsFreshLease() {
     const ports = createMemoryPorts();
-    const sessionId = "contract-active-lease-001";
+    const runtime = createAgentRuntime({ ports, defaultRunConfig: { modelSampler: createMockSampler("不应执行") } });
+    const { id: sessionId } = await runtime.sessions.create({});
     const turnId = "turn-active-lease-001";
     const now = Date.now();
-    await seedSession(ports, sessionId);
     await ports.turnStore.save({
       id: turnId,
       sessionId,
@@ -379,8 +379,6 @@ describe("TurnService contract test", function turnServiceContractSuite() {
       lease: { leaseId: "lease-active", ownerId: "owner-active", heartbeatAt: now, safeBoundarySeq: 1 },
     });
 
-    const runtime = createAgentRuntime({ ports, defaultRunConfig: { modelSampler: createMockSampler("不应执行") } });
-
     await expect(collectEvents(runtime.turns.continue({ sessionId, turnId }))).rejects.toMatchObject({
       code: "TURN_ALREADY_RUNNING",
     });
@@ -388,12 +386,13 @@ describe("TurnService contract test", function turnServiceContractSuite() {
 
   it("start 拒绝 Session 中已有新鲜 lease 的活动 turn", async function rejectsActiveStart() {
     const ports = createMemoryPorts();
-    const sessionId = "contract-active-start-001";
+    const runtime = createAgentRuntime({ ports, defaultRunConfig: { modelSampler: createMockSampler("不应执行") } });
+    const session = await runtime.sessions.create({});
+    const sessionId = session.id;
     const turnId = "turn-active-start-001";
     const now = Date.now();
     await ports.sessionStore.save({
-      id: sessionId,
-      persistenceMode: "durable",
+      ...session,
       status: "running",
       activeTurnId: turnId,
       createdAt: now,
@@ -416,8 +415,6 @@ describe("TurnService contract test", function turnServiceContractSuite() {
       completedCallIds: [],
       lease: { leaseId: "lease-active-start", ownerId: "owner-active-start", heartbeatAt: now, safeBoundarySeq: 1 },
     });
-
-    const runtime = createAgentRuntime({ ports, defaultRunConfig: { modelSampler: createMockSampler("不应执行") } });
 
     await expect(collectEvents(runtime.turns.start({ sessionId, content: "不应创建第二个 turn" }))).rejects.toMatchObject({
       code: "TURN_ALREADY_RUNNING",
@@ -1212,8 +1209,6 @@ describe("会话延续基线（H1）", function conversationBaselineSuite() {
 
   it("首次任务因沙箱不可用失败后，继续执行仍能看到原请求与失败事实", async function keepsFirstFailedTask() {
     const ports = createMemoryPorts();
-    const sessionId = "turn-baseline-first-failed";
-    await seedSession(ports, sessionId);
     const samples: AgentMessage[][] = [];
     const runtime = createAgentRuntime({
       ports,
@@ -1228,6 +1223,7 @@ describe("会话延续基线（H1）", function conversationBaselineSuite() {
         },
       },
     });
+    const { id: sessionId } = await runtime.sessions.create({});
 
     const firstEvents = await collectEvents(runtime.turns.start({ sessionId, content: "把计算器做成 index.html" }));
     const failed = firstEvents.at(-1);
@@ -1248,8 +1244,6 @@ describe("会话延续基线（H1）", function conversationBaselineSuite() {
 
   it("已有成功历史时，最新失败轮仍是下一轮基线", async function prefersLatestFailedTurn() {
     const ports = createMemoryPorts();
-    const sessionId = "turn-baseline-after-completed";
-    await seedSession(ports, sessionId);
     const samples: AgentMessage[][] = [];
     const runtime = createAgentRuntime({
       ports,
@@ -1266,6 +1260,7 @@ describe("会话延续基线（H1）", function conversationBaselineSuite() {
         },
       },
     });
+    const { id: sessionId } = await runtime.sessions.create({});
 
     await collectEvents(runtime.turns.start({ sessionId, content: "第一轮任务" }));
     const failedEvents = await collectEvents(runtime.turns.start({ sessionId, content: "第二轮任务" }));

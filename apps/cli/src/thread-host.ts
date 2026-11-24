@@ -12,6 +12,7 @@ import type { AgentRuntime, RuntimePorts } from "@autopilot-agent/core";
 
 /** 创建常驻宿主所需的受信事实；全部来自 Composition Root 与当前 Runtime。 */
 export interface CreateCliThreadHostOptions {
+  observeExecution?: (input: { threadId: string; turnId: string }) => void;
   workspaceId: string;
   stateRootId: string;
   runtime: AgentRuntime;
@@ -24,6 +25,7 @@ export interface CreateCliThreadHostOptions {
 
 /** 常驻宿主；是否在驱动由真实启动状态决定，不由调用方猜测。 */
 export interface CliThreadHost {
+  listExecutions: NodeThreadRunner["listExecutions"];
   /** 开始发现并驱动；重复调用无副作用。 */
   start(): void;
   /** 停止发现与驱动，返回停机报告；从未启动时返回 undefined。 */
@@ -46,6 +48,8 @@ export function createCliThreadHost(options: CreateCliThreadHostOptions): CliThr
     runtime: options.runtime,
     ports: options.ports,
     ...(options.onError ? { onError: options.onError } : {}),
+    onTurnStarted: function observeStarted(input) { options.observeExecution?.({ threadId: input.threadId, turnId: input.turnId }); },
+    onTurnSettled: function observeSettled(input) { options.observeExecution?.(input); },
   });
   let started = false;
   let discovering = false;
@@ -91,6 +95,7 @@ export function createCliThreadHost(options: CreateCliThreadHostOptions): CliThr
       return runner.stop();
     },
     registerExecution: runner.registerExecution,
+    listExecutions: runner.listExecutions,
     isRunning: function isRunning() {
       return started;
     },

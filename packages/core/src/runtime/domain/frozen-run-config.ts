@@ -30,6 +30,8 @@ export interface FrozenRunConfig {
   chatAttachmentGrants?: readonly import("../protocol/chat-capability").ChatAttachmentGrant[];
   /** 当前 Turn 冻结的 Work 预览能力开关；旧记录缺失按 false，仅受信 Host 计算，override 不可开启。 */
   workPreviewEnabled?: boolean;
+  /** 浏览器能力冻结开关，旧回合缺省不能在恢复时新增。 */
+  browserEnabled?: boolean;
 
   /** 模型引用；冻结时已解析，可能为 undefined（表示使用 Runtime 默认 sampler）。 */
   modelRef?: ModelRef;

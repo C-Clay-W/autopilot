@@ -75,13 +75,17 @@ export function getTuiVisualLineSelectionRange(lines: TimelineVisualLine[], sele
   return start < end ? { start, end } : undefined;
 }
 
-/** 将当前选区交给平台剪贴板；Windows 不经 shell 调用 clip，其它平台使用有界 OSC 52。 */
-export function copyTuiSelectedText(text: string, stdout: { write(chunk: string): void }): void {
+/** 将当前选区交给平台剪贴板；Windows/macOS 不经 shell 调用 clip/pbcopy，其它平台使用有界 OSC 52。 */
+export async function copyTuiSelectedText(text: string, stdout: { write(chunk: string): void }): Promise<void> {
   if (!text) return;
-  if (process.platform === "win32") {
-    const clipboard = spawn("clip", [], { stdio: "pipe", windowsHide: true });
-    clipboard.on("error", function ignoreClipboardFailure(): void {});
-    clipboard.stdin.end(text);
+  if (process.platform === "win32" || process.platform === "darwin") {
+    await new Promise<void>(function writeClipboard(resolve, reject) {
+      const clipboard = spawn(process.platform === "win32" ? "clip.exe" : "pbcopy", [], { stdio: "pipe", windowsHide: true });
+      clipboard.on("error", reject);
+      clipboard.stdin.on("error", reject);
+      clipboard.on("close", function copied(code) { if (code === 0) resolve(); else reject(new Error("剪贴板写入失败")); });
+      clipboard.stdin.end(process.platform === "win32" ? Buffer.from("\ufeff" + text, "utf16le") : Buffer.from(text, "utf8"));
+    });
     return;
   }
   const bytes = Buffer.from(text);

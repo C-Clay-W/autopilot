@@ -18,6 +18,8 @@ export interface TurnUsageSummaryView {
   inputTokens?: number;
   /** 本 Turn 累计输出 token；与 inputTokens 同时提供或同时省略。 */
   outputTokens?: number;
+  /** 只有本Turn全部输出均有供应商推理明细时提供；已含在outputTokens中。 */
+  reasoningTokens?: number;
   /** 本 Turn 累计输入+输出 token；与 Kernel 安全预算 runtimeBudget.totalTokens 同源，恒有值。 */
   totalTokens: number;
   /** 当前执行段耗时毫秒；以最近一次安全边界刷新的 checkpoint 为准，终态后不再增长。 */
@@ -47,6 +49,7 @@ export function buildTurnUsageSummary(input: {
   return {
     turnId: input.turnId,
     ...(hasCompleteSplit ? { inputTokens: budget.inputTokens, outputTokens: budget.outputTokens } : {}),
+    ...(hasCompleteSplit && budget.reasoningReportedOutputTokens === budget.outputTokens && isTokenCount(budget.reasoningTokens) && budget.reasoningTokens <= budget.outputTokens! ? { reasoningTokens: budget.reasoningTokens } : {}),
     totalTokens: budget.totalTokens,
     elapsedMs: updatedAt - budget.startedAt,
   };
@@ -63,9 +66,11 @@ export function projectPublicTurnUsageSummary(summary: TurnUsageSummaryView | nu
   const hasSplit = summary.inputTokens !== undefined || summary.outputTokens !== undefined;
   if (hasSplit && (!isTokenCount(summary.inputTokens) || !isTokenCount(summary.outputTokens))) return null;
   if (hasSplit && summary.inputTokens! + summary.outputTokens! !== summary.totalTokens) return null;
+  if (summary.reasoningTokens !== undefined && (!hasSplit || !isTokenCount(summary.reasoningTokens) || summary.reasoningTokens > summary.outputTokens!)) return null;
   return {
     turnId: summary.turnId,
     ...(hasSplit ? { inputTokens: summary.inputTokens, outputTokens: summary.outputTokens } : {}),
+    ...(summary.reasoningTokens !== undefined ? { reasoningTokens: summary.reasoningTokens } : {}),
     totalTokens: summary.totalTokens,
     elapsedMs: summary.elapsedMs,
   };

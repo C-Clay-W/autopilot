@@ -100,8 +100,8 @@ describe("OpenAI Chat Completions V2 Adapter", function adapterSuite() {
     const tools: AgentModelToolDefinition[] = [{ type: "function", function: { name: "chat_submit_answer", description: "submit", parameters: { type: "object" } } }];
     await sampler.sample([{ role: "user", content: [{ type: "text", text: "submit" }] }], tools, { toolChoice: { name: "chat_submit_answer" } });
     const forced = JSON.parse(fetchMock.mock.calls[0][1].body);
-    expect(forced).toMatchObject({ tool_choice: { type: "function", function: { name: "chat_submit_answer" } }, thinking: { type: "disabled" }, temperature: 0 });
-    expect(forced).not.toHaveProperty("reasoning_effort");
+    expect(forced).toMatchObject({ tool_choice: { type: "function", function: { name: "chat_submit_answer" } }, thinking: { type: "enabled" }, temperature: 0 });
+    expect(forced).toHaveProperty("reasoning_effort", "high");
     await sampler.sample([{ role: "user", content: [{ type: "text", text: "next" }] }], tools, {});
     expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toMatchObject({ tool_choice: "auto", thinking: { type: "enabled" }, reasoning_effort: "high", temperature: 0.7 });
   });

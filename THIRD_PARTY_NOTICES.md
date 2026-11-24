@@ -11,9 +11,13 @@ Upstream: https://github.com/JetBrains/JetBrainsMono
 
 ## Anthropic sandbox-runtime
 
-Adapters depends on @anthropic-ai/sandbox-runtime 0.0.78, licensed under Apache-2.0. The dependency serves the macOS sandbox path only; Windows process tools run on the host after per-call approval and have no OS sandbox. A copy of the upstream Apache-2.0 license is retained as packages/adapters/native/srt-win/LICENSE-APACHE-2.0. The project no longer ships derived Windows patches, candidate build scripts or a source manifest for that upstream package.
+Adapters depends on @anthropic-ai/sandbox-runtime 0.0.78, licensed under Apache-2.0. The dependency serves the macOS sandbox path only; Windows process tools run on the host under the configured permission policy and have no OS sandbox. A copy of the upstream Apache-2.0 license is retained as packages/adapters/native/srt-win/LICENSE-APACHE-2.0. The project no longer ships derived Windows patches, candidate build scripts or a source manifest for that upstream package.
 Upstream: https://github.com/anthropic-experimental/sandbox-runtime
 
 ## npm dependencies
 
 Each dependency retains its own license and notices. package-lock.json records the selected dependency tree; obtain complete dependency license texts from the installed packages when redistributing a built application. Project MIT permission does not override those terms or external model/service terms.
+
+## Desktop assets
+
+The Claude, Codex, OpenCode and CodeBuddy icons use LobeHub Icons. See [asset credits](apps/desktop/src/assets/README.md) and the [MIT license](apps/desktop/src/assets/LICENSE-lobe-icons). The Desktop browser resource preparation script verifies the agent-browser archive and copies its upstream license with the driver.

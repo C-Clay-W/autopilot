@@ -128,6 +128,7 @@ export function createThreadService(ports: RuntimePorts, store: ThreadStore, con
 
   /** 每次检查当前 Project 与 workspace 绑定，撤销后拒绝继续使用旧能力。 */
   async function verifyWorkspace(): Promise<void> {
+    if (actor.kind === "thread" && (await ports.sessionStore.get(actor.threadId))?.managedExecution) throw new ThreadServiceError("THREAD_SCOPE_DENIED");
     const project = await ports.projectStore.get(context.projectId);
     const workspace = await ports.workspaceAdapter.resolveWorkspaceRoot();
     if (!project || project.workspaceRoot !== workspace) throw new ThreadServiceError("THREAD_SCOPE_DENIED");
@@ -215,6 +216,7 @@ export function createThreadService(ports: RuntimePorts, store: ThreadStore, con
 
   /** 只接受空闲或最近一次 Turn 已成功完成的会话；恢复态和不完整事实均拒绝。 */
   async function canEnableForSession(session: import("../domain").Session | null): Promise<boolean> {
+    if (session?.managedExecution) throw new ThreadServiceError("THREAD_SCOPE_DENIED");
     if (!session || session.productMode !== "work" || session.projectId !== context.projectId || session.activeTurnId) return false;
     if (session.status === "idle") return true;
     if (session.status !== "completed") return false;
@@ -226,6 +228,7 @@ export function createThreadService(ports: RuntimePorts, store: ThreadStore, con
 
   /** 仅可信人类入口可为已存在且空闲的 Work Session 显式启用或重新启用协作。 */
   async function enableLocked(input: { requestId: string; rootThreadId: string; groupId?: string }): Promise<ThreadControl> {
+    if ((await ports.sessionStore.get(input.rootThreadId))?.managedExecution) throw new ThreadServiceError("THREAD_SCOPE_DENIED");
     if (actor.kind !== "human") throw new ThreadServiceError("THREAD_SCOPE_DENIED");
     requireId(input.requestId); requireId(input.rootThreadId);
     if (input.groupId !== undefined) requireId(input.groupId);
@@ -413,6 +416,7 @@ export function createThreadService(ports: RuntimePorts, store: ThreadStore, con
       for (let n = 0; n < 32; n++) {
         const current = await authorize(input.groupId);
         const session = await ports.sessionStore.get(input.threadId);
+        if (session?.managedExecution) throw new ThreadServiceError("THREAD_SCOPE_DENIED");
         if (!session || session.productMode !== "work" || session.projectId !== context.projectId) throw new ThreadServiceError("THREAD_SCOPE_DENIED");
         await verifyRequest("associate", input.requestId, input.groupId, fingerprint);
         const prior = current.receipts.find(function same(item) { return item.actorKey === key && item.operation === "associate" && item.requestId === input.requestId; });
@@ -495,7 +499,7 @@ export function createThreadService(ports: RuntimePorts, store: ThreadStore, con
     if (input.roleLabel !== undefined && (typeof input.roleLabel !== "string" || input.roleLabel.length > 100)) throw new ThreadServiceError("INVALID_INPUT");
     if (input.modelRef !== undefined) { requireId(input.modelRef.provider); requireId(input.modelRef.modelId); }
     if (input.modelRef !== undefined && (!modelCatalog.some(function allowed(model) { return model.provider === input.modelRef?.provider && model.modelId === input.modelRef?.modelId; }))) throw new ThreadServiceError("MODEL_NOT_FOUND");
-    if (input.reasoningEffort !== undefined && !["none", "low", "medium", "high", "max"].includes(input.reasoningEffort)) throw new ThreadServiceError("INVALID_INPUT");
+    if (input.reasoningEffort !== undefined && !["none", "low", "medium", "high", "xhigh", "max"].includes(input.reasoningEffort)) throw new ThreadServiceError("INVALID_INPUT");
     const fingerprint = digest([input.parentThreadId, input.title ?? null, input.roleLabel ?? null, input.modelRef ?? null, input.reasoningEffort ?? null]);
     let intent: ThreadCreateIntent | undefined;
     for (let n = 0; n < 32; n++) {

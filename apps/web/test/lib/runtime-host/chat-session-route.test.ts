@@ -9,6 +9,8 @@ import { CHAT_ATTACHMENT_TTL_MS, NodeChatError, NodeStateError, createNodeWorksp
 import { createWebChatHost, type WebChatHost, type WebChatHostOptions } from "@/lib/runtime-host/web-chat-host";
 import { runChatSessionRoute, toChatErrorResponse } from "@/lib/runtime-host/chat-session-route";
 import { createSessionTaskController } from "@/app/chat/session-task-controller";
+import { selectAssistantAnswers } from "@autopilot-agent/presentation";
+import { reduceWebPresentationEvent } from "@/lib/runtime-host/web-presentation-adapter";
 
 const roots: string[] = [];
 const hosts: WebChatHost[] = [];
@@ -27,8 +29,8 @@ async function fixture(extra: Partial<WebChatHostOptions> = {}) {
   hosts.push(host);
   const workspace = vi.spyOn(host.storage.ports.workspaceAdapter, "resolveWorkspaceRoot");
   /** 直接调用正式 HTTP 适配，唯一 seam 是宿主实例。 */
-  function route(method: string, segments: string[], body?: unknown) {
-    return runChatSessionRoute(new Request(`http://localhost/api/chat/sessions/${segments.join("/")}`, { method, ...(body !== undefined ? { body: JSON.stringify(body), headers: { "Content-Type": "application/json" } } : {}) }), segments, async function load() { return host; });
+  function route(method: string, segments: string[], body?: unknown, query = "", signal?: AbortSignal) {
+    return runChatSessionRoute(new Request(`http://localhost/api/chat/sessions/${segments.join("/")}${query}`, { method, signal, ...(body !== undefined ? { body: JSON.stringify(body), headers: { "Content-Type": "application/json" } } : {}) }), segments, async function load() { return host; });
   }
   /** 通过 canonical POST 创建会话，保证测试未绕过产品身份校验。 */
   async function session(mode = "none") { const response = await route("POST", [], { chatRetrievalMode: mode }); expect(response.status).toBe(201); return (await response.json()).id as string; }
@@ -232,14 +234,104 @@ describe("Chat Host Stage3", function suite() {
     const response = await f.route("POST", [id, "messages"], { content: "等待", clientMessageId: "message_cancel" });
     await vi.waitFor(function sampling() { expect(sample).toHaveBeenCalledOnce(); });
     const turnId = (await f.host.runtime.turns.getState({ sessionId: id })).turn!.id;
+    expect(response.headers.get("X-Autopilot-Turn-Id")).toBe(turnId);
+    // 原 POST 接收方和新的观察者都可以离开，随后由同会话的显式操作停止执行。
+    await response.body!.cancel();
+    const observer = await f.route("GET", [id, "stream"], undefined, `?turnId=${turnId}`);
+    await observer.body!.cancel();
     const foreignCancel = await f.route("POST", [other, "cancel"], { turnId });
     expect(foreignCancel.status).toBe(404);
     expect(await foreignCancel.json()).toMatchObject({ code: "TURN_NOT_FOUND" });
     expect((await f.host.runtime.turns.getState({ sessionId: id })).turn?.status).toBe("running");
     expect((await f.route("POST", [id, "cancel"], { turnId })).status).toBe(200);
-    await response.text();
+    await vi.waitFor(async function confirmStop() {
+      const state = await (await f.route("GET", [id, "turn-state"], undefined, `?turnId=${turnId}`)).json();
+      expect(state).toMatchObject({ turnId, status: "interrupted", cancellation: "confirmed" });
+    });
     expect((await f.host.runtime.turns.getState({ sessionId: id })).turn?.status).not.toBe("running");
     expect((await f.route("DELETE", [id])).status).toBe(200);
+  });
+
+  /** 真实 Runtime 持久化前缀与后缀，浏览器换连接只读取缺失序号。 */
+  it("断开 Chat POST 后从持久游标接到同一回答和终态，不重投消息", async function resumesDetachedChat() {
+    let release!: () => void;
+    let samplerSignal: AbortSignal | undefined;
+    const gate = new Promise<void>(function pause(resolve) { release = resolve; });
+    const sample = vi.fn<NonNullable<RunConfig["modelSampler"]>["sample"]>(async function answer(_messages, _tools, options, onDelta) {
+      samplerSignal = options.signal;
+      onDelta?.("前半段。");
+      await gate;
+      onDelta?.("后半段。");
+      return { content: "前半段。后半段。", toolCalls: [], reasoningSummary: "", finishReason: "stop" };
+    });
+    const f = await fixture({ modelSampler: { sample } });
+    const id = await f.session();
+    const other = await f.session();
+    const browser = new AbortController();
+    const input = { content: "只投递一次", clientMessageId: "disconnect_chat_001" };
+    const original = await f.route("POST", [id, "messages"], input, "", browser.signal);
+    const turnId = original.headers.get("X-Autopilot-Turn-Id");
+    expect(turnId).toMatch(/^[a-f\d]{64}$/);
+    try {
+      await vi.waitFor(async function hasPrefix() {
+        const events = await f.host.storage.ports.transcriptStore.getEvents(id);
+        expect(events).toContainEqual(expect.objectContaining({ turnId, event: expect.objectContaining({ type: "answer_delta", delta: "前半段。" }) }));
+      });
+      browser.abort();
+      expect(samplerSignal?.aborted).toBe(false);
+      expect((await f.route("POST", [id, "messages"], input)).status).toBe(409);
+      expect((await f.route("DELETE", [id])).status).toBe(409);
+      expect((await f.route("GET", [other, "stream"], undefined, `?turnId=${turnId}`)).status).toBe(404);
+      expect((await f.route("GET", [id, "stream"], undefined, `?turnId=${turnId}&cursor=-1`)).status).toBe(400);
+      const snapshot = await (await f.route("GET", [id])).json();
+      expect(snapshot.meta).toMatchObject({ activeTurnId: turnId, runtimeStatus: "running" });
+      const cursor = snapshot.presentation.lastSeqByTurn[turnId!];
+      const reattached = await f.route("GET", [id, "stream"], undefined, `?turnId=${turnId}&cursor=${cursor}`);
+      const seen: number[] = [];
+      let presentation = snapshot.presentation;
+      const client = createSessionTaskController(id, function append(_messageId, event) {
+        if (typeof event.seq === "number") seen.push(event.seq);
+        presentation = reduceWebPresentationEvent(presentation, event, id);
+      });
+      release();
+      expect(await client.consume(reattached, "reattached")).toBe("terminal_seen");
+      const facts = (await f.host.storage.ports.transcriptStore.getEvents(id)).filter(function newer(event) { return event.turnId === turnId && event.seq > cursor; });
+      expect(seen).toEqual(facts.map(function seq(event) { return event.seq; }));
+      expect(selectAssistantAnswers(presentation, turnId!)).toMatchObject([{ content: "前半段。后半段。" }]);
+      const alreadyObserved = await f.route("GET", [id, "stream"], undefined, `?turnId=${turnId}&cursor=${seen.at(-1)}`);
+      expect(await alreadyObserved.text()).toBe("data: [DONE]\n\n");
+      const settled = await (await f.route("GET", [id])).json();
+      expect(settled.messages.map(function content(message: { content: string }) { return message.content; })).toEqual([input.content, "前半段。后半段。"]);
+      expect(await (await f.route("POST", [id, "messages"], input)).json()).toMatchObject({ code: "CHAT_MESSAGE_ALREADY_SUBMITTED" });
+      expect(sample).toHaveBeenCalledOnce();
+    } finally { release(); }
+  });
+
+  /** 前置正文已持久化而 Core 未创建 Turn 时，重复请求仍不追加正文或重新执行。 */
+  it("Chat 写入用户消息后启动失败仍按原消息键去重", async function preventsDuplicateAfterStartFailure() {
+    const f = await fixture();
+    const id = await f.session();
+    vi.spyOn(f.host.runtime.turns, "start").mockImplementationOnce(async function* failBeforeCreatingTurn() { throw new Error("fixture startup failure"); });
+    const input = { content: "已持久正文", clientMessageId: "failed_start_001" };
+    const response = await f.route("POST", [id, "messages"], input);
+    expect(await response.text()).toContain("turn_failed");
+    expect(await (await f.route("POST", [id, "messages"], input)).json()).toMatchObject({ code: "CHAT_MESSAGE_ALREADY_SUBMITTED" });
+    const history = await (await f.route("GET", [id])).json();
+    expect(history.messages.filter(function user(message: { role: string }) { return message.role === "user"; })).toMatchObject([{ content: input.content }]);
+    expect(f.sample).not.toHaveBeenCalled();
+  });
+
+  /** POST 已返回 Turn 身份时应能停止，即使 Core 尚未写入第一条事件。 */
+  it("Chat 确认响应中的 Turn 身份可立即显式停止", async function stopsBeforeFirstEvent() {
+    const f = await fixture();
+    const id = await f.session();
+    const response = await f.route("POST", [id, "messages"], { content: "早停", clientMessageId: "early_stop_001" });
+    const turnId = response.headers.get("X-Autopilot-Turn-Id");
+    expect(turnId).toBeTruthy();
+    expect((await f.route("POST", [id, "cancel"], { turnId })).status).toBe(200);
+    expect(await response.text()).toContain("turn_interrupted");
+    const state = await (await f.route("GET", [id, "turn-state"], undefined, `?turnId=${turnId}`)).json();
+    expect(state).toMatchObject({ turnId, status: "interrupted", cancellation: "confirmed" });
   });
 
   it("错误边界严格白名单，区分损坏请求、内部故障与宿主停用", async function validatesErrors() {

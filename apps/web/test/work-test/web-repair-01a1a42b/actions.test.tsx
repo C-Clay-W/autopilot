@@ -2,17 +2,19 @@
 import { createElement, type Dispatch, type SetStateAction } from "react";
 import { render } from "ink-testing-library";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { createPresentationState, type AgentPresentationState, type ApprovalItem } from "@autopilot-agent/presentation";
+import { createPresentationState, selectAssistantAnswers, type AgentPresentationState, type ApprovalItem } from "@autopilot-agent/presentation";
 import { useTurnRecoveryActions } from "@/app/chat/hooks/useTurnRecoveryActions";
 import { useSessionConversation } from "@/app/chat/hooks/useSessionConversation";
-import type { Message } from "@/app/chat/chat-page-types";
+import type { Message, PendingAgentInput } from "@/app/chat/chat-page-types";
+import { reduceWebPresentationEvent } from "@/lib/runtime-host/web-presentation-adapter";
 
 const context = vi.hoisted(function mocks() {
   const list: unknown[] = [];
   return { manager: { subscribeList: function subscribe() { return function unsubscribe() {}; }, getListSnapshot: function snapshot() { return list; }, getSessionSnapshot: vi.fn(), updateRuntimeState: vi.fn(), beginSession: vi.fn(), applyTerminalEvent: vi.fn() }, refreshSessions: vi.fn() };
 });
 vi.mock("@/app/chat/session-task-context", function contextMock() { return { useSessionTaskContext: function current() { return context; } }; });
-vi.mock("@/app/chat/components/Notice", function noticeMock() { return { useNotice: function notice() { return { error: vi.fn(), warning: vi.fn() }; } }; });
+const notices = vi.hoisted(function notificationMocks() { return { error: vi.fn(), warning: vi.fn() }; });
+vi.mock("@/app/chat/components/Notice", function noticeMock() { return { useNotice: function notice() { return notices; } }; });
 
 /** 执行真实Hook生命周期，不替换React状态实现。 */
 function mount<T, P extends object>(hook: (options: P) => T, options: P) {
@@ -48,6 +50,64 @@ function recovery() {
 
 beforeEach(function globals() { vi.clearAllMocks(); vi.stubGlobal("window", { setTimeout, clearTimeout, addEventListener: vi.fn(), removeEventListener: vi.fn() }); });
 afterEach(function cleanup() { vi.unstubAllGlobals(); });
+
+/** 覆盖页面刷新及断流后手动恢复，两次都用持久游标而不重新提交。 */
+it("Chat 从 History 游标观察原 Turn，断流刷新同一目标", async function resumesChatObservation() {
+  const prefix = reduceWebPresentationEvent(createPresentationState(), { type: "answer_delta", delta: "前半段", turnId: "T", sessionId: "session", seq: 3 }, "session");
+  const history = { meta: { id: "session", productMode: "chat", runtimeStatus: "running", activeTurnId: "T" }, messages: [], presentation: prefix };
+  const answer = { type: "answer_delta", delta: "后半段", turnId: "T", sessionId: "session", seq: 4 };
+  const terminal = { type: "turn_completed", turnId: "T", sessionId: "session", seq: 5 };
+  const sse = `data: ${JSON.stringify(answer)}\n\ndata: ${JSON.stringify(terminal)}\n\ndata: [DONE]\n\n`;
+  const fetch = vi.fn().mockImplementationOnce(function snapshot() { return Response.json(history); })
+    .mockResolvedValueOnce(new Response("data: [DONE]\n\n"))
+    .mockImplementationOnce(function snapshot() { return Response.json(history); }).mockResolvedValueOnce(new Response(sse));
+  vi.stubGlobal("fetch", fetch);
+  const options = { workspaceId: "@chat", sessionId: "session", isChat: true, textareaRef: { current: null }, notifyNewProgress: vi.fn(), setSelectedSkills: vi.fn(), setPinnedSkills: vi.fn() };
+  const hook = mount(function useChatHooks(props: typeof options) {
+    const conversation = useSessionConversation(props);
+    const recovery = useTurnRecoveryActions({ ...conversation, ...props, canWrite: conversation.historyReady });
+    return { conversation, recovery };
+  }, options);
+  try {
+    await vi.waitFor(function disconnected() { expect(hook.current.conversation.presentation.transport).toBe("disconnected"); });
+    expect(hook.current.conversation.activeTurnRef.current).toEqual({ sessionId: "session", turnId: "T" });
+    expect(hook.current.conversation.loading).toBe(true);
+    await hook.current.recovery.refreshTransport();
+    await vi.waitFor(function completed() { expect(hook.current.conversation.loading).toBe(false); });
+    expect(selectAssistantAnswers(hook.current.conversation.presentation, "T")).toMatchObject([{ content: "前半段后半段" }]);
+    expect(fetch.mock.calls.map(function url(call) { return call[0]; })).toEqual([
+      "/api/chat/sessions/session", "/api/chat/sessions/session/stream?turnId=T&cursor=3",
+      "/api/chat/sessions/session", "/api/chat/sessions/session/stream?turnId=T&cursor=3",
+    ]);
+    expect(fetch.mock.calls.every(function onlyGet(call) { return !call[1]?.method; })).toBe(true);
+  } finally { hook.unmount(); }
+});
+
+/** 409 对账只更改当前输入的等待状态，不能把已消费输入记成取消。 */
+it.each([true, false])("Work 取消冲突时提醒并按权威等待列表对账（仍等待=%s）", async function reconcileInputConflict(stillPending) {
+  const h = recovery();
+  const requested: PendingAgentInput = { inputId: "old", clientMessageId: "old-message", delivery: "queue", status: "pending", content: "不会重投", attachmentCount: 0, skillCount: 0, createdAt: 1 };
+  const other = { ...requested, inputId: "new", clientMessageId: "new-message" };
+  const pending = cell([requested, other]);
+  h.options.setPendingInputs = pending.set;
+  h.options.pendingInputsRef.current = pending.value;
+  const fetch = vi.fn().mockResolvedValueOnce(Response.json({ cancelled: false }, { status: 409 }))
+    .mockResolvedValueOnce(Response.json({ pendingInputs: stillPending ? [requested] : [] }));
+  vi.stubGlobal("fetch", fetch);
+  const hook = mount(useTurnRecoveryActions, h.options);
+  try {
+    expect(await hook.current.cancelPendingInput("old")).toBe(false);
+    expect(notices.warning).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls.map(function url(call) { return call[0]; })).toEqual(["/api/workspaces/ws/sessions/session/messages", "/api/workspaces/ws/sessions/session"]);
+    expect(pending.value).toEqual(stillPending ? [requested, other] : [other]);
+    expect(h.options.pendingInputsRef.current).toEqual(pending.value);
+    expect(h.presentation.value.items).toEqual([]);
+    fetch.mockResolvedValueOnce(Response.json({ cancelled: true }));
+    expect(await hook.current.cancelPendingInput("new")).toBe(true);
+    expect(pending.value).toEqual(stillPending ? [requested] : []);
+    expect(fetch).toHaveBeenCalledTimes(3);
+  } finally { hook.unmount(); }
+});
 
 it("审批History恢复清loading，原观察流不会持续占用可提交状态", async function approvalHistoryReleasesBusy() {
   vi.stubGlobal("fetch", vi.fn(async function history() { return Response.json({ meta: { id: "session", productMode: "work", runtimeStatus: "waiting_approval" }, messages: [], presentation: createPresentationState(), agent: { turnId: "T", status: "awaiting_approval", approvalId: "A", interactionState: "pending", execution: "inactive" } }); }));

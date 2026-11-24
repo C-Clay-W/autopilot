@@ -6,15 +6,19 @@ import { describe, expect, it, vi } from "vitest";
 import { createAgentRuntime, type AgentOptions } from "../../internal/agent-runtime";
 import { createWebFetchTool } from "../../internal/tools/builtins/web-fetch-tool";
 import { createWebSearchTool } from "../../internal/tools/builtins/web-search-tool";
+import { createBrowserTool } from "../../internal/tools/builtins/browser-tool";
+import { applyWebFetchRedirect } from "../../internal/tools/web-fetch-redirect";
 import { ToolExecutor } from "../../internal/tools/tool-executor";
 import { ToolRegistry } from "../../internal/tools/tool-registry";
-import type { AgentToolDefinition } from "../../internal/tools/types";
+import type { AgentToolDefinition, ToolPermissionMode } from "../../internal/tools/types";
 import { getAgentMessageText, type AgentMessage } from "../../internal/types/agent-message";
 import type { ModelSampler } from "../../internal/kernel/model-sampler";
 import { WebFetchCapabilityError, resolveRunConfig, type WebCapability, type WebFetchCapability, type WebFetchCapabilityErrorCode, type WebSearchCapability } from "../protocol";
+import { sanitizeEventForExternal } from "../protocol/sanitize-checkpoint";
+import type { BrowserOperation } from "../protocol/browser-capability";
 
 /** 为单个 Web 工具创建不依赖文件系统或 Provider 的执行器。 */
-function createWebExecutor<TInput, TOutput>(definition: AgentToolDefinition<TInput, TOutput>, permissionMode: "ask" | "full_access" = "ask", extraContext: Record<string, unknown> = {}): ToolExecutor {
+function createWebExecutor<TInput, TOutput>(definition: AgentToolDefinition<TInput, TOutput>, permissionMode: ToolPermissionMode = "ask", extraContext: Record<string, unknown> = {}): ToolExecutor {
   const registry = new ToolRegistry();
   registry.register(definition);
   return new ToolExecutor(registry, {
@@ -119,6 +123,120 @@ describe("Web Search Stage 1 contract", function webStage1ContractSuite() {
     expect(JSON.stringify(result.approval)).not.toContain("must-not-display");
   });
 
+  it("公开 Fetch 和已启用 Search 在自动批准与完全访问直行，Skill 禁止仍优先", async function admitsPublicWebForWorkModes() {
+    const fetch = vi.fn(createFetchCapability().fetch);
+    const search = vi.fn(createSearchCapability().search);
+    const fetchTool = createWebFetchTool({ fetch });
+    const searchTool = createWebSearchTool({ search });
+    const fetchRequest = { callId: "public-fetch", toolName: "web_fetch", input: { url: "https://example.com/page" } };
+    const searchRequest = { callId: "public-search", toolName: "web_search", input: { query: "public fixture" } };
+    expect(await createWebExecutor(fetchTool, "ask").execute(fetchRequest)).toMatchObject({ status: "approval_required" });
+    expect(await createWebExecutor(searchTool, "ask").execute(searchRequest)).toMatchObject({ status: "approval_required" });
+    expect(fetch).not.toHaveBeenCalled();
+    expect(search).not.toHaveBeenCalled();
+    for (const mode of ["auto_approve", "full_access"] as const) {
+      expect(await createWebExecutor(fetchTool, mode).execute(fetchRequest)).toMatchObject({ status: "success" });
+      expect(await createWebExecutor(searchTool, mode).execute(searchRequest)).toMatchObject({ status: "success" });
+      expect(await createWebExecutor(fetchTool, mode, { allowedTools: [] }).execute(fetchRequest)).toMatchObject({ status: "denied" });
+      expect(await createWebExecutor(searchTool, mode, { allowedTools: [] }).execute(searchRequest)).toMatchObject({ status: "denied" });
+    }
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(search).toHaveBeenCalledTimes(2);
+  });
+
+  it("浏览器在自动批准与完全访问只免公开导航和观察的 Core 卡，宿主仍接收精确动作", async function preservesBrowserHostAuthority() {
+    const request = vi.fn(async function acceptBrowserOperation() { return { ok: true }; });
+    const binding = { sessionId: "fixture-session", turnId: "fixture-turn" };
+    const tool = createBrowserTool({ request, async endTurn() {} }, binding);
+    const page = { pageId: "11223344-1122-4122-8122-112233445566", revision: 3 };
+    const reads: BrowserOperation[] = [
+      { type: "open", url: "https://example.com/read" }, { type: "navigate", ...page, url: "https://example.com/next" },
+      { type: "list" }, { type: "snapshot", ...page }, { type: "screenshot", ...page }, { type: "wait", ...page, condition: "load", timeout: 1000 },
+    ];
+    const approvalOperations: BrowserOperation[] = [
+      { type: "open", url: "http://localhost:8080/" }, { type: "navigate", ...page, url: "http://127.0.0.1/" },
+      { type: "document", path: "README.md" }, { type: "click", ...page, ref: "@e1" }, { type: "fill", ...page, ref: "@e1", value: "fixture" },
+      { type: "press", ...page, key: "Enter" }, { type: "downloads", ...page },
+    ];
+    for (const mode of ["auto_approve", "full_access"] as const) {
+      const execution = createWebExecutor(tool, mode);
+      for (const [index, operation] of reads.entries()) {
+        const callId = `browser-${index}-${mode}`;
+        expect(await execution.execute({ callId, toolName: "browser", input: operation })).toMatchObject({ status: "success" });
+        const authorization = mode === "full_access" ? [{ mode }] : [];
+        expect(request).toHaveBeenLastCalledWith(binding, callId, operation, expect.any(AbortSignal), ...authorization);
+      }
+      for (const [index, operation] of approvalOperations.entries()) {
+        expect(await execution.execute({ callId: `browser-guard-${index}`, toolName: "browser", input: operation })).toMatchObject({ status: "approval_required" });
+      }
+      expect(await createWebExecutor(tool, mode, { allowedTools: [] }).execute({ callId: "browser-skill-deny", toolName: "browser", input: reads[0] })).toMatchObject({ status: "denied" });
+    }
+    expect(await createWebExecutor(tool).execute({ callId: "browser-ask", toolName: "browser", input: reads[0] })).toMatchObject({ status: "approval_required" });
+    expect(request).toHaveBeenCalledTimes(reads.length * 2);
+  });
+
+  it("浏览器只传递本次动作已消费的批准，精确文件可由可信宿主确认", async function passesConsumedBrowserApproval() {
+    const request = vi.fn(async function acceptBrowserOperation() { return { ok: true }; });
+    const binding = { sessionId: "fixture-session", turnId: "fixture-turn" };
+    const tool = createBrowserTool({ confirmsDocument: true, request, async endTurn() {} }, binding);
+    const execution = createWebExecutor(tool, "full_access");
+    const input = { type: "click", pageId: "11223344-1122-4122-8122-112233445566", revision: 3, ref: "@e1" };
+    const click = { callId: "browser-click", toolName: "browser", input };
+    const pending = await execution.execute(click);
+    expect(pending).toMatchObject({ status: "approval_required", approval: { display: { operation: "click", resource: `网页地址待确认（标签 ${input.pageId}） · @e1` } } });
+    if (pending.status !== "approval_required") throw new Error("missing click approval");
+    const approval = { approvalId: pending.approval.approvalId, decision: "allow_once" as const };
+    expect(await execution.execute({ ...click, callId: "wrong-call", approval })).toMatchObject({ status: "error", error: { code: "APPROVAL_MISMATCH" } });
+    expect(request).not.toHaveBeenCalled();
+    expect(await execution.execute({ ...click, approval })).toMatchObject({ status: "success" });
+    expect(request).toHaveBeenLastCalledWith(binding, click.callId, input, expect.any(AbortSignal), { mode: "full_access", approvedOnce: true });
+    expect(await execution.execute({ ...click, approval })).toMatchObject({ status: "error", error: { code: "APPROVAL_MISMATCH" } });
+    expect(request).toHaveBeenCalledTimes(1);
+    const document = { type: "document", path: "README.md" };
+    expect(await execution.execute({ callId: "browser-document", toolName: "browser", input: document })).toMatchObject({ status: "success" });
+    expect(request).toHaveBeenLastCalledWith(binding, "browser-document", document, expect.any(AbortSignal), { mode: "full_access" });
+    expect(await createWebExecutor(tool, "auto_approve").execute({ callId: "auto-document", toolName: "browser", input: document })).toMatchObject({ status: "approval_required" });
+  });
+
+  it("可信浏览器宿主收到真实 AP 档位，普通点击与文件动作不重复创建 Core 审批", async function delegatesNativeBrowserApproval() {
+    const request = vi.fn(async function acceptBrowserOperation() { return { ok: true }; });
+    const binding = { sessionId: "fixture-session", turnId: "fixture-turn" };
+    const tool = createBrowserTool({ confirmsDocument: true, managesApprovals: true, request, async endTurn() {} }, binding);
+    const click = { type: "click", pageId: "11223344-1122-4122-8122-112233445566", revision: 3, ref: "@e1" };
+    for (const mode of ["ask", "auto_approve", "full_access"] as const) {
+      for (const input of [click, { type: "document", path: "README.md" }]) {
+        const callId = `${mode}-${input.type}`;
+        expect(await createWebExecutor(tool, mode).execute({ callId, toolName: "browser", input })).toMatchObject({ status: "success" });
+        expect(request).toHaveBeenLastCalledWith(binding, callId, input, expect.any(AbortSignal), { mode });
+      }
+    }
+  });
+
+  it("浏览器单次审批显示已观察的同代站点和元素并隐藏敏感地址字段", async function describesBrowserApprovalTarget() {
+    const pageId = "11223344-1122-4122-8122-112233445566";
+    let revision = 3;
+    const tool = createBrowserTool({
+      async request(_binding, _callId, operation) {
+        if (operation.type === "snapshot") return { origin: "https://example.org/next?token=secret", snapshot: "private page title" };
+        return [{ id: pageId, revision, title: "private page title", url: "https://user:secret@example.com/private-path?q=token#fragment" }];
+      },
+      async endTurn() {},
+    }, { sessionId: "fixture-session", turnId: "fixture-turn" });
+    const execution = createWebExecutor(tool, "full_access");
+    expect(await execution.execute({ callId: "browser-list", toolName: "browser", input: { type: "list" } })).toMatchObject({ status: "success" });
+    const click = { callId: "browser-click", toolName: "browser", input: { type: "click", pageId, revision, ref: "@e2" } };
+    const displayed = await execution.execute(click);
+    expect(displayed).toMatchObject({ status: "approval_required", approval: { display: { operation: "click", resource: "https://example.com · @e2" } } });
+    expect(JSON.stringify(displayed)).not.toMatch(/user:|secret|private-path|q=token|fragment|private page title/);
+    expect(await execution.execute({ ...click, callId: "close", input: { type: "close", pageId, revision } })).toMatchObject({ status: "approval_required", approval: { display: { operation: "close", resource: "https://example.com" } } });
+
+    revision = 4;
+    expect(await execution.execute({ callId: "browser-new-list", toolName: "browser", input: { type: "list" } })).toMatchObject({ status: "success" });
+    expect(await execution.execute({ ...click, callId: "stale-click" })).toMatchObject({ status: "approval_required", approval: { display: { resource: `网页地址待确认（标签 ${pageId}） · @e2` } } });
+    expect(await execution.execute({ callId: "browser-snapshot", toolName: "browser", input: { type: "snapshot", pageId, revision } })).toMatchObject({ status: "success" });
+    expect(await execution.execute({ ...click, callId: "click-after-snapshot", input: { ...click.input, revision } })).toMatchObject({ status: "approval_required", approval: { display: { resource: "https://example.org · @e2" } } });
+  });
+
   it("Fetch 成功展示只含域名、类型和裁剪状态，不含网页正文", async function projectsSafeFetchDisplay() {
     const content = "PAGE_BODY_MUST_NOT_ENTER_DISPLAY".repeat(4_000);
     const fetch: WebFetchCapability = {
@@ -139,7 +257,7 @@ describe("Web Search Stage 1 contract", function webStage1ContractSuite() {
   });
 
   /** Adapter 在第一跳交回剩余九跳时，Core 必须接受新预算并保持目标重新校验。 */
-  it("Core 接受十跳预算中的跨域续接", async function resumesExpandedRedirectBudget() {
+  it.each(["auto_approve", "full_access"] as const)("Core 接受十跳预算中的跨域续接（%s）", async function resumesExpandedRedirectBudget(mode) {
     const seen: Array<{ url: string; redirectsRemaining?: number }> = [];
     const capability: WebFetchCapability = {
       async fetch(input) {
@@ -148,7 +266,14 @@ describe("Web Search Stage 1 contract", function webStage1ContractSuite() {
         return { url: input.url, finalUrl: input.url, content: "ok", contentType: "text/plain", truncated: false };
       },
     };
-    const result = await createWebExecutor(createWebFetchTool(capability), "full_access").execute({ callId: "redirect-expanded", toolName: "web_fetch", input: { url: "https://example.com/start" } });
+    const executor = createWebExecutor(createWebFetchTool(capability), mode);
+    const call = { id: "redirect-expanded", name: "web_fetch", input: { url: "https://example.com/start" } };
+    const initial = await executor.execute({ callId: call.id, toolName: call.name, input: call.input });
+    expect(initial).toMatchObject({ status: "approval_required", approval: { preview: { host: "other.example.com" } } });
+    if (initial.status !== "approval_required") throw new Error("missing redirect approval");
+    expect(seen).toHaveLength(1);
+    applyWebFetchRedirect(call, initial, []);
+    const result = await executor.execute({ callId: call.id, toolName: call.name, input: call.input, approval: { approvalId: initial.approval.approvalId, decision: "allow_once" } });
     expect(result.status).toBe("success");
     expect(seen).toHaveLength(2);
     expect(seen[1]).toMatchObject({ url: "https://other.example.com/final", redirectsRemaining: 9 });
@@ -235,21 +360,34 @@ describe("Web Search Stage 1 contract", function webStage1ContractSuite() {
 
   /** Fetch Adapter 的稳定安全码必须保留，但私有 URL、响应正文与底层错误消息不得穿透。 */
   it("保留 Fetch 稳定错误码并使用 Core 固定文案", async function preservesSafeFetchErrors() {
-    const cases: Array<[WebFetchCapabilityErrorCode, string]> = [
+    const cases: Array<[WebFetchCapabilityErrorCode, string, string?]> = [
       ["WEB_URL_BLOCKED", "网页地址被安全策略阻止"],
+      ["WEB_URL_BLOCKED", "网页地址被安全策略阻止", "__proto__"],
+      ["WEB_URL_BLOCKED", "网页地址或协议不允许访问", "url_not_allowed"],
+      ["WEB_URL_BLOCKED", "网页域名解析失败，请检查 DNS 或网络设置", "dns_failed"],
+      ["WEB_URL_BLOCKED", "网页目标地址位于非公网网段，请检查 DNS 或代理设置", "non_public_address"],
+      ["WEB_URL_BLOCKED", "网页重定向无效或超过安全上限", "redirect_rejected"],
       ["WEB_REDIRECT_REQUIRES_APPROVAL", "网页重定向到其他域名，需要重新审批"],
       ["WEB_RESPONSE_TOO_LARGE", "网页响应超过安全读取上限"],
       ["WEB_CONTENT_TYPE_UNSUPPORTED", "网页内容类型不受支持"],
     ];
-    for (const [code, message] of cases) {
+    for (const [code, message, blockReason] of cases) {
       const capability: WebFetchCapability = {
         /** 模拟 Adapter 携带稳定错误码但附带不可公开的内部消息。 */
-        async fetch() { throw new WebFetchCapabilityError(code, "PRIVATE_FETCH_ERROR_BODY"); },
+        async fetch() { throw Object.assign(new WebFetchCapabilityError(code, "PRIVATE_FETCH_ERROR_BODY"), { blockReason }); },
       };
-      const result = await createWebExecutor(createWebFetchTool(capability), "full_access").execute({ callId: `fetch-${code}`, toolName: "web_fetch", input: { url: "https://example.com/hidden?token=private" } });
-
+      const executor = createWebExecutor(createWebFetchTool(capability));
+      const request = { callId: `fetch-${code}`, toolName: "web_fetch", input: { url: "https://example.com/hidden?token=private" } };
+      const approval = await executor.execute(request);
+      if (approval.status !== "approval_required") throw new Error("missing fixture approval");
+      const result = await executor.execute({ ...request, approval: { approvalId: approval.approval.approvalId, decision: "allow_once" } });
       expect(result.status).toBe("error");
       expect(result.status === "error" && result.error).toEqual({ code, message });
+      if (code === "WEB_URL_BLOCKED") {
+        const event = sanitizeEventForExternal({ type: "tool_result", turnId: "test", stepId: "test-step", callId: result.callId, toolName: "web_fetch", result, retryCount: 0, summary: code });
+        expect(event).toMatchObject({ result: { error: { code, message }, display: { summary: message } } });
+        expect(JSON.stringify(event)).not.toContain("blockReason");
+      }
       expect(JSON.stringify(result)).not.toContain("PRIVATE_FETCH_ERROR_BODY");
       expect(JSON.stringify(result)).not.toContain("token=private");
     }

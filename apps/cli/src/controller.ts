@@ -9,6 +9,8 @@
 import { createCliSessionTitle, getCliSessionDisplayTitle } from "./session-title.js";
 import { recordTuiRuntimeErrorDiagnostic } from "./tui/performance-diagnostics.js";
 import { classifyCliError } from "./error-diagnostics.js";
+import { prepareFileMentionContext } from "./file-mention-context.js";
+import type { FileMentionReference } from "./file-mention-budget.js";
 import { randomUUID } from "node:crypto";
 import { AgentRuntimeError, normalizeWorkImage } from "@autopilot-agent/core";
 import { createNodeSessionImageStore } from "@autopilot-agent/adapters";
@@ -90,6 +92,8 @@ export interface CliControllerResult {
   exitCode: CliExitCode;
   lines: string[];
   message?: string;
+  /** 仅在交互 TUI 的滚动覆盖层显示，不进入通知。 */
+  infoReport?: string;
   skillOptions?: CliSkillSummary[];
   /** 交互 TTY 用于打开权限 picker；Plain 模式使用同一结果中的稳定 lines。 */
   permissionOptions?: CliPermissionOption[];
@@ -105,11 +109,26 @@ export interface CliControllerResult {
   contextView?: { usage: ContextUsageView | null; expanded: boolean };
   /** 运行中输入成功写入 durable inbox 后，供 TUI 标识等待中的引导或排队消息。 */
   submittedInput?: { inputId: string; delivery: "steer" | "queue" };
+  /** Host 已持久记录的追加原文；不是Core inbox回执，不伪造inputId。 */
+  hostRecordedPrompt?: string;
+  continuationRequested?: boolean;
+  preparedPrompt?: { content: string; delivery?: "steer" | "queue"; attachments: SessionImageRef[]; selectedSkills: Array<{ skillRef: string; skillId: string; contentHash: string; pinned: boolean }>; activeSkills: Array<{ skillId: string; contentHash: string }>; fileMentions?: readonly FileMentionReference[] };
   projection: CliProjection;
 }
 
 /** 描述基础结果之外的可选输出，避免调用方使用 undefined 维护位置参数。 */
 type CliControllerResultOptions = Omit<CliControllerResult, "kind" | "exitCode" | "lines" | "projection">;
+
+/** 普通问题和宿主恢复问题共用编号/自定义答案解析，不将自然语言映射为隐式选择。 */
+export function parseQuestionAnswer(content: string, item: { id: string; options: { label: string }[] }): { id: string; selected: string[]; custom?: string } {
+  const text = content.trim();
+  if (!text) throw new Error("请输入当前题目的选项编号或自定义文本");
+  const custom = text.startsWith("其他 ") ? text.slice(3).trim() : undefined;
+  if (custom === "") throw new Error("请输入自定义答案内容");
+  const number = custom === undefined && /^\d+$/u.test(text) ? Number(text) : undefined;
+  if (number !== undefined && (number < 1 || number > item.options.length)) throw new Error("选项编号超出范围");
+  return number !== undefined ? { id: item.id, selected: [item.options[number - 1].label] } : { id: item.id, selected: [], custom: custom ?? text };
+}
 
 /** 持久授权的安全展示行来源；canonical 私有身份已被 Core list 投影剔除。 */
 type CliPermissionGrant = Awaited<ReturnType<CliRuntime["approvals"]["listPersistentGrants"]>>[number];
@@ -126,6 +145,8 @@ export interface CreateCliControllerOptions {
   workspaceRoot?: string;
   /** 读取已热更新的安全 Runtime 默认值；仅用于 idle/Completed 状态栏，不参与 Turn 冻结。 */
   getRuntimeStatusDefaults?: () => CliRuntimeStatusDefaults;
+  /** 受管宿主在原生附件与Skill解析后接管投递，不允许Controller另开执行。 */
+  handoffPrompt?: boolean;
   onEvent?: CliEventListener;
   /** 普通执行与现有 Runner 共享 owner 索引；不因前台选择转移 owner。 */
   registerExecution?(input: { threadId: string; turnId: string; cancel(): void }): { activate(): void; release(): void };
@@ -136,6 +157,16 @@ export interface CreateCliControllerOptions {
 
 /** CLI Controller 对外接口。 */
 export interface CliController {
+  /** Desktop Worker 核验受管输入的文件路径，本地终端直接发送原文。 */
+  readonly resolveFileMentionsInHost?: true;
+  /** 受管执行者的审批反馈由宿主回执确认。 */
+  readonly hostApprovalFeedback?: true;
+  /** 当前受管审批暂停点的宿主回执。 */
+  getHostApprovalStatus?(): string | undefined;
+  /** 受管宿主可在公共目录上提供它实际执行的补全命令。 */
+  suggestSlashCommands?(input: string): import("./types.js").CliSlashCommand[];
+  /** 受管宿主可扩展输入命令；普通 CLI 继续采用默认解析。 */
+  parseInput?(input: string): import("./types.js").CliActionParseResult;
   dispatch(action: CliAction): Promise<CliControllerResult>;
   consume(events: AsyncIterable<AgentEvent>): Promise<CliControllerResult>;
   resume(expectedApproval?: { turnId: string; approvalId: string }): Promise<CliControllerResult>;
@@ -154,6 +185,12 @@ export interface CliController {
   setEventListener(listener?: import("./types.js").CliEventListener): void;
   /** 绑定 queue Turn 启动通知；Plain 宿主不需要注册。 */
   setQueuedInputListener?(listener?: CliQueuedInputStartedListener): void;
+}
+
+/** 将受信问题的当前题目与原选项投影为终端提示，数字选择与自定义文本共用原Core校验。 */
+export function questionLines(question: NonNullable<NonNullable<import("@autopilot-agent/core").TurnExecutionView["interaction"]>["question"]>, index = 0): string[] {
+  const item = question.questions[index];
+  return item ? [`等待回答（${index + 1}/${question.questions.length}） ${item.header}`, item.question, ...item.options.map(function option(option, n) { return `${n + 1}. ${option.label} — ${option.description}`; }), "输入选项编号，或直接输入自定义答案（纯数字补充用“其他 <内容>”）"] : [];
 }
 
 /** 创建无 React 依赖的 Controller；Renderer 和 Runtime 均通过参数注入。 */
@@ -195,8 +232,8 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
   function createPermissionOptions(selectedMode: CliPermissionMode): CliPermissionOption[] {
     return [
       { mode: "ask", label: "询问", description: "查看和新建自动执行；编辑、覆写和每次命令执行询问。", selected: selectedMode === "ask" },
-      { mode: "auto_approve", label: "为我审批", description: "文件工具沿用既有自动审批；命令仅自动执行只读，受信任工作区内的已识别变更命令可自动通过，未知或外部命令仍需审批。", selected: selectedMode === "auto_approve" },
-      { mode: "full_access", label: "完全访问", description: "可执行需审批命令；仍拒绝破坏性命令，并遵守工作区路径、Trust 和参数校验。", selected: selectedMode === "full_access" },
+      { mode: "auto_approve", label: "为我审批", description: "已确认只读及受信项目日常读写、构建和测试自动通过；危险、外部副作用或未知风险仍询问。Windows 命令无 OS 沙箱。", selected: selectedMode === "auto_approve" },
+      { mode: "full_access", label: "完全访问", description: "放行更广范围的普通调用；危险、显式询问和工作区外修改仍需授权，硬拒绝、Trust 与路径校验继续有效。Windows 命令无 OS 沙箱。", selected: selectedMode === "full_access" },
     ];
   }
 
@@ -216,16 +253,18 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
   function getConfigLabels(config: {
     modelRef?: { provider: string; modelId: string };
     reasoningProfile?: { effort: string };
-    effectiveReasoning?: { effort: string; source: "requested" | "clamped" };
+    effectiveReasoning?: { effort: string; source: "requested" | "clamped" | "default" };
     permissionMode?: CliPermissionMode;
+    executionPermissionMode?: CliPermissionMode;
   }): Pick<CliStatusView, "model" | "effort" | "permissionMode"> {
     const effective = config.effectiveReasoning;
+    const capability = config.modelRef ? findModelCapability(config.modelRef.modelId, config.modelRef.provider) : undefined;
     return {
       model: config.modelRef ? `${config.modelRef.provider}/${config.modelRef.modelId}` : "runtime default",
       effort: effective
         ? effective.source === "clamped" ? `${effective.effort} (max clamped)` : effective.effort
-        : config.reasoningProfile?.effort ?? "runtime default",
-      permissionMode: config.permissionMode ?? "ask",
+        : config.reasoningProfile?.effort ?? capability?.defaultReasoningEffort ?? (capability?.reasoningCapabilityUnknown ? "供应商默认（能力未知）" : "runtime default"),
+      permissionMode: config.executionPermissionMode ?? config.permissionMode ?? "ask",
     };
   }
 
@@ -269,7 +308,7 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
     const sessionConfig = session?.defaultRunConfig;
     const runtimeDefaults = options.getRuntimeStatusDefaults?.() ?? {};
     const currentProjection = projector.getProjection();
-    const isActive = (currentProjection.status === "running" || currentProjection.status === "waiting_approval") && Boolean(targetSessionId && targetTurnId);
+    const isActive = ["running", "waiting_approval", "waiting_user_input", "interrupted", "interrupted_recoverable", "limit_reached"].includes(currentProjection.status) && Boolean(targetSessionId && targetTurnId);
     const frozen = isActive && options.runtime && targetSessionId && targetTurnId
       ? await options.runtime.turns.getFrozenRunConfig({ sessionId: targetSessionId, turnId: targetTurnId })
       : undefined;
@@ -381,8 +420,7 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
     });
     statusRevision++;
     const statusView = await getStatusView();
-    const isActive = statusView.source === "turn_frozen";
-    const suffix = isActive ? "；当前 Turn 保持 frozen，下一个 Turn 生效" : "；下一个 Turn 生效";
+    const suffix = "；下次安全恢复或新回合生效，已经执行的动作不变";
     return result("ok", 0, [`permission: ${permissionLabel(mode)} (${mode})${suffix}`], { statusView });
   }
 
@@ -549,6 +587,10 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
     const imageStore = options.workspaceRoot ? createNodeSessionImageStore(options.workspaceRoot) : undefined;
     const stored = [];
     for (const image of normalized) stored.push(await imageStore!.put({ sessionId, ...image }));
+    if (options.handoffPrompt) {
+      const mentions = options.workspaceRoot ? await prepareFileMentionContext(content, options.workspaceRoot) : undefined;
+      return result("ok", 0, mentions?.notices ?? [], { preparedPrompt: { content, delivery, attachments: stored, selectedSkills: toInboxSkillRefs(), activeSkills: selectedSkills.map(function active(skill) { return { skillId: skill.skillId, contentHash: skill.contentHash }; }), fileMentions: mentions?.references } });
+    }
     const status = submittedStatus;
     if (stored.length === 0 && delivery === undefined && isCliContinuePrompt(content) && status !== "running") {
       const recoverable = await options.runtime.turns.getRecoverableState({ sessionId, turnId });
@@ -581,14 +623,9 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
   /** 当前目标内逐题收集历史问题答案，按精确requestId提交，原文只交给私有问题服务。 */
   let questionDraft: { turnId: string; requestId: string; answers: Array<{ id: string; selected: string[]; custom?: string }> } | undefined;
 
-  /** 将受信问题的当前题目与原选项投影为终端提示，数字选择与自定义文本共用原Core校验。 */
-  function questionLines(question: NonNullable<NonNullable<import("@autopilot-agent/core").TurnExecutionView["interaction"]>["question"]>, index = 0): string[] {
-    const item = question.questions[index];
-    return item ? [`等待回答（${index + 1}/${question.questions.length}） ${item.header}`, item.question, ...item.options.map(function option(option, n) { return `${n + 1}. ${option.label} — ${option.description}`; }), "输入选项编号，或直接输入自定义答案（纯数字补充用“其他 <内容>”）"] : [];
-  }
-
   /** 已保存决定先交给受信宿主控制面；无协作组时沿原本机continue入口执行。 */
   async function continueSavedInteraction(input: { sessionId: string; turnId: string; approvalId?: string; requestId?: string }, approval?: ContinueTurnInput["approval"]): Promise<CliControllerResult> {
+    if (options.handoffPrompt) return result("ok", 0, ["交互决定已保存，交由原Host继续。"], { continuationRequested: true });
     const handoff = await options.runtime!.turns.requestInteractionContinuation?.(input);
     if (handoff?.queued) {
       const view = await options.runtime!.turns.getExecutionState({ sessionId: input.sessionId, turnId: input.turnId }).catch(function unavailable() { return null; });
@@ -610,13 +647,9 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
     if (view.interaction.state !== "pending") return result("error", 2, [], "问题状态待确认，请刷新后重试");
     if (questionDraft?.requestId !== question.requestId || questionDraft.turnId !== view.turnId) questionDraft = { turnId: view.turnId, requestId: question.requestId, answers: [] };
     const item = question.questions[questionDraft.answers.length];
-    const text = content.trim();
-    if (!item || !text) return result("error", 2, [], "请输入当前题目的选项编号或自定义文本");
-    const custom = text.startsWith("其他 ") ? text.slice(3).trim() : undefined;
-    if (custom === "") return result("error", 2, [], "请输入自定义答案内容");
-    const number = custom === undefined && /^\d+$/u.test(text) ? Number(text) : undefined;
-    if (number !== undefined && (number < 1 || number > item.options.length)) return result("error", 2, questionLines(question, questionDraft.answers.length), "选项编号超出范围");
-    questionDraft.answers.push(number !== undefined ? { id: item.id, selected: [item.options[number - 1].label] } : { id: item.id, selected: [], custom: custom ?? text });
+    if (!item) return result("error", 2, [], "当前问题已变化，请刷新后重试");
+    try { questionDraft.answers.push(parseQuestionAnswer(content, item)); }
+    catch (error) { return result("error", 2, questionLines(question, questionDraft.answers.length), error instanceof Error ? error.message : "答案无效"); }
     if (questionDraft.answers.length < question.questions.length) return result("ok", 0, questionLines(question, questionDraft.answers.length));
     if (!options.runtime.questions) { questionDraft = undefined; return result("unavailable", 1, [], "当前宿主不支持提交历史问题答案"); }
     executing++;
@@ -725,6 +758,9 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
         const decision = await options.runtime.approvals?.getDecision?.({ sessionId, turnId, approvalId: state.approval.approvalId });
         if (generation !== observationGeneration) return result("error", 2, [], "CLI_TURN_IDENTITY_CHANGED");
         if (decision) return await continueSavedInteraction({ sessionId, turnId, approvalId: state.approval.approvalId }, { approvalId: state.approval.approvalId, decision: decision.decision === "deny" ? "deny" : "allow" });
+        const statusView = await getStatusView();
+        if (generation !== observationGeneration) return result("error", 2, [], "CLI_TURN_IDENTITY_CHANGED");
+        if (statusView.nextPermissionMode) return await consume(options.runtime.turns.continue({ sessionId, turnId }));
         return result("ok", 0, [
           `approval required: ${state.approval?.approvalId ?? "unknown"}${state.approval ? ` (${state.approval.toolName})` : ""}`,
         ]);
@@ -831,9 +867,10 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
     if (!options.runtime?.sessions) return result("error", 1, [], "CLI_RUNTIME_NOT_ATTACHED");
     const capability = findModelCapability(modelId, provider);
     if (!capability) return result("error", 2, [], "MODEL_NOT_SUPPORTED");
+    if (capability.supportsToolCalls === false) return result("error", 2, [], "MODEL_NOT_SUPPORTED");
     const session = await options.runtime.sessions.get(sessionId);
     if (!session) return result("error", 1, [], "SESSION_NOT_FOUND");
-    const currentEffort = session.defaultRunConfig?.reasoningProfile?.effort;
+    const currentEffort = session.defaultRunConfig?.reasoningProfile?.effort ?? options.getRuntimeStatusDefaults?.().reasoningProfile?.effort;
     if (currentEffort && !capability.requestableEfforts.includes(currentEffort)) return result("error", 2, [], "REASONING_EFFORT_NOT_SUPPORTED");
     await options.runtime.sessions.setDefaultRunConfig(sessionId, {
       ...(session.defaultRunConfig ?? {}),
@@ -852,12 +889,13 @@ export function createCliController(options: CreateCliControllerOptions): CliCon
     const modelRef = session?.defaultRunConfig?.modelRef ?? options.getRuntimeStatusDefaults?.().modelRef;
     const capability = modelRef ? findModelCapability(modelRef.modelId, modelRef.provider) : undefined;
     if (!capability) return result("unavailable", 1, [], "CAPABILITY_UNAVAILABLE: effort_catalog");
-    const selectedEffort = session?.defaultRunConfig?.reasoningProfile?.effort ?? options.getRuntimeStatusDefaults?.().reasoningProfile?.effort;
+    const selectedEffort = session?.defaultRunConfig?.reasoningProfile?.effort ?? options.getRuntimeStatusDefaults?.().reasoningProfile?.effort ?? capability.defaultReasoningEffort;
     const effortOptions = capability.requestableEfforts.map(function toEffortOption(effort) {
       return { effort, selected: effort === selectedEffort };
     });
     return result("ok", 0, [
       `efforts for ${capability.provider}/${capability.modelId}:`,
+      ...(effortOptions.length === 0 ? [capability.reasoningCapabilityUnknown ? "供应商默认（能力未知）" : "不支持调整"] : []),
       ...effortOptions.map(function formatEffort(option, index) { return `${index + 1}. ${option.effort}${option.selected ? " (selected)" : ""}`; }),
       "interactive: ↑↓ select · Enter save · Esc cancel; plain: /effort <effort>",
     ], { statusView, effortOptions });

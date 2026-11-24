@@ -245,8 +245,8 @@ describe("Talk-Plan0805 Step2", function step2Suite() {
       onAppExit: function onAppExit(_code: number): void {},
     }));
     await new Promise<void>(function waitForStatus(resolve) { setTimeout(resolve, 20); });
-    expect(result.lastFrame() ?? "").toContain("model: deepseek/deepseek-v4-flash");
-    expect(result.lastFrame() ?? "").toContain("permission: 询问 (ask)");
+    expect(result.lastFrame() ?? "").toContain("deepseek/deepseek-v4-flash · high · 询问 (ask)");
+    expect(result.lastFrame() ?? "").not.toContain("tokens:");
 
     result.stdin.write("/permissions");
     result.stdin.write("\r");
@@ -267,7 +267,7 @@ describe("Talk-Plan0805 Step2", function step2Suite() {
     result.stdin.write("\r");
     await new Promise<void>(function waitForSave(resolve) { setTimeout(resolve, 30); });
     expect(calls).toEqual([{ type: "open_permissions" }, { type: "set_permission_mode", mode: "full_access" }]);
-    expect(result.lastFrame() ?? "").toContain("permission: 完全访问 (full_access)");
+    expect(result.lastFrame() ?? "").toContain("· 完全访问 (full_access)");
     result.unmount();
   });
 

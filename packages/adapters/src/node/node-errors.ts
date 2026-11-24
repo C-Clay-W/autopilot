@@ -37,6 +37,8 @@ export interface NodeStorageDiagnostic {
   phase: "prepare" | "identity" | "lock" | "temporary_write" | "rename" | "cleanup";
   osCode?: string;
   lockWaitMs?: number;
+  attempts?: number;
+  elapsedMs?: number;
   cleanupFailed?: boolean;
 }
 

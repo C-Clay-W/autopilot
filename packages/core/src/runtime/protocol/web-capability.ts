@@ -66,6 +66,19 @@ export type WebFetchCapabilityErrorCode =
   | "WEB_RESPONSE_TOO_LARGE"
   | "WEB_CONTENT_TYPE_UNSUPPORTED";
 
+/** WEB_URL_BLOCKED 的有限诊断原因，只在 Fetch Adapter 与 Core 之间传递。 */
+export type WebFetchBlockReason = "url_not_allowed" | "dns_failed" | "non_public_address" | "redirect_rejected";
+
+/** 同一份固定文案供工具结果和展示事实使用。 */
+export const WEB_FETCH_BLOCK_MESSAGES: Readonly<Record<WebFetchBlockReason, string>> = {
+  url_not_allowed: "网页地址或协议不允许访问",
+  dns_failed: "网页域名解析失败，请检查 DNS 或网络设置",
+  non_public_address: "网页目标地址位于非公网网段，请检查 DNS 或代理设置",
+  redirect_rejected: "网页重定向无效或超过安全上限",
+};
+
+export const WEB_FETCH_BLOCK_FALLBACK = "网页地址被安全策略阻止";
+
 /** 承载稳定错误码且不包含 URL 参数、响应正文或底层堆栈的 Fetch capability 异常。 */
 export class WebFetchCapabilityError extends Error {
   /** 创建只含安全消息的 Fetch capability 异常。 */
@@ -74,6 +87,8 @@ export class WebFetchCapabilityError extends Error {
     message: string,
     /** 仅在进程内交给 Core 重新审批；不得序列化到错误、事件或 checkpoint。 */
     public readonly redirect?: { url: string; remainingRedirects: number },
+    /** 仅适用于 WEB_URL_BLOCKED，向外只投影固定文案。 */
+    public readonly blockReason?: WebFetchBlockReason,
   ) {
     super(message);
     this.name = "WebFetchCapabilityError";

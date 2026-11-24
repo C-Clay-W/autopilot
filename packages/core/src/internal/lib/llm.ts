@@ -56,6 +56,8 @@ export interface AgentSampleResult {
 
 /** 当前完整 Provider 响应的内部 context usage；字段名与 OpenAI 兼容字段一一对应。 */
 export interface AgentSampleUsage {
+  /** 供应商报告的输出推理子项，不与输出总量重复相加。 */
+  reasoningTokens?: number;
   inputTokens: number;
   outputTokens: number;
   contextTokens: number;

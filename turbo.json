@@ -1,6 +1,11 @@
 {
   "$schema": "https://turbo.build/schema.json",
   "tasks": {
+    "@autopilot-agent/desktop#build": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "outputs": ["out/**"]
+    },
     "build": {
       "dependsOn": ["^build"],
       "outputs": ["dist/**"]

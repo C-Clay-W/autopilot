@@ -4,7 +4,7 @@
 
 import { z } from "zod";
 import { WebFetchRedirect } from "../web-fetch-redirect";
-import { isWebFetchCapabilityError, type WebFetchCapabilityError, type WebFetchCapability, type WebFetchResult } from "../../../runtime/protocol/web-capability";
+import { isWebFetchCapabilityError, WEB_FETCH_BLOCK_FALLBACK, WEB_FETCH_BLOCK_MESSAGES, type WebFetchCapabilityError, type WebFetchCapability, type WebFetchResult } from "../../../runtime/protocol/web-capability";
 import { createToolError, TOOL_ERROR_CODES } from "../tool-error";
 import type { AgentToolDefinition, ToolActionFacts } from "../types";
 
@@ -101,8 +101,12 @@ function hasStableToolError(error: unknown): error is Error & { toolError: { cod
 }
 
 /** 将 capability 稳定错误码再次收敛为 Core 固定文案，禁止信任 Adapter 自带消息。 */
-function getWebFetchCapabilityErrorMessage(code: WebFetchCapabilityError["code"]): string {
-  if (code === "WEB_URL_BLOCKED") return "网页地址被安全策略阻止";
+function getWebFetchCapabilityErrorMessage({ code, blockReason }: WebFetchCapabilityError): string {
+  if (code === "WEB_URL_BLOCKED") {
+    return typeof blockReason === "string" && Object.prototype.hasOwnProperty.call(WEB_FETCH_BLOCK_MESSAGES, blockReason)
+      ? WEB_FETCH_BLOCK_MESSAGES[blockReason]
+      : WEB_FETCH_BLOCK_FALLBACK;
+  }
   if (code === "WEB_REDIRECT_REQUIRES_APPROVAL") return "网页重定向到其他域名，需要重新审批";
   if (code === "WEB_RESPONSE_TOO_LARGE") return "网页响应超过安全读取上限";
   return "网页内容类型不受支持";
@@ -119,11 +123,11 @@ export function createWebFetchTool(capability: WebFetchCapability): AgentToolDef
       if (isWebFetchCapabilityError(error) && error.code === "WEB_REDIRECT_REQUIRES_APPROVAL" && error.redirect) {
         const remaining = error.redirect.remainingRedirects;
         if (!Number.isInteger(remaining) || remaining < 0 || remaining >= (context.webFetchRedirectsRemaining ?? 10)) {
-          throw createToolError(TOOL_ERROR_CODES.WEB_URL_BLOCKED, "网页重定向超过安全上限");
+          throw createToolError(TOOL_ERROR_CODES.WEB_URL_BLOCKED, WEB_FETCH_BLOCK_MESSAGES.redirect_rejected);
         }
         throw new WebFetchRedirect(error.redirect.url, input.prompt, remaining);
       }
-      if (isWebFetchCapabilityError(error)) throw createToolError(error.code, getWebFetchCapabilityErrorMessage(error.code));
+      if (isWebFetchCapabilityError(error)) throw createToolError(error.code, getWebFetchCapabilityErrorMessage(error));
       if (hasStableToolError(error)) throw error;
       throw createToolError(TOOL_ERROR_CODES.TOOL_EXECUTION_FAILED, "网页读取失败");
     }
@@ -141,12 +145,16 @@ export function createWebFetchTool(capability: WebFetchCapability): AgentToolDef
       // 采用 CC Fetch 的 60 秒数值；同一执行段内的 DNS、重定向和正文读取共享期限。
       timeout: { defaultMs: 60_000, maxMs: 60_000 },
     },
-    /** Chat 只读 Fetch 使用 Session 上限授权；Work 保持既有逐域名审批。 */
+    /** 只有 Work 的初始公开 Fetch 可以按权限档放行，跨域续接仍进入目标域审批。 */
     createActionFacts(input, context) {
       const facts = createWebFetchActionFacts(input);
-      return context.capabilityCeiling?.productMode === "chat" && context.capabilityCeiling.chatRetrievalMode === "web"
-        ? { ...facts, requiresApproval: false, approval: undefined }
-        : facts;
+      if (context.capabilityCeiling?.productMode === "chat") {
+        return context.capabilityCeiling.chatRetrievalMode === "web" ? { ...facts, requiresApproval: false, approval: undefined } : facts;
+      }
+      if ((context.permissionMode === "full_access" || context.permissionMode === "auto_approve") && context.webFetchRedirectsRemaining === undefined) {
+        return { ...facts, risk: "read_only", requiresApproval: false, approval: undefined };
+      }
+      return context.webFetchRedirectsRemaining === undefined ? facts : { ...facts, requireSingleApproval: true };
     },
     execute: executeWebFetch,
     /** 输出已经过本地有界化，可直接作为 Agent 工具观察。 */

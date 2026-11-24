@@ -48,8 +48,8 @@ function renderLineWithCursor(lineText: string, cursorOffset: number, useColor: 
 }
 
 /** 渲染带可视光标的多行输入；所有 prompt 文本放进同一个 Text，避免兄弟节点分别换行。 */
-export function TuiPromptInput(props: { input: string; cursorIndex: number; columns: number; useColor: boolean; screenReader: boolean; busy: boolean; maximumRows?: number }): ReactNode {
-  const layout = createTuiPromptLayout(props.input, props.cursorIndex, Math.max(1, props.columns - 4));
+export function TuiPromptInput(props: { input: string; cursorIndex: number; columns: number; useColor: boolean; screenReader: boolean; busy: boolean; maximumRows?: number; compact?: boolean }): ReactNode {
+  const layout = createTuiPromptLayout(props.input, props.cursorIndex, Math.max(1, props.columns - (props.compact ? 0 : 4)));
   const nodes: ReactNode[] = [];
   const placeholder = props.screenReader && !props.input ? "prompt" : "";
 
@@ -75,7 +75,7 @@ export function TuiPromptInput(props: { input: string; cursorIndex: number; colu
   }
 
   return (
-    <Box aria-role="textbox" aria-state={{ busy: props.busy, multiline: true }} width={props.columns} flexShrink={0} marginTop={1} borderStyle="single" borderColor={props.useColor ? TUI_ACCENT_COLOR : undefined} paddingX={1}>
+    <Box aria-role="textbox" aria-state={{ busy: props.busy, multiline: true }} width={props.columns} flexShrink={0} marginTop={props.compact ? 0 : 1} borderStyle={props.compact ? undefined : "single"} borderColor={props.useColor ? TUI_ACCENT_COLOR : undefined} paddingX={props.compact ? 0 : 1}>
       <Text wrap="wrap">{nodes}</Text>
     </Box>
   );

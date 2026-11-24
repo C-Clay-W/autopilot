@@ -1,6 +1,17 @@
 /** TUI 启动期一次性解析的渲染模式纯函数：颜色/读屏/降级/渲染模式策略。 */
 
+import { createContext } from "react";
 import type { TuiRenderMode } from "./types.js";
+
+/** 编排受管终端的局部样式，只由受管入口开启，并在读屏模式禁用。 */
+export const TuiManagedTerminalStyles = createContext(false);
+
+/** 资源管理器启动的 cmd 可由 Windows Terminal 承载，但不继承 WT_SESSION。 */
+export function getWindowsTuiResizeHost(isTTY: boolean | undefined, env: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): "desktop" | "external" | undefined {
+  if (platform !== "win32" || !isTTY) return;
+  if (env.TERM_PROGRAM === "autopilot-desktop") return "desktop";
+  if (!env.TERM_PROGRAM || env.WT_SESSION) return "external";
+}
 
 /** 判断当前环境是否要求关闭 ANSI 颜色。 */
 export function resolveNoColor(env: NodeJS.ProcessEnv): boolean {

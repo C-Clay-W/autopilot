@@ -43,11 +43,12 @@ export function createStartBackgroundJobTool(input: { jobs: JobService; workspac
         destructive: result.risk === "destructive",
         operation: "command",
         resource: normalizeProgramName(value.program),
-        risk: target ? "external_side_effect" : result.risk,
+        risk: result.risk === "destructive" ? "destructive" : target ? "external_side_effect" : result.risk,
         stableConstraint: target ? computeExternalExecutionConstraint("start_background_job", target) : `program:${normalizeProgramName(value.program)}`,
         ...(target ? { externalMutation: true, externalExecutionTarget: target } : {}),
         hardDenyReason: result.decision === "deny" ? result.reason : undefined,
         requiresApproval: result.decision !== "deny",
+        requireSingleApproval: result.requireSingleApproval ?? (target && result.risk === "unknown" && context.permissionMode !== "ask" ? true : undefined),
         approval: { reason: target ? "后台命令请求修改一个工作区外精确文件，需要明确用户授权" : result.reason, preview: { program: value.program, args: value.args, cwd: value.cwd, background: true, ...(value.serviceUrl ? { serviceUrl: value.serviceUrl } : {}), ...(target ? { externalWriteTarget: externalExecutionTargetLabel(target), operation: "write" } : {}) } },
       };
     },

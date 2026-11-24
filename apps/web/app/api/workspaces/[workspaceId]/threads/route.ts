@@ -18,7 +18,7 @@ import {
 } from "@/lib/workspace-host/thread-route";
 
 /** 允许的推理强度值与 Core `ReasoningEffort` 一致。 */
-const REASONING_EFFORTS = ["none", "low", "medium", "high", "max"] as const;
+const REASONING_EFFORTS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
 
 /** 创建子会话；创建本身不启动推理。 */
 export async function POST(request: Request, { params }: { params: Promise<{ workspaceId: string }> }) {

@@ -36,6 +36,7 @@ export interface CliSessionEntry {
   summaryApproval?: AgentEventEnvelope;
   summaryRejectedId?: string;
   executionView?: TurnExecutionView;
+  executionViewReadAt?: number;
   interactionNotice?: string;
   viewState: { draftRef: CliTuiDraftRef; initialStarted: boolean; lastSubmittedPrompt: { current: string | undefined } };
   pendingPrompts?: NonNullable<Session["presentation"]>["messages"];
@@ -153,6 +154,7 @@ export function createCliSessionManager(options: {
     const previous = entry.executionView;
     if (previous?.turnId === view.turnId && view.lastSeq < previous.lastSeq) return;
     entry.executionView = view;
+    entry.executionViewReadAt = Date.now();
     reconcileObservedIdentity(entry, { activeTurnId: view.turnId, status: view.status });
     entry.summaryApproval = view.interaction?.state === "pending" ? view.interaction.approval : undefined;
     entry.summaryReady = true;

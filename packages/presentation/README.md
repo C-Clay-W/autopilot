@@ -1,6 +1,6 @@
 # @autopilot-agent/presentation
 
-CLI 与 Web 共用的纯 TypeScript 展示层：把 Runtime 安全事件和宿主事件转换为可重放的时间线状态。普通用户安装 `autopilot-agent@0.2.0`，CLI 会带入本包。
+CLI 与 Web 共用的纯 TypeScript 展示层：把 Runtime 安全事件和宿主事件转换为可重放的时间线状态。普通用户安装 `autopilot-agent@0.4.0`，CLI 会带入本包。
 
 ## 核心接口
 
@@ -40,8 +40,16 @@ npm run build -w packages/presentation
 npm run test -w packages/presentation -- test/todo.test.ts
 ```
 
-从 monorepo 根运行。产物为 CJS、ESM 和 TypeScript 声明，Core 保持 external；npm 0.2.0 精确依赖 Core 0.2.0。公开源码还保留 reducer、分组及展示行为测试和合成 fixture。
+从 monorepo 根运行。产物为 CJS、ESM 和 TypeScript 声明，Core 保持 external；npm 0.4.0 精确依赖 Core 0.4.0。公开源码还保留 reducer、分组及展示行为测试和合成 fixture。
+
+## 0.4.0 版本
+
+为 CLI 和 Web 提供匹配 Core 0.4.0 的时间线、工具活动及审批展示接口。
+
+## 0.3.0 版本
+
+改进主子会话进展、工具活动分组、等待原因和失败信息展示，支持 Web 交互式内容的事件投影。审批请求、执行状态和最终结果分别呈现，普通观察或失联状态不会直接当作待审批。
 
 ## 许可证
 
-MIT，见本包 LICENSE。
+公开源码采用 [MIT 许可证](https://github.com/C-Clay-W/autopilot/blob/main/LICENSE)。

@@ -17,6 +17,8 @@ import type { UserQuestionSubmissionService } from "../application/user-question
 
 /** 公开 AgentRuntime 接口；宿主通过此 Facade 访问所有 Runtime 能力。 */
 export interface AgentRuntime {
+  /** 只读安全事实与重放游标，不触发执行。 */
+  facts: import("../application/runtime-facts").RuntimeFacts;
   /** 仅受信宿主绑定来源；不接收模型自报身份。 */
   threads: { bind(context: ThreadHostContext): ThreadFacade };
   /** turn 操作服务。 */

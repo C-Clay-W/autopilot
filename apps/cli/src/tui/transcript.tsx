@@ -1,14 +1,33 @@
 /** transcript 节点渲染：用户 prompt、通知、完整历史 Turn 与动态等待输入。 */
 
-import { memo, type ReactNode } from "react";
-import { Box, Text } from "ink";
-import { TUI_ACCENT_COLOR, TUI_PROMPT_BACKGROUND_COLOR, TUI_WAITING_BACKGROUND_COLOR } from "../design-tokens.js";
+import { stripVTControlCharacters } from "node:util";
+import { memo, useContext, type ReactNode } from "react";
+import { Box, Text, Transform } from "ink";
+import stringWidth from "string-width";
+import wrapAnsi from "wrap-ansi";
+import { TUI_ACCENT_COLOR, TUI_MANAGED_PROMPT_BACKGROUND_SGR, TUI_PROMPT_BACKGROUND_COLOR, TUI_WAITING_BACKGROUND_COLOR } from "../design-tokens.js";
 import { splitTuiFileMentionSegments } from "./input/file-mention.js";
+import { TuiManagedTerminalStyles } from "./render-mode.js";
 import { renderTimeline } from "./timeline/static-timeline.js";
 import type { CliTuiPendingInput, CliTuiTranscriptItem } from "./types.js";
 
 /** 渲染一个用户 prompt；当前 Turn 会暂留在动态区，避免历史区固化时机丢失。@文件 片段用强调色加粗。 */
 export function TuiPromptLine(props: { content: string; useColor: boolean; columns: number; keyValue?: string }): ReactNode {
+  const managedBackground = useContext(TuiManagedTerminalStyles);
+  if (managedBackground) {
+    // 仅清理显示副本，交给 Ink 的控制码只来自固定颜色 token。
+    const content = stripVTControlCharacters(props.content).replace(/\r\n?/gu, "\n").replace(/\t/gu, "    ").replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/gu, "");
+    const inset = props.columns > 3 ? " " : "";
+    const width = Math.max(1, props.columns - inset.length * 2);
+    const lines = wrapAnsi(content, width, { hard: true, trim: false }).split("\n")
+      .map(function indent(line) { return inset + line; }).join("\n");
+    return <Box key={props.keyValue} width={props.columns}>
+      <Transform transform={function shadePromptRow(line) {
+        const fill = " ".repeat(Math.max(0, props.columns - stringWidth(line)));
+        return TUI_MANAGED_PROMPT_BACKGROUND_SGR + line + fill + "\u001b[49m";
+      }}>{lines}</Transform>
+    </Box>;
+  }
   const segments = splitTuiFileMentionSegments(props.content);
   return (
     <Box key={props.keyValue} width={props.columns} paddingX={1} backgroundColor={props.useColor ? TUI_PROMPT_BACKGROUND_COLOR : undefined}>
@@ -57,11 +76,14 @@ function renderTranscriptItem(props: { item: CliTuiTranscriptItem; useColor: boo
 export const MemoizedTuiTranscriptItem = memo(TuiTranscriptItem);
 
 /** queue 在等待区显示原文；steer 正文已按提交位置留在所属轮。 */
-export function TuiPendingInputItem(props: { item: CliTuiPendingInput; useColor: boolean }): ReactNode {
+export function TuiPendingInputItem(props: { item: CliTuiPendingInput; useColor: boolean; columns: number }): ReactNode {
+  const managedBackground = useContext(TuiManagedTerminalStyles);
   const label = props.item.delivery === "queue" ? "[排队]" : "[引导]";
   return (
-    <Box key={props.item.key} flexDirection="column" backgroundColor={props.useColor ? TUI_WAITING_BACKGROUND_COLOR : undefined}>
-      {props.item.delivery === "queue" ? <Text>{props.item.content}</Text> : null}
+    <Box key={props.item.key} flexDirection="column" backgroundColor={props.useColor && !managedBackground ? TUI_WAITING_BACKGROUND_COLOR : undefined}>
+      {props.item.delivery === "queue" ? managedBackground
+        ? <TuiPromptLine content={props.item.content} useColor={props.useColor} columns={props.columns} />
+        : <Text>{props.item.content}</Text> : null}
       <Text dimColor={props.useColor}>↳ {label} 等待当前步骤结束</Text>
     </Box>
   );

@@ -1,6 +1,6 @@
 {
   "name": "@autopilot-agent/adapters",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
@@ -42,7 +42,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sandbox-runtime": "0.0.78",
-    "@autopilot-agent/core": "0.3.0",
+    "@autopilot-agent/core": "0.4.0",
     "js-yaml": "4.3.0",
     "linkedom": "0.18.12"
   },

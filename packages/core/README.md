@@ -1,6 +1,6 @@
 # @autopilot-agent/core
 
-Autopilot 的共享 Agent Runtime、工具执行、审批、会话和 RAG 核心。普通 CLI 用户只需安装 `autopilot-agent@0.2.0`；本包主要面向自行编写宿主或集成知识检索能力的开发者。
+Autopilot 的共享 Agent Runtime、工具执行、审批、会话和 RAG 核心。普通 CLI 用户只需安装 `autopilot-agent@0.4.0`；本包主要面向自行编写宿主或集成知识检索能力的开发者。
 
 ## 入口与能力
 
@@ -15,7 +15,7 @@ Autopilot 的共享 Agent Runtime、工具执行、审批、会话和 RAG 核心
 | listWorkspaceFiles | 工作区文件索引与候选枚举 |
 | @autopilot-agent/core/experimental | Kernel、采样器和工具工厂等不稳定接口 |
 
-完整签名、参数、错误和示例见 [Core API 参考](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/Core-API.md)。默认入口是稳定公开边界，禁止把 core/internal/* 深层路径当作正式集成接口。开发文档以对应版本源码为准。
+完整签名、参数、错误和示例见 [Core API 参考](https://github.com/C-Clay-W/autopilot/blob/main/agent/doc/Core-API.md)。默认入口是稳定公开边界，禁止把 core/internal/* 深层路径当作正式集成接口。开发文档以源码为准，可能先于 npm 0.4.0。
 
 ## 装配原则
 
@@ -49,10 +49,16 @@ npm run test -w packages/core -- src/internal/tools/builtins/todo-write-tool.tes
 
 Trust、工具授权和沙箱各有职责。拒绝不支持的路径/协议不等于证明 OS 隔离成功；平台实机限制见主入口包手册。
 
-## 源码 0.2.0 与 npm 版本
+## 0.4.0 版本
 
-源码与五个 npm 包当前版本均为 0.2.0。Windows 不提供 OS 进程沙箱，命令、后台 Job 与 host MCP 逐次审批后以当前用户权限直接执行；审批不提供 OS 隔离。macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
+支持 OpenAI Responses 协议，并按模型能力选择推理强度。命令权限检查可识别 `git clean -nd` 等只读预览。
+
+## 0.3.0 版本
+
+新增会话协作、任务交接、进展汇报和大段命令输出回读，改进审批与问答后的继续执行、上下文缓存和文件读取。协作任务按 CLI / Web 执行环境匹配，宿主集成时需按当前公开接口提供对应执行环境。
+
+本包随 npm 0.4.0 发布，内部依赖使用匹配的精确版本。Windows 命令和后台 Job 按权限模式与风险审批后以当前用户权限执行，host MCP 另按授权执行，审批不提供 OS 隔离；macOS 继续使用 Seatbelt。实机与进程树生命周期仍需按实际验证确认。
 
 ## 许可证
 
-MIT，见 LICENSE。第三方依赖采用各自授权。
+公开源码采用 [MIT 许可证](https://github.com/C-Clay-W/autopilot/blob/main/LICENSE)。第三方依赖采用各自授权。

@@ -52,6 +52,8 @@ import type { McpCapability } from "../runtime/protocol";
 import type { CredentialStore, FileMutationStore } from "../runtime/ports";
 import { McpStdioRuntime } from "./tools/mcp-runtime";
 import { createStartBackgroundJobTool } from "./tools/builtins/start-background-job-tool";
+import { createBrowserTool } from "./tools/builtins/browser-tool";
+import type { BrowserBinding, BrowserCapability } from "../runtime/protocol/browser-capability";
 import { createOpenPreviewTool } from "./tools/builtins/open-preview-tool";
 import type { WorkPreviewCapability } from "../runtime/protocol/work-preview-capability";
 import { createListBackgroundJobsTool, createReadBackgroundJobTool, createStopBackgroundJobTool } from "./tools/builtins/background-job-tools";
@@ -80,6 +82,10 @@ export interface RagCapability {
 export interface AgentOptions {
   /** Runtime 从 Session 派生的冻结产品权限，不能由模型输入覆盖。 */
   capabilityCeiling?: CapabilityCeiling;
+  /** 真实 Runtime 会话绑定的宿主工具，仍受 registry 能力上限约束。 */
+  /** 受信宿主在普通工具真实执行前进行资源准入；不能替代普通权限检查。 */
+  hostToolAdmission?: (toolName: string) => Promise<void>;
+  hostTools?: import("./tools/types").AgentToolDefinition<any, any>[];
   chatCapability?: ChatCapability;
   chatAttachmentGrants?: readonly ChatAttachmentGrant[];
   /** 受信会话图片读取端口及冻结模型能力。 */
@@ -97,6 +103,9 @@ export interface AgentOptions {
   web?: WebCapability;
   /** Trust 后由宿主注入的 Work 内置预览能力；缺失时不向模型注册 open_preview。 */
   workPreview?: WorkPreviewCapability;
+  /** 浏览器绑定来自真实 Core Turn。 */
+  browser?: BrowserCapability;
+  browserBinding?: BrowserBinding;
   /**
    * 已绑定当前 Turn 的协作能力；组、父会话与 actor 由 Runtime 装配，缺失时不注册协作工具。
    * Chat 不装配该能力，模型参数也不能构造它。
@@ -261,6 +270,9 @@ export interface AgentCheckpoint {
     inputTokens?: number;
     /** 累计输出 token；与 inputTokens 同时维护，两者之和必须等于 totalTokens 才视为完整分项。 */
     outputTokens?: number;
+    /** 已报告推理子项累计值；reportedOutputTokens用于确认统计完整性。 */
+    reasoningTokens?: number;
+    reasoningReportedOutputTokens?: number;
     /** 最近一次安全边界刷新时间戳；供执行段耗时投影使用，旧 checkpoint 缺少时耗时按 0 处理。 */
     updatedAt?: number;
     /** 缺少此字段的旧 checkpoint 会在 Continue 取得 lease 后迁移到当前执行段。 */
@@ -303,6 +315,8 @@ interface InternalAgentRunInput {
   approval?: { approvalId: string; decision: ToolApprovalDecision };
   /** 可信TurnService确认旧审批已失效后，只重新签发当前pending call审批，不执行工具。 */
   reissueApproval?: boolean;
+  /** 受信权限修订后重新评估 pending call，禁止携带旧审批决定。 */
+  revalidateApproval?: boolean;
   /** 应用层从可信 Question Store 读取的已提交答案；仅用于恢复原 ask_user_question 调用。 */
   userQuestion?: { requestId: string; answer: import("../runtime/domain").UserQuestionAnswer };
 }
@@ -531,6 +545,7 @@ export function createAgentRuntime(options: AgentOptions = {}) {
     registry.register(createStopBackgroundJobTool(scopedJobs));
   }
   // Work 内置预览（Talk-Plan0908 Stage1）：仅受信宿主注入能力且存在 Turn 绑定时注册；Chat/CLI 永不注册。
+  if (!isChat && options.browser && options.browserBinding) registry.register(createBrowserTool(options.browser, options.browserBinding, options.sessionImageStore, options.jobs && options.jobBinding && options.workspaceRoot ? { jobs: options.jobs, workspaceId: options.jobBinding.workspaceId, workspaceRoot: options.workspaceRoot } : undefined));
   if (!isChat && options.workPreview && options.jobBinding && options.workspaceRoot) {
     registry.register(createOpenPreviewTool({ capability: options.workPreview, jobs: options.jobs, workspaceRoot: options.workspaceRoot, workspaceId: options.jobBinding.workspaceId, sessionId: options.jobBinding.sessionId, turnId: options.jobBinding.turnId }));
   }
@@ -553,6 +568,7 @@ export function createAgentRuntime(options: AgentOptions = {}) {
   if (options.visionAnalyzer) registry.register(createVisionAnalyzeTool());
   if (options.userQuestions) registry.register(createAskUserQuestionTool(options.userQuestions));
   registry.register(createTodoWriteTool());
+  if (!isChat) for (const tool of options.hostTools ?? []) registry.register(tool);
 
   const abortController = new AbortController();
   const modelSampler = options.modelSampler ?? createDefaultModelSampler();
@@ -830,6 +846,7 @@ export function createAgentRuntime(options: AgentOptions = {}) {
       fileMutationStore: options.fileMutationStore,
       sandbox: options.sandbox,
       hostMutationProtection: options.hostMutationProtection,
+      hostToolAdmission: options.hostToolAdmission ? async function admit(tool) { if (!options.hostTools?.includes(tool)) await options.hostToolAdmission!(tool.name); } : undefined,
       sessionId: options.sessionId,
       signal: abortController.signal,
       maxSteps: runtimeLimits.maxSteps,
@@ -840,6 +857,7 @@ export function createAgentRuntime(options: AgentOptions = {}) {
       clock: options.clock,
       approval: input.approval,
       reissueApproval: input.reissueApproval,
+      revalidateApproval: input.revalidateApproval,
       userQuestion: input.userQuestion,
       onSafeToolBatch: options.onSafeToolBatch ? async function persistUiBudget(checkpoint) { await options.onSafeToolBatch!(withUiBudget(checkpoint)); } : undefined,
       contextUsageProjection: options.contextUsageProjection,

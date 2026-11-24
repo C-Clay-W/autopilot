@@ -5,6 +5,7 @@
 
 import { useEffect, useState } from "react";
 import { listWorkspaceFiles } from "@autopilot-agent/core";
+import { resolveTrustedFileMentionRoot } from "../../file-mention-context.js";
 
 /** useFileMentionIndex 的返回契约；ready 为 false 时 @ 菜单不激活。 */
 export interface FileMentionIndex {
@@ -35,6 +36,14 @@ function buildMentionEntries(files: readonly string[]): string[] {
   });
 }
 
+/** 枚举前后核对受信根，防止其被重定向时把其他目录的文件名显示为候选。 */
+async function loadMentionEntries(workspaceRoot: string): Promise<string[]> {
+  const root = await resolveTrustedFileMentionRoot(workspaceRoot);
+  const { files } = await listWorkspaceFiles({ workspaceRoot: root });
+  await resolveTrustedFileMentionRoot(root);
+  return buildMentionEntries(files);
+}
+
 /** 挂载后预热 @ 文件索引；workspaceRoot 缺失或 Core 枚举失败时静默降级为空候选，不影响普通输入。 */
 export function useFileMentionIndex(workspaceRoot: string | undefined): FileMentionIndex {
   const [entries, setEntries] = useState<string[]>(function readCachedEntries() {
@@ -47,10 +56,7 @@ export function useFileMentionIndex(workspaceRoot: string | undefined): FileMent
   useEffect(function preloadMentionIndex() {
     if (!workspaceRoot || cachedMentionEntries !== undefined) return;
     if (!cachedMentionLoad) {
-      cachedMentionLoad = listWorkspaceFiles({ workspaceRoot })
-        .then(function collect(result) {
-          return buildMentionEntries(result.files);
-        })
+      cachedMentionLoad = loadMentionEntries(workspaceRoot)
         .catch(function degradeOnFailure() {
           return [];
         });

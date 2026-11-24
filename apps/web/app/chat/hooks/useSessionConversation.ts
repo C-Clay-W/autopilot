@@ -67,6 +67,8 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, active 
   const [loading, setLoading] = useState(false);
   const [streamingMessageId, setStreamingMessageId] = useState("");
   const [activeTurnId, setActiveTurnId] = useState("");
+  /** Chat 从最近一次持久 History 的同一 Turn 和 seq 续接观察。 */
+  const [chatObservation, setChatObservation] = useState<{ turnId: string; cursor: number } | null>(null);
   const [sessionMeta, setSessionMeta] = useState<SessionMeta | null>(null);
   const [readOnlyReason, setReadOnlyReason] = useState<string | undefined>();
   const [historyReady, setHistoryReady] = useState(!sessionId);
@@ -96,6 +98,8 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, active 
   // eslint-disable-next-line react-hooks/refs -- 与 currentSessionIdRef 相同模式：每次渲染同步，供异步 History 回调读取最新归属。
   sessionMetaIdRef.current = sessionMeta?.id ?? null;
   const requestAbortRef = useRef<AbortController | null>(null);
+  /** Chat /messages 已在等待执行身份；Esc 在身份到达后再发确切的停止命令。 */
+  const chatStartPendingRef = useRef(false);
   /** 首次创建 Session 期间禁止 URL 变化触发的空 History 覆盖本地实时消息。 */
   const locallyCreatedSessionRef = useRef<string | null>(null);
   const pendingInputsRef = useRef<PendingAgentInput[]>([]);
@@ -268,6 +272,7 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, active 
     setContextUsage(undefined);
     setTurnUsage(undefined);
     if (!sid) {
+      setChatObservation(null);
       transportDisconnectedRef.current = false;
       setMessages([]);
       setPresentation(createPresentationState());
@@ -370,8 +375,10 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, active 
         : undefined;
       const mapped: Message[] = data.messages.map(function mapMessage(m) { return { ...mapHistoryMessage(m, agent, recoverableTurnId), ...(m.turnId === agent?.turnId && agent?.requestId ? { questionRequestId: agent.requestId } : {}) }; });
       const restoredPendingInputs = (data.pendingInputs as PendingAgentInput[] | undefined) ?? [];
-      const restoredTurnId = typeof data.turnId === "string" ? data.turnId : restoredPresentation.turnId;
-      const hasRestoredActiveTurn = Boolean(restoredActiveOperation && restoredTurnId && (!agent?.execution || agent.execution === "active"));
+      const restoredTurnId = isChat ? data.meta.activeTurnId : typeof data.turnId === "string" ? data.turnId : restoredPresentation.turnId;
+      const chatTurnRunning = isChat && data.meta.runtimeStatus === "running" && Boolean(restoredTurnId) && !data.readOnlyReason;
+      const hasRestoredActiveTurn = chatTurnRunning || Boolean(restoredActiveOperation && restoredTurnId && (!agent?.execution || agent.execution === "active"));
+      if (isChat) setChatObservation(chatTurnRunning ? { turnId: restoredTurnId!, cursor: restoredPresentation.lastSeqByTurn[restoredTurnId!] ?? 0 } : null);
       setPendingInputs(restoredPendingInputs);
       pendingInputsRef.current = restoredPendingInputs;
       joinedInputIdsRef.current = new Set(restoredPresentation.items.flatMap(function consumed(item) { return item.kind === "input_notice" && item.state !== "queued" ? [item.inputId] : []; }));
@@ -634,7 +641,7 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, active 
     activity, setActivity,
     loading, setLoading,
     streamingMessageId, setStreamingMessageId,
-    activeTurnId, setActiveTurnId,
+    activeTurnId, setActiveTurnId, chatObservation,
     sessionMeta, setSessionMeta,
     readOnlyReason, setReadOnlyReason,
     historyReady, setHistoryReady,
@@ -647,7 +654,7 @@ export function useSessionConversation({ workspaceId, sessionId, isChat, active 
     turnUsage, setTurnUsage,
     currentSessionIdRef,
     currentWorkspaceIdRef,
-    requestAbortRef,
+    requestAbortRef, chatStartPendingRef,
     locallyCreatedSessionRef,
     pendingInputsRef,
     joinedInputIdsRef,

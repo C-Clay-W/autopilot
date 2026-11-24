@@ -7,7 +7,25 @@
 import type { CredentialRef } from "../domain";
 
 /** 当前 Core 明确支持的 Provider wire 协议。 */
-export type ApiProtocol = "anthropic-messages" | "openai-chat-completions";
+export type ApiProtocol = "anthropic-messages" | "openai-chat-completions" | "openai-responses";
+
+/** 只由用户级受信配置声明的兼容预设。 */
+export type CompatibilityPreset = "openai" | "deepseek" | "generic";
+
+/** Responses 私有推理历史的有限回放策略。 */
+export interface OpenAiResponsesProtocolProfile {
+  apiProtocol: "openai-responses";
+  reasoningReplay: "none" | "encrypted" | "content";
+}
+
+/** 用户级模型能力覆盖；省略表示沿用目录或保守缺省。 */
+export interface ModelCapabilityDeclaration {
+  supportedReasoningEfforts?: readonly import("../domain/model-ref").ReasoningEffort[];
+  defaultReasoningEffort?: import("../domain/model-ref").ReasoningEffort;
+  inputModalities?: readonly ("text" | "image")[];
+  supportsToolCalls?: boolean;
+  maxOutputTokens?: number;
+}
 
 /** Anthropic Messages 的封闭兼容 profile。 */
 export interface AnthropicMessagesProtocolProfile {
@@ -23,7 +41,7 @@ export interface OpenAiChatCompletionsProtocolProfile {
 }
 
 /** 已冻结或已解析的协议兼容差异。 */
-export type ProtocolProfile = AnthropicMessagesProtocolProfile | OpenAiChatCompletionsProtocolProfile;
+export type ProtocolProfile = AnthropicMessagesProtocolProfile | OpenAiChatCompletionsProtocolProfile | OpenAiResponsesProtocolProfile;
 
 /** 受信 Host route catalog 的单条 Provider 配置。 */
 export interface ProviderRouteProfile {
@@ -33,12 +51,13 @@ export interface ProviderRouteProfile {
   baseUrl: string;
   credentialRef: CredentialRef;
   protocolProfile?: ProtocolProfile;
-  models: ReadonlyArray<{ id: string; protocolProfile?: ProtocolProfile; contextWindowTokens?: number }>;
+  compatibilityPreset?: CompatibilityPreset;
+  models: ReadonlyArray<{ id: string; protocolProfile?: ProtocolProfile; contextWindowTokens?: number; capabilities?: ModelCapabilityDeclaration }>;
 }
 
 /** 判断值是否为已支持的明确协议。 */
 export function isApiProtocol(value: unknown): value is ApiProtocol {
-  return value === "anthropic-messages" || value === "openai-chat-completions";
+  return value === "anthropic-messages" || value === "openai-chat-completions" || value === "openai-responses";
 }
 
 /** 判断 profile 是否与已冻结协议严格匹配。 */
@@ -47,6 +66,10 @@ export function isProtocolProfileForApiProtocol(profile: unknown, apiProtocol: A
   const value = profile as Record<string, unknown>;
   if (apiProtocol === "anthropic-messages") {
     return hasExactKeys(value, ["apiProtocol"]) && value.apiProtocol === apiProtocol;
+  }
+  if (apiProtocol === "openai-responses") {
+    return hasExactKeys(value, ["apiProtocol", "reasoningReplay"]) && value.apiProtocol === apiProtocol
+      && (value.reasoningReplay === "none" || value.reasoningReplay === "encrypted" || value.reasoningReplay === "content");
   }
   return hasExactKeys(value, ["apiProtocol", "assistantToolCallContent", "supportsReasoningContent", "supportsUsageInStreaming"])
     && value.apiProtocol === apiProtocol

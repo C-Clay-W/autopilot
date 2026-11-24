@@ -39,6 +39,8 @@ export type { CreateDatabaseSearchCapabilityOptions, DatabaseAggregationKeyword,
 
 // ── Runtime 公开 Facade（Phase 2 / Phase 3）───────────
 export { createAgentRuntime } from "./runtime/public";
+export { projectRuntimeFact } from "./runtime/application/runtime-facts";
+export type { RuntimeFact, RuntimeFactSnapshot, RuntimeFacts } from "./runtime/application/runtime-facts";
 export { normalizeWorkImage } from "./internal/lib/image-normalization";
 export { getAgentProviderFailureMessage, sanitizeAgentProviderFailureReason, sanitizeAgentProviderFailureDetail } from "./runtime/provider/provider-failure-guidance";
 export { normalizeLegacyProviderFailureReason } from "./runtime/provider/provider-failure-normalization";
@@ -147,6 +149,7 @@ export type {
   McpCapability,
   McpServerConfig,
   WebCapability,
+  WebFetchBlockReason,
   WebFetchCapability,
   WebFetchCapabilityErrorCode,
   WebFetchResult,
@@ -285,6 +288,8 @@ export {
   createFirstPartyModelSampler,
   listModelCapabilities,
   getModelCapability,
+  resolveRouteModelCapability,
+  resolveRouteProtocolProfile,
   createVisionAnalyzer,
   resolveFirstPartyModelSampleOptions,
   resolveModelSampleOptions,
@@ -775,3 +780,9 @@ export type { ThreadDeliveryHostContext, ThreadDeliveryService, ThreadStartDeliv
 // 所有宿主共用的只读执行/交互安全投影，不进行状态恢复或工具重放。
 export { readTurnExecutionView } from "./runtime/application/turn/turn-execution-view";
 export type { TurnExecutionView } from "./runtime/application/turn/turn-execution-view";
+
+// Desktop 浏览器能力只暴露宿主中立契约。
+export type { BrowserCapability, BrowserBinding, BrowserOperation, BrowserRequestAuthorization } from "./runtime/protocol/browser-capability";
+export { isPublicBrowserRead, isPublicBrowserUrl, parseBrowserOperation } from "./runtime/protocol/browser-operation";
+// 受信Node宿主复用固定单文件服务脚本，调用者负责文件授权和生命周期。
+export { STATIC_PREVIEW_SCRIPT } from "./internal/tools/builtins/static-preview";

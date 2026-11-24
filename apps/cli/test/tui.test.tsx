@@ -1,9 +1,15 @@
 /** Ink TUI Step 5.4 契约测试：stdin 只驱动 Action，Static 与安全事件不重复。 */
 
+import { TuiInlineOutputOwner } from "../src/tui/inline-output.js";
+import { EventEmitter } from "node:events";
+import { Box } from "ink";
 import { render } from "ink-testing-library";
 import { describe, expect, it, vi } from "vitest";
 import { CliTuiApp, createCliTuiStore, parseTuiControlAction, resolveTuiDeleteDirection } from "../src/tui.js";
 import { createInitialCliProjection } from "../src/event-projector.js";
+import { TUI_MANAGED_FULL_ACCESS_SGR, TUI_MANAGED_MODEL_ACCENT_SGR } from "../src/design-tokens.js";
+import { TuiManagedTerminalStyles } from "../src/tui/render-mode.js";
+import { TuiStatusLine } from "../src/tui/status-line.js";
 import type { CliController, CliControllerResult } from "../src/controller.js";
 import type { CliAction, CliProjection, CliPublicEvent } from "../src/types.js";
 
@@ -96,7 +102,7 @@ function createApprovalProjection(): CliProjection {
 }
 
 /** 渲染 TUI 测试组件并把 Controller 结果同步回 Store。 */
-function renderTui(controller: CliController, store = createCliTuiStore()): { stdin: { write(value: string): void }; unmount: () => void; lastFrame: () => string | undefined; calls: CliAction[]; results: CliControllerResult[]; exits: number[]; interrupts: number; cancels: number; store: ReturnType<typeof createCliTuiStore> } {
+function renderTui(controller: CliController, store = createCliTuiStore(), terminalSizeSource?: EventEmitter & { columns: number; rows: number }): { stdin: { write(value: string): void }; unmount: () => void; lastFrame: () => string | undefined; calls: CliAction[]; results: CliControllerResult[]; exits: number[]; interrupts: number; cancels: number; store: ReturnType<typeof createCliTuiStore> } {
   const calls: CliAction[] = [];
   const results: CliControllerResult[] = [];
   const exits: number[] = [];
@@ -108,6 +114,7 @@ function renderTui(controller: CliController, store = createCliTuiStore()): { st
   const result = render(
     <CliTuiApp
       store={store}
+      terminalSizeSource={terminalSizeSource}
       controller={controller}
       closeWhenIdle={false}
       useColor={false}
@@ -188,6 +195,113 @@ describe("Ink TUI", function inkTuiSuite() {
     }
   });
 
+  it("active inline prompt stays live across split resize and approval resume before archiving once", async function activePromptReflow() {
+    const controller = createController([]);
+    const store = createCliTuiStore();
+    const size = Object.assign(new EventEmitter(), { columns: 100, rows: 30 });
+    const rendered = renderTui(controller, store, size);
+    store.recordPrompt("first prompt 原始文字");
+    store.syncProjection({ ...createInitialCliProjection(), status: "running", turnId: "turn-live" });
+    await vi.waitFor(function live() { expect(rendered.lastFrame()).toContain("first prompt 原始文字"); });
+    // Static输出会被Ink移出lastFrame；活动文字必须在后续重绘中仍存在。
+    for (const status of ["waiting_approval", "running", "interrupted_recoverable", "running"] as const) {
+      size.columns = size.columns === 100 ? 40 : 100; size.emit("resize");
+      store.syncProjection({ ...createInitialCliProjection(), status, turnId: "turn-live" });
+      await new Promise(function frame(resolve) { setTimeout(resolve, 30); });
+      expect((rendered.lastFrame() ?? "").match(/first prompt 原始文字/g)).toHaveLength(1);
+    }
+    store.syncProjection({ ...createInitialCliProjection(), status: "completed", turnId: "turn-live" });
+    await new Promise(function frame(resolve) { setTimeout(resolve, 30); });
+    store.recordPrompt("next prompt retains wording");
+    await new Promise(function frame(resolve) { setTimeout(resolve, 30); });
+    store.syncProjection({ ...createInitialCliProjection(), status: "running", turnId: "turn-next" });
+    await new Promise(function frame(resolve) { setTimeout(resolve, 30); });
+    expect((rendered.lastFrame() ?? "").match(/next prompt retains wording/g)).toHaveLength(1);
+    rendered.unmount();
+  });
+
+  it("inline session switching restores only the selected active prompt", async function sessionSwitch() {
+    const controller = createController([]);
+    const first = createCliTuiStore(); const second = createCliTuiStore();
+    first.recordPrompt("session one prompt"); second.recordPrompt("session two prompt");
+    first.syncProjection({ ...createInitialCliProjection(), status: "running", turnId: "one" });
+    second.syncProjection({ ...createInitialCliProjection(), status: "running", turnId: "two" });
+    /** 相同Static所有者内按真实session key重挂载选中会话，并切换列宽。 */
+    function view(store: ReturnType<typeof createCliTuiStore>, columns: number) {
+      return <TuiInlineOutputOwner><CliTuiApp key={store === first ? "one" : "two"} store={store} controller={controller} inlineOutputKey={store === first ? "one" : "two"} closeWhenIdle={false} useColor={false} screenReader availableColumns={columns} onResult={function result() {}} onRequestInterrupt={function interrupt() {}} onRequestCancel={function cancel() {}} onEof={function eof() {}} onAppExit={function exit() {}} /></TuiInlineOutputOwner>;
+    }
+    const rendered = render(view(first, 80));
+    await vi.waitFor(function selected() { expect((rendered.lastFrame() ?? "").match(/session one prompt/g)).toHaveLength(1); });
+    rendered.rerender(view(second, 40));
+    await vi.waitFor(function selected() { expect((rendered.lastFrame() ?? "").match(/session two prompt/g)).toHaveLength(1); });
+    expect(rendered.lastFrame()).not.toContain("session one prompt");
+    rendered.rerender(view(first, 80));
+    await vi.waitFor(function restored() { expect((rendered.lastFrame() ?? "").match(/session one prompt/g)).toHaveLength(1); });
+    expect(rendered.lastFrame()).not.toContain("session two prompt");
+    rendered.unmount();
+  });
+
+  it.each(["interrupted", "interrupted_recoverable"] as const)("Esc %s 后编辑重发时原 prompt 位于原轮终态前且只归档一次", async function archivesInterruptedPrompt(status) {
+    const store = createCliTuiStore();
+    const controller = createController([]);
+    let turnNumber = 0;
+    let projection = createInitialCliProjection();
+    controller.dispatch = async function dispatch(action) {
+      if (action.type === "submit_prompt") {
+        turnNumber += 1;
+        projection = { ...createInitialCliProjection(), turnId: `turn-${turnNumber}`, status: "running" };
+        store.acceptEvent({ type: "turn_started", seq: 1, turnId: projection.turnId!, stepCount: 0 }, projection);
+      }
+      return { kind: "ok", exitCode: 0, lines: [], projection };
+    };
+    const view = renderTui(controller, store);
+    try {
+      view.stdin.write("原消息"); view.stdin.write("\r");
+      await vi.waitFor(function started() { expect(store.getSnapshot().status).toBe("running"); });
+      view.stdin.write("\u001b");
+      await vi.waitFor(function restored() { expect(view.lastFrame()).toContain("› 原消息"); });
+      store.setCancellationRequested(true);
+      projection = { ...projection, status };
+      store.acceptEvent({ type: "status", seq: 2, turnId: "turn-1", status }, projection);
+      await vi.waitFor(function stopped() { expect(view.lastFrame()).toContain("Cogitated for"); });
+      const stopped = view.lastFrame() ?? "";
+      expect(stopped.indexOf("原消息")).toBeLessThan(stopped.indexOf("Cogitated for"));
+
+      view.stdin.write("修订"); view.stdin.write("\r");
+      await vi.waitFor(function resent() { expect(turnNumber).toBe(2); });
+      projection = { ...projection, status: "completed" };
+      store.acceptEvent({ type: "answer_delta", seq: 2, turnId: "turn-2", delta: "第二轮回答" }, { ...projection, status: "running" });
+      store.acceptEvent({ type: "status", seq: 3, turnId: "turn-2", status: "completed" }, projection);
+      await vi.waitFor(function completed() { expect(view.lastFrame()).toContain("第二轮回答"); });
+      const frame = view.lastFrame() ?? "";
+      const lines = frame.split("\n").map(function trim(line) { return line.trim(); });
+      expect(lines.filter(function original(line) { return line === "原消息"; })).toHaveLength(1);
+      expect(lines.filter(function revised(line) { return line === "原消息修订"; })).toHaveLength(1);
+      expect(frame.indexOf("原消息")).toBeLessThan(frame.indexOf("Cogitated for"));
+      expect(frame.indexOf("Cogitated for")).toBeLessThan(frame.indexOf("原消息修订"));
+      expect(frame.indexOf("原消息修订")).toBeLessThan(frame.indexOf("第二轮回答"));
+    } finally { view.unmount(); }
+  });
+
+  it("中断后恢复同轮不会把已归档 prompt 再放回动态区", async function resumesArchivedPromptOnce() {
+    const store = createCliTuiStore();
+    const view = renderTui(createController([]), store);
+    const running = { ...createInitialCliProjection(), turnId: "resume-turn", status: "running" as const };
+    try {
+      store.recordPrompt("恢复轮原消息");
+      store.acceptEvent({ type: "turn_started", seq: 1, turnId: "resume-turn", stepCount: 0 }, running);
+      store.acceptEvent({ type: "status", seq: 2, turnId: "resume-turn", status: "interrupted_recoverable" }, { ...running, status: "interrupted_recoverable" });
+      await vi.waitFor(function archived() { expect(view.lastFrame()).toContain("Cogitated for"); });
+      store.acceptEvent({ type: "turn_started", seq: 3, turnId: "resume-turn", stepCount: 1 }, running);
+      store.acceptEvent({ type: "answer_delta", seq: 4, turnId: "resume-turn", delta: "恢复后回答" }, running);
+      await vi.waitFor(function resumed() { expect(view.lastFrame()).toContain("恢复后回答"); });
+      expect((view.lastFrame() ?? "").match(/恢复轮原消息/g)).toHaveLength(1);
+      store.acceptEvent({ type: "status", seq: 5, turnId: "resume-turn", status: "completed" }, { ...running, status: "completed" });
+      await vi.waitFor(function completed() { expect(store.getSnapshot().status).toBe("completed"); });
+      expect((view.lastFrame() ?? "").match(/恢复轮原消息/g)).toHaveLength(1);
+    } finally { view.unmount(); }
+  });
+
   it("stdin prompt dispatches submit_prompt and aggregates completed turn once", async function dispatchesPrompt() {
     const calls: CliAction[] = [];
     const controller = createController(calls);
@@ -242,9 +356,54 @@ describe("Ink TUI", function inkTuiSuite() {
     expect(frame).toContain("然后执行测试");
     expect(frame).toContain("[引导] 等待当前步骤结束");
     expect(frame).toContain("[排队] 等待当前步骤结束");
-    expect(frame).toContain("Esc interrupt");
-    expect(frame).toContain("Enter 引导");
+    expect(frame).toContain("Working · screen reader · Esc interrupt");
+    expect(frame).not.toContain("Enter 引导");
+    expect(frame).not.toContain("/queue <prompt> 排队");
     rendered.unmount();
+  });
+
+  it("状态栏精简当前配置并仅在受管终端局部强调模型", function rendersCompactStatusLine() {
+    const statusView = { model: "openai/fixture\u001b[31m-model\u001b[39m", effort: "medium" as const, permissionMode: "ask" as const, source: "runtime_default" as const, workspaceRoot: "fixture", nextModel: "openai/next", turnUsage: { turnId: "turn-1", inputTokens: 123, outputTokens: 6, totalTokens: 129, elapsedMs: 0 } };
+    const snapshot = { ...createCliTuiStore().getSnapshot(), status: "running" as const };
+    const view = render(<TuiManagedTerminalStyles.Provider value><TuiStatusLine snapshot={snapshot} statusView={statusView} useColor={false} screenReader={false} /></TuiManagedTerminalStyles.Provider>);
+    const frame = view.lastFrame() ?? "";
+    expect(frame).toContain("Working · Esc interrupt\n");
+    expect(frame).toContain(`${TUI_MANAGED_MODEL_ACCENT_SGR}openai/fixture-model\u001b[39m · medium · 询问 (ask)`);
+    expect(frame).not.toContain("\u001b[31m");
+    expect(frame).not.toContain("tokens:");
+    expect(frame).toContain("workspace: fixture · context: unknown");
+    expect(frame).toContain("next model: openai/next");
+    view.unmount();
+
+    const fullyAuthorized = render(<TuiManagedTerminalStyles.Provider value><TuiStatusLine snapshot={snapshot} statusView={{ ...statusView, permissionMode: "full_access" }} useColor={false} screenReader={false} /></TuiManagedTerminalStyles.Provider>);
+    expect(fullyAuthorized.lastFrame()).toContain(`${TUI_MANAGED_FULL_ACCESS_SGR}完全访问 (full_access)\u001b[39m`);
+    fullyAuthorized.unmount();
+
+    const plain = render(<TuiStatusLine snapshot={snapshot} statusView={statusView} useColor={false} screenReader={false} escapeClosesPanel />);
+    expect(plain.lastFrame()).toContain("Working · Esc关闭侧栏 · Ctrl+T选择会话");
+    expect(plain.lastFrame()).not.toContain("Esc interrupt");
+    expect(plain.lastFrame()).not.toContain("\u001b[");
+    expect(plain.lastFrame()).toContain("workspace: fixture · context: unknown");
+    plain.unmount();
+
+    const reader = render(<TuiManagedTerminalStyles.Provider value><TuiStatusLine snapshot={{ ...snapshot, cancellationRequested: true }} statusView={statusView} useColor={false} screenReader /></TuiManagedTerminalStyles.Provider>);
+    expect(reader.lastFrame()).toContain("Stopping · press Ctrl+C again to exit");
+    expect(reader.lastFrame()).not.toContain("Esc interrupt");
+    expect(reader.lastFrame()).not.toContain(TUI_MANAGED_MODEL_ACCENT_SGR);
+    expect(reader.lastFrame()).toContain("workspace: fixture · context: unknown");
+    reader.unmount();
+  });
+
+  it("窄状态栏先缩短工作区路径并保留 Context，读屏模式保留原路径", function rendersNarrowStatusLine() {
+    const snapshot = createCliTuiStore().getSnapshot();
+    const statusView = { model: "fixture", effort: "medium" as const, permissionMode: "ask" as const, source: "runtime_default" as const, workspaceRoot: "E:/重复目录/重复目录/重复目录/重复目录/end" };
+    const narrow = render(<Box width={45}><TuiStatusLine snapshot={snapshot} statusView={statusView} useColor={false} screenReader={false} /></Box>);
+    expect(narrow.lastFrame()).toMatch(/workspace: [^\n]*…[^\n]* · context: unknown/u);
+    expect(narrow.lastFrame()).not.toContain(statusView.workspaceRoot);
+    narrow.unmount();
+    const reader = render(<TuiStatusLine snapshot={snapshot} statusView={statusView} useColor={false} screenReader />);
+    expect(reader.lastFrame()).toContain(`workspace: ${statusView.workspaceRoot} · context: unknown`);
+    reader.unmount();
   });
 
   it("input_consumed 清除等待态并保留唯一普通用户正文", function settlesPendingPromptOnce() {

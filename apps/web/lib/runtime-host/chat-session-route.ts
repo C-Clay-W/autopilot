@@ -11,7 +11,11 @@ import { getSessionMessages } from "../session-store";
 import { persistUserMessage } from "./web-message-projection";
 import { replayWebPresentation } from "./web-presentation-adapter";
 import { createRuntimeAgentStream } from "./web-agent-stream";
-import { cancelActiveTurn, tryAcquireQueueStartLock } from "../agent-turn-store";
+import { cancelActiveTurn, hasActiveTurn, tryAcquireQueueStartLock } from "../agent-turn-store";
+import { createWebTurnStream } from "../workspace-host/web-turn-stream";
+import { isTerminalTurnEvent } from "../workspace-host/web-turn-host";
+
+const SSE_HEADERS = { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" };
 
 const CHAT_HTTP_FAILURES = {
   INVALID_CHAT_REQUEST: { status: 400, message: "Chat 请求无效" },
@@ -65,12 +69,13 @@ export async function runChatSessionRoute(request: Request, segments: string[] =
   const [sessionId, operation, attachmentRef] = segments;
   const shape = !segments.length ? "collection"
     : segments.length === 1 ? "session"
-      : segments.length === 2 && ["messages", "cancel", "attachments", "knowledge"].includes(operation) ? operation
+      : segments.length === 2 && ["messages", "cancel", "attachments", "knowledge", "stream", "turn-state"].includes(operation) ? operation
         : segments.length === 3 && operation === "attachments" && /^[A-Za-z0-9_-]{16,128}$/.test(attachmentRef) ? "attachment" : undefined;
-  const methods: Record<string, string[]> = { collection: ["GET", "POST"], session: ["GET", "DELETE"], messages: ["POST"], cancel: ["POST"], attachments: ["GET", "POST"], attachment: ["GET"], knowledge: ["POST"] };
+  const methods: Record<string, string[]> = { collection: ["GET", "POST"], session: ["GET", "DELETE"], messages: ["POST"], cancel: ["POST"], attachments: ["GET", "POST"], attachment: ["GET"], knowledge: ["POST"], stream: ["GET"], "turn-state": ["GET"] };
   if (!shape) return Response.json({ code: "CHAT_ROUTE_NOT_FOUND", error: "Chat 接口不存在" }, { status: 404 });
   if (!methods[shape].includes(request.method)) return Response.json({ code: "METHOD_NOT_ALLOWED", error: "请求方法不允许" }, { status: 405, headers: { Allow: methods[shape].join(", ") } });
-  if (new URL(request.url).search) return toChatErrorResponse(new WebRouteError("INVALID_CHAT_REQUEST"));
+  const url = new URL(request.url);
+  if (url.search && shape !== "stream" && shape !== "turn-state") return toChatErrorResponse(new WebRouteError("INVALID_CHAT_REQUEST"));
   try {
     // 创建请求先验字段校验，再启动宿主；客户端不能指定 Workspace 或能力对象。
     let retrievalMode: ChatRetrievalMode | undefined;
@@ -96,7 +101,30 @@ export async function runChatSessionRoute(request: Request, segments: string[] =
     if (host.storage.attachments.isSessionDeleting(sessionId)) throw new NodeChatError("CHAT_SESSION_DELETING");
     if (shape === "session") {
       const state = await host.runtime.turns.getState({ sessionId });
-      return Response.json({ meta: chatDto(session), messages: await getSessionMessages(host.runtime, sessionId), presentation: replayWebPresentation(state.events), attachments: session.chatRetrievalMode === "rag" ? [] : await host.storage.attachments.list(sessionId) });
+      const activeTurn = state.turn && hasActiveTurn(sessionId, state.turn.id) ? state.turn : undefined;
+      // 与观察流保持相同的终态写回屏障，避免快照游标跳过仍待投影的终态。
+      const events = activeTurn ? state.events.filter(function ready(event) { return event.turnId !== activeTurn.id || !isTerminalTurnEvent(event.event.type); }) : state.events;
+      const meta = activeTurn ? { ...chatDto(session), runtimeStatus: "running", activeTurnId: activeTurn.id } : chatDto(session);
+      return Response.json({ meta, messages: await getSessionMessages(host.runtime, sessionId), presentation: replayWebPresentation(events), attachments: session.chatRetrievalMode === "rag" ? [] : await host.storage.attachments.list(sessionId) });
+    }
+    if (shape === "stream" || shape === "turn-state") {
+      const turnId = url.searchParams.get("turnId") ?? "";
+      const rawCursor = url.searchParams.get("cursor");
+      const cursor = Number(rawCursor ?? "0");
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(turnId) || url.searchParams.getAll("turnId").length !== 1
+        || url.searchParams.getAll("cursor").length > 1 || !Number.isSafeInteger(cursor) || (rawCursor !== null && !/^\d+$/.test(rawCursor))
+        || [...url.searchParams.keys()].some(function unknown(key) { return key !== "turnId" && !(shape === "stream" && key === "cursor"); })) throw new WebRouteError("INVALID_CHAT_REQUEST");
+      const ports = host.storage.ports;
+      const turn = await ports.turnStore.get(turnId);
+      if (!turn || turn.sessionId !== sessionId) return toChatErrorResponse({ code: "TURN_NOT_FOUND" });
+      if (shape === "turn-state") {
+        const checkpoint = await ports.checkpointStore.getByTurn(sessionId, turnId);
+        const terminal = ["interrupted", "completed", "failed", "limit_reached"].includes(turn.status);
+        const inactive = checkpoint && !["running", "awaiting_approval", "awaiting_user_input"].includes(checkpoint.status);
+        return Response.json({ turnId, status: turn.status, cancellation: terminal && inactive && !hasActiveTurn(sessionId, turnId) ? "confirmed" : "pending" });
+      }
+      const stream = createWebTurnStream({ ports, sessionId, turnId, cursor, signal: AbortSignal.any([request.signal, host.signal]), isExecutionActive: function active() { return hasActiveTurn(sessionId, turnId); } });
+      return new Response(stream, { headers: SSE_HEADERS });
     }
     if (shape === "knowledge") {
       if (session.chatRetrievalMode !== "rag") throw new NodeChatError("CHAT_UPLOAD_MODE_MISMATCH");
@@ -121,24 +149,26 @@ export async function runChatSessionRoute(request: Request, segments: string[] =
     if (shape === "cancel") {
       const body = await readBody(request, ["turnId"]);
       if (typeof body.turnId !== "string" || !/^[A-Za-z0-9_-]{1,128}$/.test(body.turnId)) throw new WebRouteError("INVALID_CHAT_REQUEST");
-      const state = await host.runtime.turns.getState({ sessionId, turnId: body.turnId });
-      if (!state.turn) throw new (loadCore().AgentRuntimeError)("TURN_NOT_FOUND", "任务不存在或不属于当前会话");
+      const turn = await host.storage.ports.turnStore.get(body.turnId);
+      if (turn ? turn.sessionId !== sessionId : !hasActiveTurn(sessionId, body.turnId)) return toChatErrorResponse({ code: "TURN_NOT_FOUND" });
       cancelActiveTurn(sessionId, body.turnId);
-      await host.runtime.turns.cancel({ sessionId, turnId: body.turnId });
+      if (turn) await host.runtime.turns.cancel({ sessionId, turnId: body.turnId });
       return Response.json({ ok: true });
     }
     const body = await readBody(request, ["content", "clientMessageId"]);
     if (typeof body.content !== "string" || !body.content.trim() || body.content.length > 100_000 || typeof body.clientMessageId !== "string" || !/^[A-Za-z0-9_-]{8,128}$/.test(body.clientMessageId)) throw new WebRouteError("INVALID_CHAT_REQUEST");
     const turnId = createHash("sha256").update(`${sessionId}:${body.clientMessageId}`).digest("hex");
+    const messageRecordId = `chat-message:${body.clientMessageId}`;
     const release = tryAcquireQueueStartLock(sessionId);
     if (!release) throw new WebRouteError("CHAT_SESSION_BUSY");
     try {
       const state = await host.runtime.turns.getState({ sessionId });
-      if ((await host.runtime.turns.getState({ sessionId, turnId })).turn) throw new WebRouteError("CHAT_MESSAGE_ALREADY_SUBMITTED");
+      // 用户消息先于 Turn 写入；即使宿主在两次写入间失败，同一个键也不能再追加正文。
+      if (await host.storage.ports.turnStore.get(turnId) || (await getSessionMessages(host.runtime, sessionId)).some(function alreadyAccepted(message) { return message.clientRecordId === messageRecordId; })) throw new WebRouteError("CHAT_MESSAGE_ALREADY_SUBMITTED");
       if (["running", "waiting_approval", "waiting_user_input"].includes(state.turn?.status ?? "")) throw new (loadCore().AgentRuntimeError)("TURN_ALREADY_RUNNING", "会话已有活动任务");
-      await persistUserMessage(host.runtime, sessionId, body.content.trim());
-      const stream = createRuntimeAgentStream({ sessionId, turnId, runtime: host.runtime, mode: "start", content: body.content.trim(), requestSignal: AbortSignal.any([request.signal, host.signal]), onSettled: release });
-      return new Response(stream, { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache, no-transform", Connection: "keep-alive" } });
+      await persistUserMessage(host.runtime, sessionId, body.content.trim(), undefined, messageRecordId);
+      const stream = createRuntimeAgentStream({ sessionId, turnId, runtime: host.runtime, mode: "start", content: body.content.trim(), requestSignal: host.signal, observerSignal: request.signal, onSettled: release });
+      return new Response(stream, { headers: { ...SSE_HEADERS, "X-Autopilot-Turn-Id": turnId } });
     } catch (error) { release(); throw error; }
   } catch (error) { return toChatErrorResponse(error); }
 }

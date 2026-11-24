@@ -25,7 +25,7 @@ function StopTaskIcon() {
 
 interface ChatComposerProps {
   pendingInputs: PendingAgentInput[];
-  cancelPendingInput: (inputId: string) => Promise<void>;
+  cancelPendingInput: (inputId: string) => Promise<boolean>;
   setInputDelivery: Dispatch<SetStateAction<"steer" | "queue">>;
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   inputRef: RefObject<string>;
@@ -81,7 +81,37 @@ interface ChatComposerProps {
   inputDelivery: "steer" | "queue";
 }
 
-/** 渲染输入区完整 UI；条件分支、事件回调与原页面保持一致。 */
+/** Work 等待输入由独立操作区渲染，服务端确认前保留原卡并禁用该次操作。 */
+function WorkPendingInputs({ pendingInputs, onAction }: { pendingInputs: PendingAgentInput[]; onAction: (pending: PendingAgentInput, action: "edit" | "switch" | "delete") => Promise<void> }) {
+  const actionRef = useRef<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  /** 同时只提交一次待处理操作，避免两个回填结果相互覆盖。 */
+  async function runAction(pending: PendingAgentInput, action: "edit" | "switch" | "delete"): Promise<void> {
+    if (actionRef.current) return;
+    actionRef.current = pending.inputId;
+    setBusy(true);
+    try { await onAction(pending, action); }
+    finally { actionRef.current = null; setBusy(false); }
+  }
+
+  return <div className="mb-3 border-2 border-ink bg-bg" aria-busy={busy}>
+    <div className="border-b-2 border-ink px-3 py-2 text-xs font-semibold">等待输入</div>
+    {pendingInputs.map(function input(pending, index) {
+      return <div key={pending.inputId} className="flex items-center gap-2 border-b border-ink px-3 py-2 text-xs last:border-b-0">
+        <span className="font-semibold">{index + 1}</span>
+        <span className="border border-ink px-1.5 py-0.5">{pending.delivery === "steer" ? "引导" : "排队"}</span>
+        <span className="min-w-0 flex-1 truncate">{pending.delivery === "queue" ? pending.content : "已投递到当前任务"}</span>
+        <span className="text-muted">附件 {pending.attachmentCount} · Skill {pending.skillCount}</span>
+        <button type="button" disabled={busy} onClick={function edit() { void runAction(pending, "edit"); }} className="border border-ink px-1.5 py-0.5 hover:bg-ink hover:text-ink-on-dark disabled:opacity-50">编辑</button>
+        <button type="button" disabled={busy} onClick={function switchDelivery() { void runAction(pending, "switch"); }} className="border border-ink px-1.5 py-0.5 hover:bg-ink hover:text-ink-on-dark disabled:opacity-50">切换</button>
+        <button type="button" disabled={busy} onClick={function remove() { void runAction(pending, "delete"); }} className="border border-ink px-1.5 py-0.5 hover:bg-accent hover:text-ink-on-dark disabled:opacity-50">删除</button>
+      </div>;
+    })}
+  </div>;
+}
+
+/** 渲染共享输入框，以及 Chat 附件和 Work 工具入口。 */
 export default function ChatComposer({ pendingInputs, cancelPendingInput, setInputDelivery, textareaRef, inputRef, inputActionsRef, inputDeliveryNotice, readOnlyReason, isChat, loading, submissionActivity, currentRetrieval, requestAbortRef, chatAttachments, sessionId, selectedFiles, setSelectedFiles, onOpenWorkspacePicker, workspace, setSkillPickerOpen, selectedSkills, getSkillDisplayName, toggleSelectedSkill, togglePinnedSkill, showSources, setShowSources, showProcess, setShowProcess, databaseEnabled, setDatabaseEnabled, permissionMode, setPermissionMode, onRetrievalChange, hasWorkspace, fileInputRef, handleFileSelect, handleDragEnter, handleDragOver, handleDragLeave, handleDrop, pendingUserQuestion, canWrite, handleKeyDown, activeTurnId, handleSend, handleContinueTurn, resumableMessageId, stopping, cancelCurrentTurn, databaseSyncMessage, databaseSyncing, databaseSyncElapsedSeconds, inputDelivery }: ChatComposerProps) {
   const [input, setInputState] = useState("");
   const [previews, setPreviews] = useState<Array<{ url: string; alt: string; file: File }>>([]);
@@ -136,6 +166,17 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
     };
   }, [inputActionsRef, updateInput]);
 
+  /** 只有取消确认后才回填，并保留等待确认期间新输入的草稿。 */
+  async function changeWorkPendingInput(pending: PendingAgentInput, action: "edit" | "switch" | "delete"): Promise<void> {
+    const draftAtClick = inputRef.current;
+    if (!(await cancelPendingInput(pending.inputId)) || action === "delete") return;
+    if (!textareaRef.current?.isConnected) return;
+    const draft = inputRef.current;
+    updateInput(draft && draft !== draftAtClick ? `${pending.content}\n${draft}` : pending.content);
+    setInputDelivery(action === "edit" ? pending.delivery : pending.delivery === "steer" ? "queue" : "steer");
+    if (!textareaRef.current.closest("[hidden]")) textareaRef.current.focus();
+  }
+
   return (
     <div
       className="border-[3px] border-ink bg-card"
@@ -145,22 +186,7 @@ export default function ChatComposer({ pendingInputs, cancelPendingInput, setInp
       onDrop={handleDrop}
     >
       <div className="max-w-3xl mx-auto p-3">
-        {pendingInputs.length > 0 && (
-          <div className="mb-3 border-2 border-ink bg-bg">
-            <div className="border-b-2 border-ink px-3 py-2 text-xs font-semibold">等待输入</div>
-            {pendingInputs.map((pending, index) => (
-              <div key={pending.inputId} className="flex items-center gap-2 border-b border-ink px-3 py-2 text-xs last:border-b-0">
-                <span className="font-semibold">{index + 1}</span>
-                <span className="border border-ink px-1.5 py-0.5">{pending.delivery === "steer" ? "引导" : "排队"}</span>
-                <span className="min-w-0 flex-1 truncate">{pending.delivery === "queue" ? pending.content : "已投递到当前任务"}</span>
-                <span className="text-muted">附件 {pending.attachmentCount} · Skill {pending.skillCount}</span>
-                <button type="button" onClick={() => { updateInput(pending.content); setInputDelivery(pending.delivery); void cancelPendingInput(pending.inputId); textareaRef.current?.focus(); }} className="border border-ink px-1.5 py-0.5 hover:bg-ink hover:text-ink-on-dark">编辑</button>
-                <button type="button" onClick={() => { updateInput(pending.content); setInputDelivery(pending.delivery === "steer" ? "queue" : "steer"); void cancelPendingInput(pending.inputId); textareaRef.current?.focus(); }} className="border border-ink px-1.5 py-0.5 hover:bg-ink hover:text-ink-on-dark">切换</button>
-                <button type="button" onClick={() => void cancelPendingInput(pending.inputId)} className="border border-ink px-1.5 py-0.5 hover:bg-accent hover:text-ink-on-dark">删除</button>
-              </div>
-            ))}
-          </div>
-        )}
+        {!isChat && pendingInputs.length > 0 && <WorkPendingInputs pendingInputs={pendingInputs} onAction={changeWorkPendingInput} />}
         {inputDeliveryNotice && (
           <div className="mb-3 border-2 border-ink bg-ink/10 px-3 py-2 text-xs" role="status" aria-live="polite">
             <div className="flex items-center gap-2 font-semibold">

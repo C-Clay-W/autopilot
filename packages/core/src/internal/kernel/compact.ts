@@ -24,7 +24,7 @@ export function serializeCanonicalMessagesForSignature(messages: AgentMessage[])
 
 /** 对 canonical 内容做保守 token 粗估；实际 usage 仍以 Provider 响应为准。 */
 export function estimateMessageTokens(messages: AgentMessage[]): number {
-  const text = serializeCanonicalMessagesForSignature(messages);
+  const text = serializeCanonicalMessagesForSignature(messages) + messages.map(function replaySize(message) { return message.adapterReplayState?.apiProtocol === "openai-responses" ? JSON.stringify(message.adapterReplayState.value) : ""; }).join("");
   let cjk = 0;
   let other = 0;
   for (const character of text) {

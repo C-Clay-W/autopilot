@@ -1,6 +1,6 @@
 {
   "name": "autopilot-agent-monorepo",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "packageManager": "npm@10.8.2",
   "workspaces": [
@@ -8,6 +8,9 @@
     "packages/*"
   ],
   "scripts": {
+    "desktop": "turbo run build --filter=\"@autopilot-agent/desktop^...\" && npm run start --workspace=@autopilot-agent/desktop",
+    "desktop:package": "turbo run build --filter=@autopilot-agent/desktop",
+    "desktop:make": "turbo run build --filter=\"@autopilot-agent/desktop^...\" && npm run make --workspace=@autopilot-agent/desktop --",
     "check:npm-pack": "node scripts/check-npm-pack.mjs",
     "dev": "turbo dev",
     "build": "turbo build",

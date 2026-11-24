@@ -1,25 +1,12 @@
 /** Web 设置服务：校验两类表单 DTO，并把原子读写委托给 Node 用户设置服务。 */
 import os from "node:os";
-import { createNodeUserSettingsService } from "@autopilot-agent/adapters";
+import { createNodeUserSettingsService, type MainSettingsCategoryInput, type MainModelCapabilitiesInput } from "@autopilot-agent/adapters";
 
 export type RagRole = "textRerank" | "visionRerank" | "textEmbedding" | "multimodalEmbedding";
 
-/** 主模型表单只暴露 Anthropic Messages 连接与已支持的 CC 高级字段。 */
-export interface MainSettingsInput {
+/** 主模型表单显式选择协议与兼容预设，不暴露内部路由或凭据引用。 */
+export interface MainSettingsInput extends MainSettingsCategoryInput {
   provider: "deepseek" | "custom";
-  baseUrl: string;
-  model: string;
-  apiKey?: string;
-  availableModels?: string[];
-  opusModel?: string;
-  sonnetModel?: string;
-  haikuModel?: string;
-  subagentModel?: string;
-  effort?: "auto" | "low" | "medium" | "high" | "max";
-  maxOutputTokens?: number;
-  compactWindow?: number;
-  timeoutMs?: number;
-  alwaysThinkingEnabled?: boolean;
 }
 
 /** Search 表单保存完整搜索连接，Key 留空时由服务端判定能否保留。 */
@@ -97,17 +84,19 @@ function parseBaseUrl(value: unknown): string | undefined {
   }
 }
 
-/** 校验主模型分类，供应商只决定 UI 预设，Runtime 始终走 Anthropic Messages。 */
+/** 校验主模型协议和预设；模型具体能力由 Adapter 复用 Core 解析。 */
 function parseMain(value: unknown): MainSettingsInput {
-  if (!isRecord(value) || Object.keys(value).some(function unknown(key) { return !["provider", "baseUrl", "model", "apiKey", "availableModels", "opusModel", "sonnetModel", "haikuModel", "subagentModel", "effort", "maxOutputTokens", "compactWindow", "timeoutMs", "alwaysThinkingEnabled"].includes(key); })) throw new CredentialSettingsError("INVALID_SETTINGS_INPUT");
+  if (!isRecord(value) || Object.keys(value).some(function unknown(key) { return !["provider", "apiProtocol", "compatibilityPreset", "baseUrl", "model", "apiKey", "availableModels", "opusModel", "sonnetModel", "haikuModel", "subagentModel", "effort", "maxOutputTokens", "compactWindow", "timeoutMs", "alwaysThinkingEnabled"].includes(key); })) throw new CredentialSettingsError("INVALID_SETTINGS_INPUT");
+  const connection = parseMainModelCapabilitiesInput({ apiProtocol: value.apiProtocol, compatibilityPreset: value.compatibilityPreset, baseUrl: value.baseUrl, model: value.model });
   const provider = value.provider === "deepseek" || value.provider === "custom" ? value.provider : undefined;
   const baseUrl = parseBaseUrl(value.baseUrl);
   const model = parseShortString(value.model);
   const apiKey = parseApiKey(value.apiKey);
   const availableModels = Array.isArray(value.availableModels) ? value.availableModels.map(function modelId(item) { return parseShortString(item); }) : undefined;
-  if (!provider || !baseUrl || !model || (provider === "deepseek" && baseUrl !== "https://api.deepseek.com/anthropic") || (provider === "custom" && baseUrl === "https://api.deepseek.com/anthropic") || (value.apiKey !== undefined && value.apiKey !== "" && !apiKey)
+  if (!provider || !baseUrl || !model || (connection.apiProtocol === "anthropic-messages" && ((provider === "deepseek" && baseUrl !== "https://api.deepseek.com/anthropic") || (provider === "custom" && baseUrl === "https://api.deepseek.com/anthropic"))) || (value.apiKey !== undefined && value.apiKey !== "" && !apiKey)
+    || (value.availableModels !== undefined && !Array.isArray(value.availableModels))
     || (availableModels && (availableModels.length === 0 || availableModels.some(function missing(item) { return !item; }) || new Set(availableModels).size !== availableModels.length))
-    || (value.effort !== undefined && !["auto", "low", "medium", "high", "max"].includes(String(value.effort)))
+    || (value.effort !== undefined && !["auto", "none", "low", "medium", "high", "xhigh", "max"].includes(String(value.effort)))
     || (value.maxOutputTokens !== undefined && (!Number.isInteger(value.maxOutputTokens) || Number(value.maxOutputTokens) < 1 || Number(value.maxOutputTokens) > 1_000_000))
     || (value.compactWindow !== undefined && (!Number.isInteger(value.compactWindow) || Number(value.compactWindow) < 1 || Number(value.compactWindow) > 10_000_000))
     || (value.timeoutMs !== undefined && (!Number.isInteger(value.timeoutMs) || Number(value.timeoutMs) < 1_000 || Number(value.timeoutMs) > 600_000))
@@ -115,7 +104,19 @@ function parseMain(value: unknown): MainSettingsInput {
   for (const key of ["opusModel", "sonnetModel", "haikuModel", "subagentModel"]) {
     if (value[key] !== undefined && !parseShortString(value[key])) throw new CredentialSettingsError("INVALID_SETTINGS_INPUT");
   }
-  return { ...value, provider, baseUrl, model, ...(apiKey ? { apiKey } : {}), ...(availableModels ? { availableModels: availableModels as string[] } : {}) } as MainSettingsInput;
+  return { ...value, ...connection, provider, baseUrl, model, ...(apiKey ? { apiKey } : {}), ...(availableModels ? { availableModels: availableModels as string[] } : {}) } as MainSettingsInput;
+}
+
+/** 只允许能力预览所需的短连接字段，拒绝凭据、路径与能力覆盖注入。 */
+export function parseMainModelCapabilitiesInput(value: unknown): MainModelCapabilitiesInput {
+  if (!isRecord(value) || Object.keys(value).some(function unknown(key) { return !["apiProtocol", "compatibilityPreset", "baseUrl", "model"].includes(key); })) throw new CredentialSettingsError("INVALID_SETTINGS_INPUT");
+  const apiProtocol = value.apiProtocol ?? "anthropic-messages";
+  const baseUrl = parseBaseUrl(value.baseUrl);
+  const model = parseShortString(value.model);
+  const compatibilityPreset = value.compatibilityPreset;
+  if (!baseUrl || !model || !["anthropic-messages", "openai-chat-completions", "openai-responses"].includes(String(apiProtocol))
+    || (compatibilityPreset !== undefined && (apiProtocol === "anthropic-messages" || !["openai", "deepseek", "generic"].includes(String(compatibilityPreset))))) throw new CredentialSettingsError("INVALID_SETTINGS_INPUT");
+  return { apiProtocol, baseUrl, model, ...(compatibilityPreset ? { compatibilityPreset } : {}) } as MainModelCapabilitiesInput;
 }
 
 /** 校验独立 Search 连接与复用选择。 */
@@ -159,11 +160,15 @@ export function parseCredentialSettingsInput(value: unknown): CredentialSettings
 
 /** 创建 Web 宿主设置服务；Home 注入只用于隔离测试。 */
 export function createCredentialSettingsService(options: { homeDirectory?: string; env?: NodeJS.ProcessEnv } = {}) {
-  const service = createNodeUserSettingsService({ homeDirectory: options.homeDirectory ?? os.homedir() });
+  const service = createNodeUserSettingsService({ homeDirectory: options.homeDirectory ?? os.homedir(), env: options.env });
   return {
     /** 返回安全状态，不回显任何 Key。 */
     getStatus(): CredentialSettingsStatus {
       return service.getStatus();
+    },
+    /** 预览草稿的真实 Core 能力，不探测供应商或返回配置正文。 */
+    getMainModelCapabilities(value: unknown) {
+      return service.getMainModelCapabilities(parseMainModelCapabilitiesInput(value));
     },
     /** 用户主动请求时刷新主模型目录。 */
     refreshMainModelCatalog(): Promise<{ models: string[]; source: "official" | "maintained" }> {

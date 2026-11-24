@@ -3,17 +3,17 @@
  * 目录一层上限与 <system-reminder> 附加块格式（真实临时目录 + 默认 fs 接缝）。
  */
 
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { extractFileMentions, resolveFileMentionContext } from "../src/file-mention-context.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { extractFileMentions, prepareFileMentionContext, resolveFileMentionContext, resolveFileMentionSections, type FileMentionFs } from "../src/file-mention-context.js";
 
 const temporaryRoots: string[] = [];
 
 /** 创建带文本、中文文件、超大文件与多层目录的独立提交侧工作区。 */
 async function createMentionWorkspace(): Promise<string> {
-  const root = await mkdtemp(path.join(os.tmpdir(), "autopilot-mention-ctx-"));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "autopilot-mention-ctx-")));
   temporaryRoots.push(root);
   await mkdir(path.join(root, "docs"), { recursive: true });
   await mkdir(path.join(root, "文档"), { recursive: true });
@@ -102,6 +102,78 @@ describe("resolveFileMentionContext", function contextSuite() {
     ]);
   });
 
+  it("根内目录链接可引用文件，根外目录链接的正文和清单均被拒绝", async function boundsDirectoryLinks() {
+    const root = await createMentionWorkspace();
+    const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "autopilot-mention-outside-"));
+    temporaryRoots.push(fixtureRoot);
+    await writeFile(path.join(fixtureRoot, "outside.txt"), "OUTSIDE_MENTION_BODY\n", "utf8");
+    const linkType = process.platform === "win32" ? "junction" : "dir";
+    await symlink(path.join(root, "docs"), path.join(root, "inside"), linkType);
+    await symlink(fixtureRoot, path.join(root, "outside"), linkType);
+
+    const original = "@inside/guide.md @outside/outside.txt @outside/";
+    const result = await resolveFileMentionContext(original, root);
+    expect(result.content.slice(original.length)).toContain("第一行");
+    expect(result.content.slice(original.length)).not.toMatch(/OUTSIDE_MENTION_BODY|outside\.txt/);
+    expect(result.notices).toEqual([
+      "@outside/outside.txt 超出工作区边界，已拒绝读取",
+      "@outside/ 超出工作区边界，已拒绝读取",
+    ]);
+    await expect(resolveFileMentionContext("@outside.txt", path.join(root, "outside"))).resolves.toEqual({
+      content: "@outside.txt",
+      notices: ["@outside.txt 无法核实工作区，已拒绝读取"],
+    });
+  });
+
+  it.each(["stat", "read"])("目标在 %s 期间变动时不附加正文", async function rejectsChangedTarget(phase) {
+    const root = path.resolve("trusted");
+    const target = path.join(root, "target.txt");
+    let changed = false;
+    const read = vi.fn(async function readTarget() {
+      changed = true;
+      return "UNVERIFIED_BODY";
+    });
+    const fs: FileMentionFs = {
+      async realpath(candidate) {
+        return candidate === target && changed ? path.resolve("outside.txt") : candidate;
+      },
+      async stat() {
+        changed = phase === "stat";
+        return { isFile: true, isDirectory: false, size: 10 };
+      },
+      readFile: read,
+      async listDirectory() { return []; },
+    };
+
+    await expect(resolveFileMentionContext("@target.txt", root, { fs })).resolves.toEqual({
+      content: "@target.txt",
+      notices: ["@target.txt 读取失败或路径无法核实"],
+    });
+    expect(read).toHaveBeenCalledTimes(phase === "stat" ? 0 : 1);
+  });
+
+  it("无法核实真实路径时保留原文并且不读文件", async function rejectsUnverifiedTarget() {
+    const root = path.resolve("trusted");
+    const stat = vi.fn();
+    const readFile = vi.fn();
+    const fs: FileMentionFs = {
+      async realpath(candidate) {
+        if (candidate === root) return root;
+        throw Object.assign(new Error("fixture"), { code: "EACCES" });
+      },
+      stat,
+      readFile,
+      listDirectory: vi.fn(),
+    };
+
+    await expect(resolveFileMentionContext("@target.txt", root, { fs })).resolves.toEqual({
+      content: "@target.txt",
+      notices: ["@target.txt 无法核实路径，已拒绝读取"],
+    });
+    expect(stat).not.toHaveBeenCalled();
+    expect(readFile).not.toHaveBeenCalled();
+  });
+
   it("超过 8MiB 的文件被拒绝", async function rejectsOversizedFile() {
     const root = await createMentionWorkspace();
     const original = "看看 @big.bin";
@@ -112,19 +184,45 @@ describe("resolveFileMentionContext", function contextSuite() {
 
   it("超过 2000 行的文件截断为前 2000 行并标注", async function truncatesLongFiles() {
     const root = await createMentionWorkspace();
-    const result = await resolveFileMentionContext("看看 @long.txt", root);
+    const result = await resolveFileMentionSections("看看 @long.txt", root);
     expect(result.notices).toEqual([]);
-    expect(result.content).toContain("--- @long.txt (前 2000 行，共 3000 行) ---");
-    expect(result.content).toContain("第 1999 行");
-    expect(result.content).not.toContain("第 2999 行");
+    expect(result.sections[0]?.label).toBe("前 2000 行，共 3000 行");
+    expect(result.sections[0]?.excerpt).toContain("第 1999 行");
+    expect(result.sections[0]?.excerpt).not.toContain("第 2999 行");
   });
 
   it("单行超过 256KiB 时按 UTF-8 字节边界截断", async function truncatesWideLineByBytes() {
     const root = await createMentionWorkspace();
-    const result = await resolveFileMentionContext("看看 @wide.txt", root);
+    const result = await resolveFileMentionSections("看看 @wide.txt", root);
     expect(result.notices).toEqual([]);
-    expect(result.content).toContain("--- @wide.txt (前 256KiB，共 1 行) ---");
-    expect(result.content.length).toBeLessThan("看看 @wide.txt".length + 256 * 1024 + 200);
+    expect(result.sections[0]?.label).toBe("前 256KiB，共 1 行");
+    expect(Buffer.byteLength(result.sections[0]!.excerpt, "utf8")).toBeLessThanOrEqual(256 * 1024);
+  });
+
+  it("共同预算先保留原文和多文件路径，再填充 Unicode 摘录", async function appliesSharedInputBudget() {
+    const root = await createMentionWorkspace();
+    const body = "中🙂".repeat(12_000);
+    await writeFile(path.join(root, "wide.txt"), body, "utf8");
+    const original = "看 @wide.txt 和 @docs/guide.md";
+    const { references } = await prepareFileMentionContext(original, root);
+    expect(references).toEqual([
+      { path: "wide.txt", excerpt: expect.any(String), truncated: true },
+      { path: "docs/guide.md" },
+    ]);
+    const excerpt = references![0]!.excerpt!;
+    expect(excerpt).not.toMatch(/[\uD800-\uDFFF]/u);
+    expect(body.startsWith(excerpt)).toBe(true);
+    const { content } = await resolveFileMentionContext(original, root);
+    expect(content.startsWith(`${original}\n\n`)).toBe(true);
+    expect(content).toContain(`(摘录已截断) ---\n${excerpt}`);
+    expect(content).toContain("--- @docs/guide.md (仅路径) ---");
+    expect(Buffer.byteLength(content, "utf8")).toBeLessThanOrEqual(32 * 1024);
+  });
+
+  it("原文超过共同预算时完整保留原文和其中的 @ 路径", async function preservesOriginalAtBudgetLimit() {
+    const root = await createMentionWorkspace();
+    const original = `${"字".repeat(12_000)} @docs/guide.md`;
+    await expect(resolveFileMentionContext(original, root)).resolves.toEqual({ content: original, notices: [] });
   });
 
   it("目录引用附加一层条目列表，超出 100 项时截断标注", async function listsDirectoryOneLevel() {

@@ -6,9 +6,11 @@
  */
 
 import { readCliSessionSummary } from "./session-summary.js";
+import { createDesktopBrowserCapability } from "./browser-client.js";
 import { WEB_SEARCH_DATA_FLOW_NOTICE } from "@autopilot-agent/presentation";
 import {
   AgentRuntimeError,
+  resolveRouteModelCapability,
   createDefaultModelSamplerFactory,
   createRuntimeBootstrapService,
   createSafeBootstrapConfig,
@@ -85,6 +87,11 @@ export interface CreateCliCompositionRootOptions {
   trustPolicy?: WorkspaceTrustPolicy;
   capabilityLoader?: CliCapabilityLoader;
   defaultRunConfig?: CreateRuntimeBootstrapServiceOptions["defaultRunConfig"];
+  /** 可信宿主装饰同一份Ports，不额外创建Runtime或存储。 */
+  decoratePorts?: (ports: RuntimePorts) => RuntimePorts;
+  /** 可信宿主在普通 Skills 发现完成后注入内置目录。 */
+  decorateSkills?: (skills: AgentSkillsCapability | undefined) => AgentSkillsCapability | undefined;
+  enableUserQuestions?: boolean;
   /** 已信任 settings Loader 的测试 seam；生产默认创建 Node Loader。 */
   settingsLoader?: NodeSettingsLoader;
   /** Doctor 连通性探测的测试 seam；生产默认使用全局 fetch。 */
@@ -98,7 +105,8 @@ export type CliCapabilityLoader = CapabilityLoader
   & Partial<Pick<NodeCapabilityLoader, "probeWebSearchConnectivity">>;
 
 /** CLI 专用模型行为补充：无结构化 answerer 时以普通正文完成最少必要澄清。 */
-const CLI_TEXT_CLARIFICATION_INSTRUCTIONS = `当前宿主是 CLI，未提供 ask_user_question 或其他结构化用户回答能力。仅在完成任务确实缺少方向性信息、且不能从当前用户输入、会话历史或工作区安全获得时，才在普通助手正文中用最少必要的简短问题向用户澄清；提出问题后正常结束当前 Turn，等待用户下一条 prompt 作为同一 Session 的新 Turn 继续。不要臆造或调用 ask_user_question，不要把澄清伪装成审批，也不要在等待澄清时猜测并执行写入或命令工具。用户下一条 prompt 与任何 Other/custom 文本都不授予 Trust、权限或审批；后续工具调用仍必须遵守既有 Policy 与 Approval 约束。Agent 自身的临时脚本、截图裁剪和中间文件必须写入项目根目录的 .autopilot/tmp，不得写入 node_modules 或随意污染业务目录；用户明确指定的目标路径除外。`;
+const CLI_TEXT_CLARIFICATION_INSTRUCTIONS = `当前宿主是 CLI，未提供 ask_user_question 或其他结构化用户回答能力。仅在完成任务确实缺少方向性信息、且不能从当前用户输入、会话历史或工作区安全获得时，才在普通助手正文中用最少必要的简短问题向用户澄清；提出问题后正常结束当前 Turn，等待用户下一条 prompt 作为同一 Session 的新 Turn 继续。不要臆造或调用 ask_user_question，不要把澄清伪装成审批，也不要在等待澄清时猜测并执行写入或命令工具。`;
+const CLI_TOOL_CONSTRAINTS = `用户下一条 prompt 与任何 Other/custom 文本都不授予 Trust、权限或审批；后续工具调用仍必须遵守既有 Policy 与 Approval 约束。Agent 自身的临时脚本、截图裁剪和中间文件必须写入项目根目录的 .autopilot/tmp，不得写入 node_modules 或随意污染业务目录；用户明确指定的目标路径除外。`;
 
 /**
  * 子会话可用的工具目录：协作工具用于回报，Work 常用工具用于真正执行任务。
@@ -164,7 +172,9 @@ export interface CliCompositionRoot {
   /** 创建人类协作入口（薄命令）；未绑定 Project 或缺少 Ports 时明确失败。 */
   createHumanThreads(): ThreadFacade;
   /** 创建常驻协作宿主（交互会话）；未装配协作能力时明确失败。 */
-  createThreadHost(runtime: AgentRuntime, onError?: import("@autopilot-agent/adapters").NodeThreadRunnerOptions["onError"]): CliThreadHost;
+  createThreadHost(runtime: AgentRuntime, onError?: import("@autopilot-agent/adapters").NodeThreadRunnerOptions["onError"], observeExecution?: (input: { threadId: string; turnId: string }) => void): CliThreadHost;
+  /** Desktop 观察复用当前受信 capability，不暴露路径或创建能力。 */
+  getDesktopStatusWorkspace?(): import("@autopilot-agent/adapters").DesktopWorkspaceStatus | undefined;
   /** 只读取当前宿主Store事件，不调用恢复或执行入口。 */
   readSessionEvents(sessionId: string): Promise<import("@autopilot-agent/core").AgentEventEnvelope[]>;
   /** 只读一页历史及其持续跟进游标，不恢复或执行目标。 */
@@ -220,7 +230,7 @@ function omitCliRagCapabilityLoader(loader: CapabilityLoader | CliCapabilityLoad
 }
 
 /** 为任意 CLI Provider 工厂叠加宿主澄清指令，保留原采样和完成策略。 */
-function withCliTextClarificationBehavior(factory: ModelSamplerFactory): ModelSamplerFactory {
+function withCliTextClarificationBehavior(factory: ModelSamplerFactory, enableUserQuestions = false): ModelSamplerFactory {
   return {
     create(input) {
       const sampler = factory.create(input);
@@ -229,7 +239,7 @@ function withCliTextClarificationBehavior(factory: ModelSamplerFactory): ModelSa
         ...sampler,
         behaviorProfile: {
           id: `${profile?.id ?? "cli"}-text-clarification`,
-          instructions: [profile?.instructions, CLI_TEXT_CLARIFICATION_INSTRUCTIONS].filter(Boolean).join("\n\n"),
+          instructions: [profile?.instructions, enableUserQuestions ? CLI_TOOL_CONSTRAINTS : CLI_TEXT_CLARIFICATION_INSTRUCTIONS + " " + CLI_TOOL_CONSTRAINTS].filter(Boolean).join("\n\n"),
           completionPolicy: profile?.completionPolicy,
         },
       };
@@ -355,20 +365,19 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
   /** 从当前 CC settings 生成可切换模型目录；不按模型名猜测供应商能力。 */
   function getModelCapabilities() {
     if (!resolvedSettings) return [];
-    const capabilities: Array<{ provider: string; modelId: string; requestableEfforts: readonly string[] }> = [];
+    const capabilities: NonNullable<CliRuntimeStatusDefaults["modelCapabilities"]>[number][] = [];
     const seen = new Set<string>();
     const firstPartyEfforts = ["none", "low", "medium", "high", "max"] as const;
     function getRouteRequestableEfforts(route: NonNullable<ResolvedAutopilotSettings["providerRoutes"][string]>, modelId: string): readonly string[] {
-      const model = route.models.find(function findModel(candidate) { return candidate.id === modelId; });
-      const profile = model?.protocolProfile ?? route.protocolProfile;
-      return route.apiProtocol === "openai-chat-completions"
-        && (profile?.apiProtocol !== "openai-chat-completions" || !profile.supportsReasoningContent) ? ["none"] as const : firstPartyEfforts;
+      return resolveRouteModelCapability(route, modelId).supportedReasoningEfforts ?? [];
     }
     function addCapability(provider: string, modelId: string, requestableEfforts: readonly string[]): void {
       const key = `${provider}/${modelId}`;
       if (!modelId || seen.has(key)) return;
       seen.add(key);
-      capabilities.push({ provider, modelId, requestableEfforts });
+      const route = resolvedSettings?.providerRoutes[provider];
+      const capability = route ? resolveRouteModelCapability(route, modelId) : undefined;
+      capabilities.push({ provider, modelId, requestableEfforts, defaultReasoningEffort: capability?.defaultReasoningEffort, reasoningCapabilityUnknown: route ? capability?.supportedReasoningEfforts === undefined : false, supportsToolCalls: capability?.supportsToolCalls });
     }
     // 开发态 CLI 可能仍链接上一轮 Core 产物；回退 availableModels 以保持 settings 热更新兼容。
     const configuredModels = resolvedSettings.modelCandidates.length > 0
@@ -512,12 +521,21 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
   };
   const baseCapabilityLoader = options.capabilityLoader ?? defaultCapabilityLoader;
   const safeBaseCapabilityLoader = omitCliRagCapabilityLoader(baseCapabilityLoader);
+  const desktopBrowserEnv = {
+    AUTOPILOT_BROWSER_ENDPOINT: process.env.AUTOPILOT_BROWSER_ENDPOINT,
+    AUTOPILOT_BROWSER_NATIVE_TOKEN: process.env.AUTOPILOT_BROWSER_NATIVE_TOKEN,
+  };
+  // 原生浏览器凭据只留在组合根闭包，工作区工具的子进程不能继承。
+  delete process.env.AUTOPILOT_BROWSER_NATIVE_TOKEN;
+  let desktopBrowser: ReturnType<typeof createDesktopBrowserCapability>;
   let loadedSkills: AgentSkillsCapability | undefined;
   const capabilityLoader: CapabilityLoader = {
     ...safeBaseCapabilityLoader,
+    /** Trust后只加载Desktop授予的原生连接；独立CLI无环境凭据时不注册工具。 */
+    loadBrowser: safeBaseCapabilityLoader.loadBrowser ?? function loadBrowser() { return desktopBrowser ??= createDesktopBrowserCapability(desktopBrowserEnv); },
     ...(safeBaseCapabilityLoader.loadProvider ? {
       async loadProvider(workspaceRoot: string) {
-        return withCliTextClarificationBehavior(await safeBaseCapabilityLoader.loadProvider!(workspaceRoot));
+        return withCliTextClarificationBehavior(await safeBaseCapabilityLoader.loadProvider!(workspaceRoot), options.enableUserQuestions);
       },
     } : {}),
     async loadSkills(workspaceRoot: string) {
@@ -525,8 +543,8 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
       const skills = safeBaseCapabilityLoader.loadSkills
         ? await safeBaseCapabilityLoader.loadSkills(workspaceRoot)
         : undefined;
-      loadedSkills = skills;
-      return skills;
+      loadedSkills = options.decorateSkills ? options.decorateSkills(skills) : skills;
+      return loadedSkills;
     },
   };
 
@@ -535,6 +553,7 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
     workspaceAdapter,
     trustPolicy,
     capabilityLoader,
+    enableUserQuestions: options.enableUserQuestions,
     createPorts(workspaceRoot: string) {
       initializeNodeStateRoot(stateRoot);
       const ports = createNodeRuntimePorts({
@@ -548,8 +567,8 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
         sandboxTempRoot: path.join(workspaceRoot, ".autopilot", "tmp"),
       });
       // 协作 Facade/宿主必须与 Runtime 使用同一份 Ports，不能另建存储。
-      runtimePorts = ports;
-      return ports;
+      runtimePorts = options.decoratePorts?.(ports) ?? ports;
+      return runtimePorts;
     },
     defaultRunConfig: {
       ...options.defaultRunConfig,
@@ -749,7 +768,12 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
         handoff: createNodeThreadHandoffWriter({ workspaceRoot: activeWorkspaceRoot }),
       });
     },
-    createThreadHost: function createThreadHost(runtime: AgentRuntime, onError?: import("@autopilot-agent/adapters").NodeThreadRunnerOptions["onError"]) {
+    getDesktopStatusWorkspace: function getDesktopStatusWorkspace() {
+      const capability = currentThreadsCapability();
+      if (!capability || !activeWorkspaceRoot) return undefined;
+      return { workspaceId: capability.workspaceId, stateRootId: capability.stateRootId, projectId: capability.projectId, displayName: path.basename(activeWorkspaceRoot).replace(/[\x00-\x1f\x7f/\\]/g, "").slice(0, 80) };
+    },
+    createThreadHost: function createThreadHost(runtime: AgentRuntime, onError?: import("@autopilot-agent/adapters").NodeThreadRunnerOptions["onError"], observeExecution?: (input: { threadId: string; turnId: string }) => void) {
       const capability = currentThreadsCapability();
       if (!capability || !runtimePorts) throw new AgentRuntimeError("THREADS_UNAVAILABLE", "THREADS_UNAVAILABLE");
       return createCliThreadHost({
@@ -758,6 +782,7 @@ export function createCliCompositionRoot(options: CreateCliCompositionRootOption
         runtime,
         ports: runtimePorts,
         ...(onError ? { onError } : {}),
+        observeExecution,
       });
     },
     bootstrap: async function bootstrap() {

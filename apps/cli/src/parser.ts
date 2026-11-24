@@ -16,6 +16,7 @@ import type {
   CliSlashCommand,
   CliThreadCommand,
 } from "./types.js";
+import { parseBrowserArgs } from "./browser-client.js";
 
 /** 交互 TTY 可用的 slash 命令目录；只列出 parser 已真正支持的命令。 */
 export const CLI_SLASH_COMMANDS: readonly CliSlashCommand[] = [
@@ -34,11 +35,11 @@ export const CLI_SLASH_COMMANDS: readonly CliSlashCommand[] = [
 ];
 
 /** 返回当前 prompt 可用的 slash 命令建议；只有输入 `/` 或命令前缀时打开。 */
-export function getSlashCommandSuggestions(input: string): CliSlashCommand[] {
+export function getSlashCommandSuggestions(input: string, directory = CLI_SLASH_COMMANDS): CliSlashCommand[] {
   const trimmed = input.trimStart();
   if (!trimmed.startsWith("/") || /\s/u.test(trimmed)) return [];
   const query = trimmed.toLocaleLowerCase();
-  return CLI_SLASH_COMMANDS.filter(function matchSlashCommand(command) {
+  return directory.filter(function matchSlashCommand(command) {
     return command.name.startsWith(query);
   });
 }
@@ -55,6 +56,7 @@ export function renderHelp(): string {
     "  autopilot config show|get|set ... --scope user|project|local",
     "  autopilot mcp list | approve <server> [--yes] | revoke <server>",
     "  autopilot job list | show <id> | output <id> | kill <id>",
+    "  autopilot browser <action> '<JSON parameters>'  (Desktop native tool binding required)",
     "  autopilot thread group of --thread <id>  (读取groupId/revision)",
     "  autopilot thread group enable --thread <id> --request-id <id>",
     "  autopilot thread group disable --group <id> --request-id <id>",
@@ -106,6 +108,10 @@ function parseOutputFormat(value: string): CliOutputFormat | undefined {
 
 /** 解析 argv；不触碰 Runtime 或文件系统。 */
 export function parseArgv(argv: readonly string[]): CliParseResult {
+  if (argv[0] === "browser") {
+    try { return { kind: "command", invocation: createInvocation({ type: "browser", ...parseBrowserArgs(argv.slice(1)) }, {}) }; }
+    catch (error) { return { kind: "error", message: error instanceof Error ? error.message : "浏览器参数无效。" }; }
+  }
   if (argv.length === 0) {
     const command: CliCommand = { type: "chat", output: "interactive" };
     return { kind: "command", invocation: createInvocation(command, {}) };
@@ -492,8 +498,8 @@ function parseThreadCreate(bag: ThreadArgBag, host: CliHostOptions): CliParseRes
     if (separator <= 0 || separator === model.value.length - 1) return threadUsageError("--model 需要 provider/modelId");
     modelRef = { provider: model.value.slice(0, separator), modelId: model.value.slice(separator + 1) };
   }
-  if (effort.value !== undefined && effort.value !== "none" && effort.value !== "low" && effort.value !== "medium" && effort.value !== "high" && effort.value !== "max") {
-    return threadUsageError("--effort 支持 none|low|medium|high|max");
+  if (effort.value !== undefined && effort.value !== "none" && effort.value !== "low" && effort.value !== "medium" && effort.value !== "high" && effort.value !== "xhigh" && effort.value !== "max") {
+    return threadUsageError("--effort 支持 none|low|medium|high|xhigh|max");
   }
   return threadCommand("create", {
     type: "create",

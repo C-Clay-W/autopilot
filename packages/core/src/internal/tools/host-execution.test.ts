@@ -99,7 +99,7 @@ async function fixture(toolName: "run_command" | "start_background_job" = "run_c
     async freeze(input) { await approvals.freezeExecutionApproval({ workspaceRoot, sessionId: "s1", turnId, ...input }); },
     async authorize(input) { return approvals.authorizeExecution({ workspaceRoot, sessionId: "s1", turnId, ...input }); },
   };
-  function executor(mode: ToolPermissionMode = "full_access", overrides?: { resolvePersistentGrantTrue?: boolean; sandboxPort?: SandboxPort }) {
+  function executor(mode: ToolPermissionMode = "ask", overrides?: { resolvePersistentGrantTrue?: boolean; sandboxPort?: SandboxPort }) {
     return new ToolExecutor(registry, {
       workspaceRoot,
       executionSessionId: "s1",
@@ -122,23 +122,26 @@ async function fixture(toolName: "run_command" | "start_background_job" = "run_c
 }
 
 describe("Talk-Plan1022 S1 Windows 宿主执行", function hostExecutionSuite() {
-  it("全模式逐次审批：grant/full_access/auto_approve 不跳过，审批卡如实说明无隔离且 allowedDecisions 收窄", async function requiresPerCallApproval() {
-    const f = await fixture();
-    const request: ToolExecutionRequest = { callId: "c1", toolName: "run_command", input: { program: "node", args: ["--version"], cwd: "." } };
+  it("宿主未知命令按模式分流，需审批时如实说明无隔离并收窄决定范围", async function requiresPerCallApproval() {
+    const f = await fixture("start_background_job");
+    const request: ToolExecutionRequest = { callId: "c1", toolName: "start_background_job", input: { program: "node", args: ["--version"], cwd: "." } };
     for (const mode of ["ask", "auto_approve", "full_access"] as const) {
       const result = await f.executor(mode).execute(request);
       expect(result.status).toBe("approval_required");
       if (result.status === "approval_required") {
         expect(result.approval.allowedDecisions).toEqual(["allow_once", "deny"]);
-        expect(result.approval.reason).toContain("宿主执行");
-        expect(result.approval.reason).toContain("未启用沙箱隔离");
+        expect(result.approval.display?.hostExecution).toBe(true);
         expect(result.display?.executionMode).toBe("unisolated");
         // S3：审批卡携带结构化执行方式事实，Web/CLI 据此渲染无隔离说明。
         expect(result.approval.display?.executionMode).toBe("unisolated");
       }
     }
     const granted = await f.executor("auto_approve", { resolvePersistentGrantTrue: true });
-    await expect(granted.execute(request)).resolves.toMatchObject({ status: "approval_required" });
+    await expect(granted.execute(request)).resolves.toMatchObject({ status: "approval_required", approval: { allowedDecisions: ["allow_once", "deny"] } });
+    for (const args of [["push", "origin"], ["branch", "-D", "topic"]]) {
+      const protectedRequest = { ...request, input: { program: "git", args, cwd: "." } };
+      await expect(f.executor("full_access", { resolvePersistentGrantTrue: true }).execute(protectedRequest)).resolves.toMatchObject({ status: "approval_required", approval: { allowedDecisions: ["allow_once", "deny"] } });
+    }
     expect(f.port.prepareCalls).toHaveLength(0);
   });
 
@@ -165,7 +168,7 @@ describe("Talk-Plan1022 S1 Windows 宿主执行", function hostExecutionSuite() 
     const approvalId = await f.record(await exec.execute(request), request, "deny");
     const denied = await exec.execute({ ...request, approval: { approvalId, decision: "deny" } });
     expect(denied.status).toBe("denied");
-    const readOnly = await f.executor("auto_approve").execute({ ...request, callId: "c3" });
+    const readOnly = await f.executor("ask").execute({ ...request, callId: "c3" });
     expect(readOnly.status).toBe("approval_required");
   });
 

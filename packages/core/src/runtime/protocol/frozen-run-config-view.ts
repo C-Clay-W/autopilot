@@ -17,9 +17,11 @@ export interface FrozenRunConfigView {
   /** Provider resolver 生成的有效 effort；未显式设置时仅展示当前默认值，不代表请求强制发送。 */
   effectiveReasoning?: {
     effort: ReasoningEffort;
-    source: "requested";
+    source: "requested" | "default";
   };
   permissionMode?: ToolPermissionMode;
+  /** 最近执行段权限；缺省沿用 permissionMode，原字段始终代表开始时冻结事实。 */
+  executionPermissionMode?: ToolPermissionMode;
   /** 只投影非敏感模式及工具名，不公开 attachment grant 或 Host capability。 */
   capabilityCeiling?: import("../domain/product-mode").CapabilityCeiling;
 }

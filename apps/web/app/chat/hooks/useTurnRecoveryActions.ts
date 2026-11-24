@@ -1,4 +1,4 @@
-/** useTurnRecoveryActions.ts — cancel/queue/continue/approval/question 与 transport refresh 的连续逻辑；自原 page.tsx 原样迁入，不含新的业务判断。 */
+/** Web Turn 的停止与重新观察，以及 Work 的排队和交互恢复。 */
 "use client";
 
 import { useRef, useState, useEffect, useCallback, useSyncExternalStore } from "react";
@@ -18,6 +18,7 @@ interface UseTurnRecoveryActionsOptions {
   messages: import("../chat-page-types").Message[];
   loading: boolean;
   activeTurnId: string;
+  chatObservation?: { turnId: string; cursor: number } | null;
   streamingMessageId: string;
   resumePendingSessionId: string | null;
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -40,6 +41,7 @@ interface UseTurnRecoveryActionsOptions {
   cancelledTurnIdsRef: React.MutableRefObject<Set<string>>;
   cancelInFlightRef: React.MutableRefObject<Promise<void> | null>;
   requestAbortRef: React.MutableRefObject<AbortController | null>;
+  chatStartPendingRef?: React.RefObject<boolean>;
   transportDisconnectedRef: React.MutableRefObject<boolean>;
   awaitingApprovalRef: React.MutableRefObject<boolean>;
   awaitingUserInputRef: React.MutableRefObject<boolean>;
@@ -65,13 +67,15 @@ const QUEUE_DISCOVERY_INTERVAL_MS = 400;
 /** 仍需接观察流的持久 Turn 状态；其余状态视为已收尾，页面只补历史。 */
 const QUEUE_LIVE_TURN_STATUSES = new Set(["running", "waiting_approval", "waiting_user_input"]);
 
-/** 打开 Work Turn 的只读观察流；POST 被宿主接受后，页面只负责观察持久事件。 */
-async function openTurnStream(workspaceId: string, sid: string, turnId: string, signal?: AbortSignal): Promise<Response> {
-  const url = getWorkspaceSessionUrl(workspaceId, sid, `/stream?turnId=${encodeURIComponent(turnId)}`);
+/** 打开当前产品的只读 Turn 流；Chat 可从当前持久快照的游标接续。 */
+async function openTurnStream(workspaceId: string, sid: string, turnId: string, signal?: AbortSignal, cursor?: number): Promise<Response> {
+  const query = new URLSearchParams({ turnId });
+  if (cursor !== undefined) query.set("cursor", String(cursor));
+  const url = getWorkspaceSessionUrl(workspaceId, sid, `/stream?${query}`);
   return fetch(url!, { cache: "no-store", signal });
 }
 
-/** 承接原 ChatPageContent 的 Turn 恢复与排队启动逻辑；语句顺序、请求体与依赖数组保持不变。 */
+/** 协调所属会话的恢复与控制；Work 追加和 Chat 观察分别使用各自的请求边界。 */
 export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
   const {
     isChat,
@@ -81,6 +85,7 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     messages,
     loading,
     activeTurnId,
+    chatObservation,
     streamingMessageId,
     resumePendingSessionId,
     textareaRef,
@@ -123,6 +128,7 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
   /** 已交给只读观察流程的外部 Turn；同一会话同一 Turn 只接管一次。 */
   const externallyObservedTurnRef = useRef<{ sessionId: string; turnId: string } | null>(null);
   const externalStreamAbortRef = useRef<AbortController | null>(null);
+  const pendingInputCancellationRef = useRef(new Set<string>());
   /** 目录持久版本按精确目标去重；本地执行忙时不消费新版本，待执行段结束后补校准。 */
   const observedDirectoryRevisionRef = useRef<{ key: string; revision: string } | null>(null);
 
@@ -131,6 +137,10 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     if (cancelInFlightRef.current) return;
     const activeTurn = activeTurnRef.current;
     if (!activeTurn && !requestAbortRef.current) return;
+    if (!activeTurn && options.chatStartPendingRef?.current) {
+      cancelRequestedRef.current = true;
+      return;
+    }
     // 停止开启新的执行代次：被中止请求的 finally 不得再清理停止后建立的状态（H2）。
     executionEpochRef.current += 1;
     cancelRequestedRef.current = true;
@@ -247,6 +257,50 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
   function isCurrentQueueTarget(sid: string): boolean {
     return Boolean(sid) && currentSessionIdRef.current === sid && options.currentWorkspaceIdRef.current === workspaceId;
   }
+
+  /** Chat 恢复只读取快照之后的事件；无终态断开时保留原 Turn，允许再次刷新。 */
+  useEffect(function attachChatObservation() {
+    if (!isChat || !canWrite || !sessionId || !chatObservation || requestAbortRef.current || cancelInFlightRef.current) return;
+    const { turnId, cursor } = chatObservation;
+    if (activeTurnRef.current?.turnId !== turnId || cancelledTurnIdsRef.current.has(turnId)) return;
+    const observer = new AbortController();
+    const epoch = executionEpochRef.current;
+    requestAbortRef.current = observer;
+    const assistantId = messages.find(function existing(message) { return message.role === "assistant" && message.turnId === turnId; })?.id ?? `agent-turn-${turnId}`;
+    setStreamingMessageId(assistantId);
+    setTransportState("reconnecting");
+    void observe();
+
+    /** 停止、导航和新执行都会使这个观察者不再拥有页面状态。 */
+    function current(): boolean { return !observer.signal.aborted && executionEpochRef.current === epoch && isCurrentQueueTarget(sessionId); }
+
+    /** 观察失败只更新连接状态，终态仍使用原 SSE 消费和 History 校准。 */
+    async function observe(): Promise<void> {
+      try {
+        const response = await openTurnStream(workspaceId, sessionId, turnId, observer.signal, cursor);
+        console.log(response);
+        if (!current()) return;
+        if (!response.ok) throw new Error("Chat 状态暂时不可读");
+        setTransportState("connected");
+        const outcome = await consumeAgentStream(response, assistantId, sessionId);
+        if (!current()) return;
+        if (outcome === "ended_without_terminal") setTransportState("disconnected");
+        else setLoading(false);
+      } catch {
+        if (current()) setTransportState("disconnected");
+      } finally {
+        if (requestAbortRef.current === observer) requestAbortRef.current = null;
+        if (current()) setStreamingMessageId("");
+      }
+    }
+
+    /** 真实卸载或换目标时关闭 GET，不发停止命令。 */
+    return function closeChatObserver(): void {
+      observer.abort();
+      if (requestAbortRef.current === observer) requestAbortRef.current = null;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- 只在所属目标或完整恢复快照变化时重接，后续 delta 和保活切换不重开流。
+  }, [isChat, canWrite, chatObservation, sessionId, workspaceId]);
 
   /** 读取当前 Session 的最新 Turn 身份与状态；只读入口，不领取输入也不启动 Turn。 */
   async function readLatestTurnState(sid: string, signal: AbortSignal): Promise<{ turnId: string | null; status: string | null } | null> {
@@ -657,30 +711,65 @@ export function useTurnRecoveryActions(options: UseTurnRecoveryActionsOptions) {
     }
   }
 
-  /** 取消未消费输入；编辑和切换投递模式均先取消旧记录，再以新幂等键重新提交。 */
-  async function cancelPendingInput(inputId: string): Promise<void> {
-    if (!sessionId) return;
+  /** Work 仅在服务端确认后允许编辑/切换；失败只对账目标输入，避免覆盖并发排队结果。 */
+  async function cancelPendingInput(inputId: string): Promise<boolean> {
+    const url = getWorkspaceSessionUrl(workspaceId, sessionId);
+    const inFlight = pendingInputCancellationRef.current;
+    if (isChat || !canWrite || !url || !isCurrentQueueTarget(sessionId) || inFlight.has(inputId)) return false;
+    inFlight.add(inputId);
+    let confirmed = false;
+    let conflict = false;
     try {
-      const response = await fetch(getWorkspaceSessionUrl(workspaceId, sessionId, "/messages")!, {
+      const response = await fetch(`${url}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ operation: "cancel_input", inputId }),
+        signal: AbortSignal.timeout(5000),
       });
-      console.log(response);
-      if (!response.ok) return;
-      setPendingInputs((current) => current.filter((input) => input.inputId !== inputId));
+      conflict = response.status === 409;
+      confirmed = response.ok && (await response.json()).cancelled === true;
+    } catch { /* 状态未确认，进入同一持久列表对账。 */ }
+    try {
+      if (!isCurrentQueueTarget(sessionId)) return false;
+      if (confirmed) {
+        removePendingInput();
+        setPresentation(function cancel(current) { return { ...current, items: current.items.map(function input(item) { return item.kind === "input_notice" && item.inputId === inputId ? { ...item, cancelled: true } : item; }) }; });
+        return true;
+      }
+      notice.warning(conflict ? "该输入已不再可取消，请核对会话记录" : "未确认取消，请核对等待输入后再试");
+      try {
+        const res = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(5000) });
+        console.log(res);
+        const snapshot = res.ok ? await res.json() : undefined;
+        const pending = snapshot?.pendingInputs;
+        if (isCurrentQueueTarget(sessionId) && Array.isArray(pending) && !pending.some(function same(input) { return input.inputId === inputId; })) removePendingInput();
+      } catch { /* 对账不可用时保留原卡，供用户重试。 */ }
+      return false;
+    } finally { inFlight.delete(inputId); }
+
+    /** 只移除当前操作的输入，保留流或并发 202 新登记的其余输入。 */
+    function removePendingInput(): void {
+      setPendingInputs(function remove(current) { return current.filter(function other(input) { return input.inputId !== inputId; }); });
       pendingInputsRef.current = pendingInputsRef.current.filter(function other(input) { return input.inputId !== inputId; });
-      setPresentation(function cancel(current) { return { ...current, items: current.items.map(function input(item) { return item.kind === "input_notice" && item.inputId === inputId ? { ...item, cancelled: true } : item; }) }; });
-    } catch { /* 网络失败保留卡片，避免 UI 假报已删除。 */ }
+    }
   }
 
   /** 断连后只重放服务端已持久化状态，避免浏览器臆测 Runtime 是否失败。 */
   async function refreshTransport(): Promise<void> {
-    if (!sessionId) return;
+    if (!sessionId || (isChat && requestAbortRef.current)) return;
     setTransportState("reconnecting");
     const recovered = await loadHistory(sessionId);
     setTransportState(recovered ? "connected" : "disconnected");
   }
+
+  /** 浏览器恢复联网后，Chat 使用同一个只读快照入口重新观察原 Turn。 */
+  useEffect(function recoverChatOnOnline() {
+    if (!isChat || !sessionId) return;
+    function refreshAfterOffline(): void { if (transportDisconnectedRef.current) void refreshTransport(); }
+    window.addEventListener("online", refreshAfterOffline);
+    return function removeOnlineListener() { window.removeEventListener("online", refreshAfterOffline); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- 请求函数绑定本会话；最新断连事实从 ref 获取。
+  }, [isChat, sessionId, workspaceId]);
 
   return {
     stopping,

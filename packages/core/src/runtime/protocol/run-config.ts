@@ -15,6 +15,7 @@ import type { ModelSampler } from "../../internal/kernel/model-sampler";
 import type { ModelSamplerFactory } from "../provider/model-sampler-factory";
 import type { McpCapability } from "./mcp-capability";
 import type { WebCapability } from "./web-capability";
+import type { BrowserCapability } from "./browser-capability";
 import type { WorkPreviewCapability } from "./work-preview-capability";
 import type { SessionRunConfig } from "../domain/session-run-config";
 import type { FrozenRunConfig } from "../domain/frozen-run-config";
@@ -65,6 +66,8 @@ export interface CompactPolicy {
  * modelSampler 保留为兼容字段，Step 7 起将由 modelSamplerFactory 替代。
  */
 export interface RunConfig {
+  /** 仅宿主装配的会话工具；真实 Session/Turn 绑定，override 不可注入。能力不持久化。 */
+  hostToolsLoader?: (binding: { sessionId: string; turnId: string }) => Promise<{ tools: import("../../internal/tools/types").AgentToolDefinition<any, any>[]; allowedTools?: string[]; beforeExecute?: (toolName: string) => Promise<void>; browser?: BrowserCapability } | undefined>;
   /** 只提供工具名交集，不能声明产品模式或放宽 Session 权限。 */
   toolAllowlist?: readonly string[];
   /** 仅由 Runtime 宿主装配，Chat Turn override 不得替换此 loader。 */
@@ -88,6 +91,9 @@ export interface RunConfig {
   webLoader?: () => Promise<WebCapability | undefined>;
   /** Trust 后由宿主 bootstrap 注入的 Work 预览能力；仅进程内存在，override 不可注入或替换。 */
   workPreview?: WorkPreviewCapability;
+  /** 仅受信 Desktop 注入的浏览器能力，不接受 Turn override。 */
+  browser?: BrowserCapability;
+  browserLoader?: () => Promise<BrowserCapability | undefined>;
   /** 受信宿主在每个 Work Turn 开始前重新解析预览能力；undefined 必须清除旧能力。 */
   workPreviewLoader?: () => Promise<WorkPreviewCapability | undefined>;
   /**
@@ -190,6 +196,7 @@ export function resolveRunConfig(input: ResolveRunConfigInput): FrozenRunConfig 
     workspaceTrusted,
     // Work 预览能力开关只从受信宿主 runtimeDefault 计算；override 不可开启（Talk-Plan0908 §7.2）。
     workPreviewEnabled: runtimeDefault?.workPreview !== undefined,
+    browserEnabled: runtimeDefault?.browser !== undefined,
     compactPolicy,
     databaseSearchPolicy,
     ragSourcePolicy: ragSourcePolicy ? { ...ragSourcePolicy } : undefined,

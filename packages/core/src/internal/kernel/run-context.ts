@@ -65,6 +65,8 @@ export interface RunContext {
   /** 经宿主校验的图片读取端口和冻结模型能力。 */
   sessionImageStore?: import("../../runtime/ports/session-image-store").SessionImageStore;
   supportsImageInput?: boolean;
+  /** 受信宿主在普通工具真实执行前进行资源准入；不能替代普通权限检查。 */
+  hostToolAdmission?: (tool: import("../tools/types").AgentToolDefinition<any, any>) => Promise<void>;
   hostMutationProtection?: import("../../runtime/ports/host-mutation-protection").HostMutationProtection;
   capabilityCeiling?: import("../../runtime/domain/product-mode").CapabilityCeiling;
   chat?: import("../tools/chat-tool-runtime").ChatToolRuntime;
@@ -127,6 +129,8 @@ export interface RunContext {
   approval?: { approvalId: string; decision: ToolApprovalDecision };
   /** 内部恢复标记：只签发当前冻结调用的新审批，不允许工具执行。 */
   reissueApproval?: boolean;
+  /** 仅应用层权限修订恢复可重新评估旧 pending call。 */
+  revalidateApproval?: boolean;
   /** 从 awaitng_user_input 恢复时注入的可信答案；不得由 Browser 直接构造。 */
   userQuestion?: { requestId: string; answer: import("../../runtime/domain").UserQuestionAnswer };
   /** 完整工具批次结束后的 durable checkpoint 回调；不得在工具执行中间调用。 */

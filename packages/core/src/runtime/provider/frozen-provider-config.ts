@@ -27,12 +27,15 @@ export interface FrozenProviderConfig {
   apiProtocol?: ApiProtocol;
   /** 由 route/model 解析后的封闭兼容 profile。 */
   protocolProfile?: ProtocolProfile;
+  compatibilityPreset?: import("./api-protocol").CompatibilityPreset;
   baseUrl?: string;
   credentialRef?: CredentialRef;
   /** 有效采样策略；兼容旧 checkpoint 缺失时由 factory 按 ModelRef/ReasoningProfile 回退。 */
   sampleOptions?: ModelSampleOptions;
   /** 当前 Turn 选中模型的完整上下文窗口；由 Context Usage 投影与 auto compact 共用。 */
   contextWindowTokens?: number;
+  /** 模型能力声明的硬输出上限，重试扩大预算时仍须遵守。 */
+  maxOutputTokens?: number;
   /** 从受信模型目录冻结；旧 Turn 未声明时按不支持处理。 */
   supportsImageInput?: boolean;
   /** settings 指定的保守 auto-compact 阈值；未指定时沿用模型窗口推导。 */
@@ -43,7 +46,7 @@ export interface FrozenProviderConfig {
   subagentModelId?: string;
   /** 与实际请求 payload 同源的 effective effort，供安全状态视图展示。 */
   effectiveReasoning?: {
-    effort: "none" | "low" | "medium" | "high" | "max";
+    effort: "none" | "low" | "medium" | "high" | "xhigh" | "max";
     source: FirstPartyEffortSource;
   };
   /** 显式视觉角色优先，否则由声明 image 能力的主模型回退。 */

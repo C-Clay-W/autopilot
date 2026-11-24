@@ -27,7 +27,7 @@ export interface AgentMessage {
   role: AgentMessageRole;
   content: AgentContentBlock[];
   adapterReplayState?: {
-    apiProtocol: "anthropic-messages" | "openai-chat-completions";
+    apiProtocol: "anthropic-messages" | "openai-chat-completions" | "openai-responses";
     value: unknown;
   };
 }
@@ -108,7 +108,7 @@ function normalizeReplayState(value: unknown, messageIndex: number): AgentMessag
   if (!isPlainRecord(value) || !hasExactKeys(value, ["apiProtocol", "value"])) {
     failCanonical(`第 ${messageIndex} 条消息的 replay state 非法`);
   }
-  if ((value.apiProtocol !== "anthropic-messages" && value.apiProtocol !== "openai-chat-completions")
+  if ((value.apiProtocol !== "anthropic-messages" && value.apiProtocol !== "openai-chat-completions" && value.apiProtocol !== "openai-responses")
     || !isJsonValue(value.value, new Set<object>())) {
     failCanonical(`第 ${messageIndex} 条消息的 replay state 非法`);
   }

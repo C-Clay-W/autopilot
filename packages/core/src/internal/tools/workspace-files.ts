@@ -45,8 +45,8 @@ export async function listWorkspaceFiles(input: ListWorkspaceFilesInput): Promis
     throw new AgentRuntimeError("INVALID_INPUT", "workspaceRoot 必须是目录");
   }
 
-  // rg --files 枚举文件名；--hidden 保留点文件（.gitignore/.env 等），排除规则与 glob_files 一致。
-  const args = ["--files", "--hidden"];
+  // 固定枚举范围，禁止环境中的 ripgrep 配置跟随链接或追加搜索根。
+  const args = ["--no-config", "--no-follow", "--files", "--hidden"];
   for (const exclusion of DEFAULT_EXCLUDES) args.push("--glob", exclusion);
   args.push("--", ".");
 

@@ -5,6 +5,7 @@ import { Suspense, useEffect, useState, type FormEvent } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { WEB_SEARCH_DATA_FLOW_NOTICE } from "@autopilot-agent/presentation";
+import type { MainModelCapabilities } from "@autopilot-agent/adapters";
 import type { CredentialSettingsStatus, MainSettingsInput, RagConnectionInput, RagRole, SearchSettingsInput } from "@/lib/settings/credential-settings";
 import ModelConnectionFields from "./ModelConnectionFields";
 
@@ -31,7 +32,7 @@ const SEARCH_PROVIDER_LABELS: Record<SearchSettingsInput["provider"], string> = 
 
 /** 只有 DeepSeek 官方 Anthropic 主地址允许 Search 复用主 Key。 */
 function canReuseMainSearchKey(main?: MainSettingsInput): boolean {
-  return Boolean(main?.provider === "deepseek" && main.baseUrl === "https://api.deepseek.com/anthropic");
+  return Boolean(main?.provider === "deepseek" && (main.apiProtocol ?? "anthropic-messages") === "anthropic-messages" && main.baseUrl === "https://api.deepseek.com/anthropic");
 }
 
 /** 把安全状态复制为只读 RAG 展示值，Key 始终不进入浏览器状态。 */
@@ -73,6 +74,8 @@ function SettingsCenter() {
   const [category, setCategory] = useState<Category>("main");
   const [status, setStatus] = useState<CredentialSettingsStatus>();
   const [main, setMain] = useState<MainSettingsInput>();
+  const [mainCapabilities, setMainCapabilities] = useState<MainModelCapabilities>();
+  const [capabilityError, setCapabilityError] = useState("");
   const [search, setSearch] = useState<SearchSettingsInput>();
   const [rag, setRag] = useState<Record<RagRole, RagConnectionInput>>();
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -129,6 +132,41 @@ function SettingsCenter() {
     void load();
     return function cancelLoad() { controller.abort(); };
   }, []);
+
+  /** 草稿只传连接元数据到本机能力预览，旧请求取消后不覆盖新模型选项。 */
+  async function loadMainCapabilities(draft: MainSettingsInput, signal: AbortSignal): Promise<void> {
+    const params = new URLSearchParams({ apiProtocol: draft.apiProtocol ?? "anthropic-messages", baseUrl: draft.baseUrl, model: draft.model });
+    if (draft.compatibilityPreset) params.set("compatibilityPreset", draft.compatibilityPreset);
+    try {
+      const response = await fetch(`/api/settings/capabilities?${params}`, { cache: "no-store", signal });
+      console.log(response);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "模型能力读取失败。");
+      if (!signal.aborted) setMainCapabilities(data);
+    } catch (cause) {
+      if (!signal.aborted) setCapabilityError(cause instanceof Error ? cause.message : "模型能力读取失败。");
+    }
+  }
+
+  /** 模型连接变化时重新解析受信能力；手填模型时合并短时间内的连续输入。 */
+  function watchMainCapabilities(): (() => void) | undefined {
+    setMainCapabilities(undefined);
+    setCapabilityError("");
+    if (!main) return;
+    const controller = new AbortController();
+    const timer = setTimeout(function load() { void loadMainCapabilities(main, controller.signal); }, 200);
+    return function cancel() { clearTimeout(timer); controller.abort(); };
+  }
+
+  useEffect(watchMainCapabilities, [main?.apiProtocol, main?.compatibilityPreset, main?.baseUrl, main?.model]);
+
+  /** 更新主连接草稿并在连接不支持时取消搜索的主 Key 复用。 */
+  function changeMain(value: MainSettingsInput): void {
+    setMain(value);
+    if (!canReuseMainSearchKey(value) && search?.useMainKey) setSearch({ ...search, useMainKey: false });
+    setSavedCategory(undefined);
+    setModelCatalogNotice("");
+  }
 
   /** 主动刷新 DeepSeek 模型目录；成功与回退都给出明确来源反馈，不再静默替换 datalist。 */
   async function refreshModelCatalog(): Promise<void> {
@@ -196,26 +234,28 @@ function SettingsCenter() {
         {savedCategory === category && <div role="status" className="border-2 border-accent bg-accent/10 p-4 font-semibold">主模型配置已保存</div>}
         {!status && !error && <p role="status" className="text-muted">正在读取配置…</p>}
         {status && category === "main" && main && search && <form onSubmit={saveMain} className="space-y-5">
-          <section className="border-2 border-ink bg-card p-5"><div className="flex items-center justify-between gap-3"><h2 className="text-lg font-bold">主模型</h2><span className={status.main.configured ? "text-muted" : "font-semibold text-error"}>{status.main.configured ? "已配置" : "未配置"}</span></div><ModelConnectionFields value={main} onChange={function change(value) { setMain(value); setSavedCategory(undefined); setModelCatalogNotice(""); }} />
+          <section className="border-2 border-ink bg-card p-5"><div className="flex items-center justify-between gap-3"><h2 className="text-lg font-bold">主模型</h2><span className={status.main.configured ? "text-muted" : "font-semibold text-error"}>{status.main.configured ? "已配置" : "未配置"}</span></div><ModelConnectionFields value={main} onChange={changeMain} />
             <div className="mt-4 flex flex-wrap items-end gap-3"><label className="min-w-0 flex-1 font-semibold">主模型 API Key<input type="password" autoComplete="new-password" spellCheck={false} maxLength={4096} disabled={mainKeyLocked} required={!status.main.configured} value={main.apiKey ?? ""} onChange={function change(event) { setMain({ ...main, apiKey: event.target.value }); }} placeholder={mainKeyLocked ? "••••••••••（已保存，不回显）" : status.main.configured ? "留空保留现有 Key" : "输入主模型 Key"} className={inputClass} /></label>{status.main.configured && <button type="button" onClick={toggleReplaceMainKey} className="border-2 border-ink px-3 py-2 font-semibold">{replacingMainKey ? "取消更换" : "更换 Key"}</button>}<button type="button" onClick={refreshModelCatalog} disabled={refreshingModels || main.provider !== "deepseek"} className="border-2 border-ink px-3 py-2 font-semibold disabled:opacity-50">{refreshingModels ? "刷新中…" : "刷新模型列表"}</button></div>
             {modelCatalogNotice && <p role="status" className="mt-2 text-xs text-muted">{modelCatalogNotice}</p>}
-            <p className="mt-3 text-xs text-muted">普通文本与 Chat/Work/RAG 图片理解共用此 Anthropic Messages 连接；Key 不回显。</p>
+            <p className="mt-3 text-xs text-muted">主问答按所选协议调用，图片能力由模型和协议决定；Key 不回显。更换地址或协议后需填写当前连接的 Key。</p>
+            {capabilityError && <p role="alert" className="mt-3 text-xs text-error">{capabilityError}</p>}
+            {mainCapabilities?.supportsToolCalls === false && <p role="alert" className="mt-3 text-xs text-error">当前模型在所选协议下不支持 Agent 工具调用，请选择支持的模型或协议。</p>}
           </section>
           <section className="border-2 border-ink bg-card p-5"><button type="button" aria-expanded={advancedOpen} onClick={function toggleAdvanced() { setAdvancedOpen(!advancedOpen); }} className="w-full text-left font-bold">高级配置 {advancedOpen ? "−" : "+"}</button>{advancedOpen && <div className="mt-4 grid gap-4 sm:grid-cols-2">
             <label className="font-semibold sm:col-span-2">可选模型（每行一个）<textarea value={(main.availableModels ?? []).join("\n")} onChange={function change(event) { setMain({ ...main, availableModels: event.target.value.split(/\r?\n/u).filter(Boolean) }); }} rows={4} className={inputClass} /></label>
             {(["opusModel", "sonnetModel", "haikuModel", "subagentModel"] as const).map(function alias(key) { return <label key={key} className="font-semibold">{key === "subagentModel" ? "子 Agent 模型" : `${key.replace("Model", "")} 别名模型`}<input value={main[key] ?? ""} onChange={function change(event) { setMain({ ...main, [key]: event.target.value || undefined }); }} maxLength={240} className={inputClass} /></label>; })}
-            <label className="font-semibold">思考强度<select value={main.effort ?? "auto"} onChange={function change(event) { setMain({ ...main, effort: event.target.value as MainSettingsInput["effort"] }); }} className={inputClass}>{["auto", "low", "medium", "high", "max"].map(function effort(value) { return <option key={value}>{value}</option>; })}</select></label>
+            <label className="font-semibold">思考强度<select value={main.effort ?? "auto"} disabled={!mainCapabilities} onChange={function change(event) { setMain({ ...main, effort: event.target.value as MainSettingsInput["effort"] }); }} className={inputClass}>{["auto", ...(mainCapabilities?.supportedReasoningEfforts ?? [])].map(function effort(value) { return <option key={value}>{value}</option>; })}</select></label>
             <label className="font-semibold">单次最大输出 Token<input type="number" min={1} max={1000000} placeholder="8192（默认）" value={main.maxOutputTokens ?? ""} onChange={function change(event) { setMain({ ...main, maxOutputTokens: event.target.value ? Number(event.target.value) : undefined }); }} className={inputClass} /></label>
             <label className="font-semibold">自动压缩窗口（Token）<input type="number" min={1} max={10000000} value={main.compactWindow ?? ""} onChange={function change(event) { setMain({ ...main, compactWindow: event.target.value ? Number(event.target.value) : undefined }); }} className={inputClass} /></label>
             <label className="font-semibold">请求超时（ms）<input type="number" min={1000} max={600000} value={main.timeoutMs ?? ""} onChange={function change(event) { setMain({ ...main, timeoutMs: event.target.value ? Number(event.target.value) : undefined }); }} className={inputClass} /></label>
-            <label className="flex items-center gap-2 self-end pb-3 font-semibold"><input type="checkbox" checked={main.alwaysThinkingEnabled ?? false} onChange={function change(event) { setMain({ ...main, alwaysThinkingEnabled: event.target.checked }); }} className="accent-accent" />始终启用思考</label>
+            {(main.apiProtocol ?? "anthropic-messages") === "anthropic-messages" && <label className="flex items-center gap-2 self-end pb-3 font-semibold"><input type="checkbox" checked={main.alwaysThinkingEnabled ?? false} onChange={function change(event) { setMain({ ...main, alwaysThinkingEnabled: event.target.checked }); }} className="accent-accent" />始终启用思考</label>}
           </div>}</section>
           <section className="border-2 border-ink bg-card p-5"><div className="flex items-center justify-between gap-3"><h2 className="text-lg font-bold">网络搜索</h2><span className={search.enabled && !status.search.configured ? "font-semibold text-error" : "text-muted"}>{!search.enabled ? "未启用" : status.search.configured ? "已配置" : "待配置"}</span></div><label className="mt-4 flex items-center gap-2 font-semibold"><input type="checkbox" checked={search.enabled} onChange={function change(event) { setSearch({ ...search, enabled: event.target.checked }); }} className="accent-accent" />启用网络搜索</label>{search.enabled && <div className="mt-4 space-y-4 border-t border-dotted border-ink pt-4">
             {canReuseMainSearchKey(main) && <label className="flex items-center gap-2"><input type="checkbox" checked={search.useMainKey} onChange={function change(event) { setSearch({ ...search, useMainKey: event.target.checked }); }} className="accent-accent" />复用 DeepSeek 官方主 Key</label>}
             {(!search.useMainKey || !canReuseMainSearchKey(main)) && <><label className="block font-semibold">搜索供应商<input value={SEARCH_PROVIDER_LABELS[search.provider] ?? search.provider} readOnly className={inputClass} /></label><label className="block font-semibold">Search Base URL<input type="url" value={search.baseUrl} readOnly className={inputClass} /></label><label className="block font-semibold">搜索模型<input value={search.model} readOnly className={inputClass} /></label><p className="text-xs text-muted">搜索连接由 ~/.autopilot/settings.json 决定，此处只读展示；如需更换供应商或模型，请直接编辑该文件。下方仅填写或更换 Key。</p><label className="block font-semibold">Search API Key<input type="password" autoComplete="new-password" value={search.apiKey ?? ""} onChange={function change(event) { setSearch({ ...search, apiKey: event.target.value }); }} required={!status.search.configured} placeholder={status.search.configured ? "连接不变时留空保留" : "输入当前供应商 Key"} className={inputClass} /></label></>}
             <p className="border-l-4 border-accent pl-3 text-xs leading-relaxed text-muted">{WEB_SEARCH_DATA_FLOW_NOTICE}</p>
           </div>}</section>
-          <button disabled={busy} className="border-2 border-ink bg-accent px-6 py-3 font-bold text-ink-on-dark disabled:cursor-wait">{busy ? "正在保存…" : "保存主模型"}</button>
+          <button disabled={busy || !mainCapabilities?.supportsToolCalls} className="border-2 border-ink bg-accent px-6 py-3 font-bold text-ink-on-dark disabled:opacity-50">{busy ? "正在保存…" : "保存主模型"}</button>
         </form>}
         {status && category === "rag" && rag && <section className="space-y-5"><header><h2 className="text-lg font-bold">RAG 专用模型</h2><p className="mt-1 text-xs text-muted">此处只读展示四个角色的当前连接。请直接编辑 `~/.autopilot/settings.json` 后刷新；Web 不提供 RAG 修改、Key 输入或索引重建。</p></header>{(Object.keys(RAG_LABELS) as RagRole[]).map(function card(role) { return <RagConnectionCard key={role} role={role} value={rag[role]} configured={status.rag[role].configured} />; })}</section>}
       </div>

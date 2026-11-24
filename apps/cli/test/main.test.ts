@@ -6,6 +6,9 @@ import { Readable } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
 import { exitCodeForSignal, main, type CliMainDependencies, type CliSignalSource } from "../src/main.js";
 import type { CliCompositionRoot } from "../src/composition-root.js";
+import * as startupBrand from "../src/tui/brand/startup.js";
+import * as tui from "../src/tui.js";
+import * as sessionManager from "../src/tui/session-manager.js";
 
 /** 创建可捕获 stdout/stderr 的测试流。 */
 function createStreams(): { stdout: { write(chunk: string): void; value: string }; stderr: { write(chunk: string): void; value: string }; stdin?: NodeJS.ReadableStream } {
@@ -133,6 +136,10 @@ function createCompositionRoot(): { root: CliCompositionRoot; dependencies: CliM
 /** 创建不驱动任何目标的常驻宿主替身；chat 用例不涉及协作执行。 */
 function createIdleThreadHost() {
   return {
+    /** 复用生产宿主的执行登记契约，替身只提供无副作用的 owner。 */
+    registerExecution: function registerExecution() {
+      return { activate: function activate() {}, release: function release() {} };
+    },
     start: function start() { return undefined; },
     stop: async function stop() { return undefined; },
     isRunning: function isRunning() { return false; },
@@ -140,6 +147,49 @@ function createIdleThreadHost() {
 }
 
 describe("CLI main", function cliMainSuite() {
+  it("两阶段 Logo 在 Trust 后与初始化并行，就绪后才进入 TUI，不等待模型回答", async function startupOrder() {
+    const setup = createCompositionRoot();
+    const streams = createStreams();
+    Object.assign(streams.stdout, { isTTY: true });
+    streams.stdin = Object.assign(new Readable({ read: function read() {} }), { isTTY: true });
+    const calls: string[] = [];
+    setup.root.resolveTrust = async function untrusted() { return { workspaceRoot: "C:/workspace", trustEntry: { status: "unknown" } } as Awaited<ReturnType<CliCompositionRoot["resolveTrust"]>>; };
+    const runtime = createRuntimeDouble();
+    setup.root.createRuntime = async function initialize() { calls.push("runtime"); return runtime; };
+    const start = vi.spyOn(startupBrand, "startCliStartupLogo").mockImplementation(function show() {
+      calls.push("logo");
+      return { dispose: function dispose() { calls.push("dispose"); }, finish: async function finish() { calls.push("ready"); } };
+    });
+    const trust = vi.spyOn(tui, "runCliTrustDialog").mockImplementation(async function confirm() { calls.push("trust"); return "granted"; });
+    const manager = vi.spyOn(sessionManager, "createCliSessionManager").mockReturnValue({ start: function start() {}, stop: async function stop() { return undefined; } } as unknown as sessionManager.CliSessionManager);
+    const run = vi.spyOn(tui, "runCliTui").mockImplementation(async function showTui(options) {
+      calls.push("tui");
+      expect(options.initial).toEqual({ type: "start", content: "hello" });
+      return { exitCode: 0, result: { kind: "exit", exitCode: 0, lines: [], projection: options.controller.getProjection() } };
+    });
+    try {
+      expect(await main(["chat", "hello"], streams, setup.dependencies)).toBe(0);
+      expect(calls).toEqual(["trust", "logo", "runtime", "ready", "tui", "dispose"]);
+    } finally { start.mockRestore(); trust.mockRestore(); manager.mockRestore(); run.mockRestore(); }
+  });
+
+  it("启动初始化失败立即移除 Logo，再报告错误，不经过两秒等待", async function startupFailure() {
+    const setup = createCompositionRoot();
+    const streams = createStreams();
+    Object.assign(streams.stdout, { isTTY: true });
+    streams.stdin = Object.assign(new Readable({ read: function read() {} }), { isTTY: true });
+    const dispose = vi.fn();
+    const finish = vi.fn();
+    const start = vi.spyOn(startupBrand, "startCliStartupLogo").mockReturnValue({ dispose, finish });
+    setup.root.createRuntime = async function fail() { throw new Error("init"); };
+    try {
+      expect(await main([], streams, setup.dependencies)).toBe(1);
+      expect(dispose).toHaveBeenCalledOnce();
+      expect(finish).not.toHaveBeenCalled();
+      expect(streams.stderr.value).toContain("CLI_RUNTIME_ERROR");
+    } finally { start.mockRestore(); }
+  });
+
   /** 升级问题须给出稳定原因和可操作提示，不能再隐藏为 CLI_RUNTIME_ERROR。 */
   it.each(["STATE_SCHEMA_VERSION_UNSUPPORTED", "STATE_SCHEMA_MIGRATION_FAILED", "STATE_SCHEMA_BUSY"] as const)("状态错误 %s 输出原因和恢复提示", async function stateError(code) {
     const streams = createStreams();

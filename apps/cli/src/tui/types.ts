@@ -20,7 +20,7 @@ import type {
 /** TUI 中可固化的 transcript 节点。 */
 export type CliTuiTranscriptItem =
   | { kind: "prompt"; key: string; content: string }
-  | { kind: "notice"; key: string; message: string }
+  | { kind: "notice"; key: string; message: string; persistent?: boolean }
   | {
       kind: "turn";
       key: string;
@@ -96,6 +96,8 @@ export interface CliTuiSnapshot {
   /** 最近一次 context_usage 的安全 DTO；只驱动状态栏刷新，不进入时间线。 */
   contextUsage?: ContextUsageView | null;
   cancellationRequested: boolean;
+  /** 当前 Session 的手动压缩等待态，仅供 TUI 展示，不改变 Turn 状态。 */
+  compacting?: boolean;
   requestedExitCode?: CliExitCode;
 }
 
@@ -103,15 +105,17 @@ export interface CliTuiSnapshot {
 export interface CliTuiStore {
   getSnapshot(): CliTuiSnapshot;
   subscribe(listener: () => void): () => void;
-  recordPrompt(content: string, displayAsActive?: boolean): string | undefined;
+  recordPrompt(content: string, displayAsActive?: boolean | "history"): string | undefined;
   captureInputPosition(): CliTuiInputPosition;
   addPendingPrompt(content: string, input: { inputId: string; delivery: "steer" | "queue" }, position?: CliTuiInputPosition): void;
+  rejectPendingPrompt(inputId: string, message: string): void;
   markQueuedInputStarted(input: CliQueuedInputStarted): void;
   recordApprovalSubmission(decision: Extract<CliAction, { type: "approve" }>["decision"]): void;
   addNotice(message: string): void;
   acceptEvent(event: CliPublicEvent, projection: CliProjection): void;
   syncProjection(projection: CliProjection): void;
   setCancellationRequested(requested: boolean): void;
+  setCompacting(compacting: boolean): void;
   requestExit(code: CliExitCode): void;
 }
 
@@ -122,6 +126,10 @@ export type CliTuiInitialOperation =
 
 /** Ink TUI 的运行参数。 */
 export interface RunCliTuiOptions {
+  /** 远端受管会话使用同一 Store 接收持久事件及连接提示。 */
+  store?: CliTuiStore;
+  /** Desktop 编排主控允许已提交消息灰底和模型名的局部强调色。 */
+  managedPromptBackground?: boolean;
   controller: CliController;
   /** Project级固定会话目录；选择只变视图，不恢复执行。 */
   sessionManager?: import("./session-manager.js").CliSessionManager;

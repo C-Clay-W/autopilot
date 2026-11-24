@@ -7,10 +7,11 @@
 
 import type { AgentCheckpoint, RunConfig, StartTurnInput } from "../../protocol";
 import { AgentRuntimeError as RuntimeError, migrateAgentMessages, validateAgentMessages } from "../../protocol";
-import { createAgentTextMessage, getAgentMessageText, scanAgentToolPairing, type AgentMessage } from "../../../internal/types/agent-message";
+import { createAgentTextMessage, getAgentMessageText, getAgentToolCalls, scanAgentToolPairing, type AgentMessage } from "../../../internal/types/agent-message";
 import type { TodoItem } from "../../domain";
 import type { Turn } from "../../domain";
 import type { RuntimePorts } from "../../ports";
+import { closeInterruptedToolCalls } from "./turn-recovery-service";
 
 /** Turn 会话构建器公开的内部职责。 */
 export interface TurnConversationBuilder {
@@ -44,8 +45,7 @@ export function createTurnConversationBuilder(ports: RuntimePorts): TurnConversa
   /**
    * 查找最近一个可安全重建的会话基线 Turn（H1）：
    * 已完成、失败与中断轮都属于可延续的会话事实，不能只为 status=completed 跳过原任务；
-   * 只接受 checkpoint 身份一致、消息可迁移且工具调用配对完整的记录，配对不完整时
-   * 回退到更早可重建轮，不改写任何 durable 数据。
+   * 保留身份一致且可重建的消息；中断轮的未闭合调用作为未知结果，不改写 durable 数据。
    */
   async function getConversationBaselineTurn(sessionId: string): Promise<Turn | undefined> {
     const candidates = (await ports.turnStore.list(sessionId))
@@ -54,10 +54,7 @@ export function createTurnConversationBuilder(ports: RuntimePorts): TurnConversa
     for (const turn of candidates) {
       const checkpoint = await ports.checkpointStore.getByTurn(sessionId, turn.id);
       if (!checkpoint || checkpoint.turnId !== turn.id) continue;
-      const migrated = migrateAgentMessages({ messageSchemaVersion: checkpoint.messageSchemaVersion, messages: checkpoint.messages, allowPending: true });
-      if (!migrated.ok) continue;
-      if (scanAgentToolPairing(migrated.messages).pendingCallIds.length > 0) continue;
-      return turn;
+      if (readBaselineMessages(checkpoint)) return turn;
     }
     return undefined;
   }
@@ -69,12 +66,9 @@ export function createTurnConversationBuilder(ports: RuntimePorts): TurnConversa
     if (!checkpoint || checkpoint.turnId !== baseline.id) return initial;
     const systemMessages = initial.filter((message) => message.role === "system");
     const remainingMessages = initial.filter((message) => message.role !== "system");
-    const migrated = migrateAgentMessages({
-      messageSchemaVersion: checkpoint.messageSchemaVersion,
-      messages: checkpoint.messages,
-    });
-    if (!migrated.ok) throw new RuntimeError("CANONICAL_MESSAGE_INVALID", `历史会话消息迁移失败：${migrated.message}`);
-    return [...systemMessages, ...normalizeConversationMessages(migrated.messages), ...remainingMessages];
+    const messages = readBaselineMessages(checkpoint);
+    if (!messages) throw new RuntimeError("CANONICAL_MESSAGE_INVALID", "历史会话消息无法安全重建");
+    return [...systemMessages, ...normalizeConversationMessages(messages), ...remainingMessages];
   }
 
   /** 在消息完整重建时继承上一 Turn 的私有 usage anchor，否则安全回退估算。 */
@@ -121,6 +115,17 @@ export function createTurnConversationBuilder(ports: RuntimePorts): TurnConversa
 
 /** 可作为新 Turn 会话基线的终态：完成、失败与中断都保留原请求与已确认操作（H1）。 */
 const CONVERSATION_BASELINE_STATUSES: ReadonlySet<Turn["status"]> = new Set(["completed", "failed", "interrupted"]);
+
+/** 中断的工具批次可能只写入了部分结果；在新 Turn 的历史中安全闭合尾部。 */
+function readBaselineMessages(checkpoint: AgentCheckpoint): AgentMessage[] | undefined {
+  const migrated = migrateAgentMessages({ messageSchemaVersion: checkpoint.messageSchemaVersion, messages: checkpoint.messages, allowPending: true });
+  if (!migrated.ok) return undefined;
+  const { messages, pendingCallIds } = scanAgentToolPairing(migrated.messages);
+  if (!pendingCallIds.length) return messages;
+  if (!["interrupted", "interrupted_recoverable"].includes(checkpoint.status)) return undefined;
+  const calls = messages.flatMap(getAgentToolCalls).filter(function pending(call) { return pendingCallIds.includes(call.id); });
+  return closeInterruptedToolCalls(messages, calls);
+}
 
 /** 只保留已通过 V2 配对校验的历史；新 V2 损坏不得静默丢弃。 */
 function normalizeConversationMessages(messages: AgentMessage[]): AgentMessage[] {

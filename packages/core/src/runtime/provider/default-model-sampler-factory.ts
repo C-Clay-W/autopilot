@@ -19,6 +19,7 @@ import type { ModelBehaviorProfile } from "./model-behavior-profile";
 import { createDefaultModelBehaviorProfile } from "./model-behavior-profile";
 import { createAnthropicMessagesSampler } from "./anthropic-messages-adapter";
 import { createOpenAiChatCompletionsSampler } from "./openai-chat-completions-adapter";
+import { createOpenAiResponsesSampler } from "./openai-responses-adapter";
 import { getModelCapabilityForRef } from "./model-capability-catalog";
 
 /**
@@ -74,6 +75,14 @@ export function createDefaultModelSamplerFactory(options: ModelSamplerFactoryOpt
 function createBaselineProtocolAdapters(): ProviderProtocolAdapter[] {
   return [
     {
+      apiProtocol: "openai-responses",
+      createSampler(input) {
+        const protocolProfile = input.providerConfig.protocolProfile;
+        if (protocolProfile && protocolProfile.apiProtocol !== "openai-responses") throw new AgentRuntimeError("INVALID_PROTOCOL_PROFILE", "Responses profile 不匹配");
+        return createOpenAiResponsesSampler({ routeId: input.providerConfig.provider, baseUrl: input.providerConfig.baseUrl, apiKey: input.credential?.apiKey, timeoutMs: input.providerConfig.timeoutMs, maxOutputTokens: input.providerConfig.maxOutputTokens, sampleOptions: input.providerConfig.sampleOptions ?? input.sampleOptions ?? { model: input.ref.modelId }, protocolProfile, compatibilityPreset: input.providerConfig.compatibilityPreset });
+      },
+    },
+    {
       apiProtocol: "anthropic-messages",
       createSampler(input) {
         return createAnthropicMessagesSampler({
@@ -100,6 +109,8 @@ function createBaselineProtocolAdapters(): ProviderProtocolAdapter[] {
           timeoutMs: input.providerConfig.timeoutMs,
           sampleOptions: input.providerConfig.sampleOptions ?? input.sampleOptions ?? resolveModelSampleOptions(input.ref, input.reasoningProfile),
           protocolProfile,
+          compatibilityPreset: input.providerConfig.compatibilityPreset,
+          maxOutputTokens: input.providerConfig.maxOutputTokens,
         });
       },
     },

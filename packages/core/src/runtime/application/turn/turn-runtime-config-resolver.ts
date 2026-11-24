@@ -17,10 +17,10 @@ import type { ApprovalService, InternalApprovalService } from "../approval-servi
 import type { InputInboxService } from "../input-inbox-service";
 import type { JobService } from "../job-service";
 import type { RunConfig } from "../../protocol";
-import { resolveFirstPartyModelSampleOptions, resolveModelSampleOptions } from "../../provider/model-sample-resolver";
+import { resolveFirstPartyModelSampleOptions, resolveModelSampleOptions, resolveRouteModelSample } from "../../provider/model-sample-resolver";
 import type { FrozenProviderConfig } from "../../provider/frozen-provider-config";
 import { isApiProtocol, isProtocolProfileForApiProtocol } from "../../provider/api-protocol";
-import { getModelCapabilityForRef } from "../../provider/model-capability-catalog";
+import { resolveRouteModelCapability, resolveRouteProtocolProfile, getModelCapabilityForRef } from "../../provider/model-capability-catalog";
 import { AgentRuntimeError } from "../../protocol/error-code";
 import { isExternalFileConstraint } from "../../domain/external-permissions";
 import { isNoSandboxExecConstraint } from "../../domain/sandbox-policy";
@@ -97,7 +97,7 @@ export function createTurnRuntimeConfigResolver(
           baseUrl: route.baseUrl,
           credentialRef: route.credentialRef,
           apiProtocol: route.apiProtocol,
-          protocolProfile: routeModel?.protocolProfile ?? route.protocolProfile,
+          protocolProfile: resolveRouteProtocolProfile(route, frozen.modelRef.modelId),
         }
       : frozen.modelRef.provider === "firstParty" ? primarySettings : undefined;
     if (route && !routeModel) {
@@ -116,10 +116,13 @@ export function createTurnRuntimeConfigResolver(
     if (routeSettings.protocolProfile && !isProtocolProfileForApiProtocol(routeSettings.protocolProfile, routeSettings.apiProtocol)) {
       throw new AgentRuntimeError("INVALID_PROTOCOL_PROFILE", "受信 route 的 protocolProfile 与 apiProtocol 不匹配");
     }
-    const resolved = frozen.modelRef.provider === "firstParty"
+    const resolved = route ? resolveRouteModelSample(route, frozen.modelRef, frozen.reasoningProfile) : frozen.modelRef.provider === "firstParty"
       ? resolveFirstPartyModelSampleOptions(frozen.modelRef, frozen.reasoningProfile, { thinkingEnabled: primarySettings?.thinkingEnabled })
       : { sampleOptions: resolveModelSampleOptions(frozen.modelRef, frozen.reasoningProfile) };
-    const contextWindowTokens = getModelCapabilityForRef(frozen.modelRef)?.contextWindowTokens ?? routeModel?.contextWindowTokens;
+    const modelCapability = route ? resolveRouteModelCapability(route, frozen.modelRef.modelId) : getModelCapabilityForRef(frozen.modelRef);
+    const contextWindowTokens = modelCapability?.contextWindowTokens;
+    const requestedMaxTokens = frozen.reasoningProfile?.maxTokens ?? primarySettings?.maxOutputTokens;
+    const maxTokens = Math.min(requestedMaxTokens ?? modelCapability?.maxOutputTokens ?? 8_192, modelCapability?.maxOutputTokens ?? Infinity);
     const visionRef = capabilities.providerSettings?.visionModelRef;
     const visionSettings = visionRef ? capabilities.providerSettings?.vision ?? primarySettings : undefined;
     const visionApiProtocol = visionSettings?.apiProtocol ?? (visionRef?.provider === "firstParty" ? primarySettings?.apiProtocol : visionRef ? "openai-chat-completions" : undefined);
@@ -127,16 +130,18 @@ export function createTurnRuntimeConfigResolver(
       provider: frozen.modelRef.provider,
       apiProtocol: routeSettings.apiProtocol,
       protocolProfile: routeSettings.protocolProfile,
+      compatibilityPreset: route?.compatibilityPreset,
       baseUrl: routeSettings.baseUrl,
       credentialRef: routeSettings.credentialRef ?? frozen.credentialRef,
       sampleOptions: {
         ...resolved.sampleOptions,
-        ...(primarySettings?.maxOutputTokens !== undefined ? { maxTokens: primarySettings.maxOutputTokens } : {}),
+        ...(maxTokens !== undefined ? { maxTokens } : {}),
         ...(primarySettings?.temperature !== undefined ? { temperature: primarySettings.temperature } : {}),
         ...(primarySettings?.topP !== undefined ? { topP: primarySettings.topP } : {}),
       },
       ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
-      supportsImageInput: getModelCapabilityForRef(frozen.modelRef)?.inputModalities.includes("image") === true,
+      ...(modelCapability?.maxOutputTokens !== undefined ? { maxOutputTokens: modelCapability.maxOutputTokens } : {}),
+      supportsImageInput: modelCapability?.inputModalities?.includes("image") === true,
       compactThresholdTokens: primarySettings?.compactThresholdTokens,
       timeoutMs: primarySettings?.timeoutMs,
       subagentModelId: primarySettings?.subagentModelId,
@@ -174,6 +179,8 @@ export function createTurnRuntimeConfigResolver(
       : undefined;
     return {
       capabilityCeiling: frozen.capabilityCeiling,
+      hostToolAdmission: isChat ? undefined : (capabilities as TurnCapabilities).hostToolAdmission,
+      hostTools: isChat ? undefined : (capabilities as TurnCapabilities).hostTools,
       sessionImageStore: isChat ? undefined : ports.sessionImageStore,
       supportsImageInput: !isChat && providerConfig?.supportsImageInput === true,
       chatCapability: chatCapability && visionAnalyzer && chatCapability.visionAnalyzer ? { ...chatCapability, visionAnalyzer } : chatCapability,
@@ -186,6 +193,8 @@ export function createTurnRuntimeConfigResolver(
       web: isChat && frozen.capabilityCeiling?.chatRetrievalMode !== "web" ? undefined : capabilities.web,
       // Work 内置预览能力仅在 Work Turn 由能力上限解析阶段装配；Chat 恒为 undefined。
       workPreview: isChat ? undefined : (capabilities as TurnCapabilities).workPreview,
+      browser: isChat ? undefined : capabilities.browser,
+      browserBinding: isChat ? undefined : { sessionId, turnId },
       // 会话协作（Talk-Plan1028 S3）：actor、父会话与组来自本 Turn 的可信绑定，Chat 不装配。
       threads: isChat || !threadCapability
         ? undefined

@@ -7,15 +7,8 @@
  * protocol payload 只由 Provider adapter 从冻结 requested/effective 结果生成。
  */
 
-/**
- * 推理强度意图（用户可见/可持久化的 requested 语义）。
- * - none：关闭思考（thinking.disabled，省略 reasoning_effort）
- * - medium：CC-compatible 的中等思考强度
- * - high：默认思考强度（thinking.enabled + reasoning_effort=high）
- * - max：最大思考强度（thinking.enabled + reasoning_effort=max）
- * 旧的扩展值不属于当前配置合同，本层不接受也不静默改写。
- */
-export type ReasoningEffort = "none" | "low" | "medium" | "high" | "max";
+/** 用户可见的中立六档推理意图，实际合法子集由协议和模型能力限定。 */
+export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 
 /**
  * 将任意字符串解析为受支持的 ReasoningEffort。
@@ -24,7 +17,7 @@ export type ReasoningEffort = "none" | "low" | "medium" | "high" | "max";
  * @returns 支持的 ReasoningEffort；未知或不支持时返回 undefined
  */
 export function parseReasoningEffort(value: unknown): ReasoningEffort | undefined {
-  if (value === "none" || value === "low" || value === "medium" || value === "high" || value === "max") return value;
+  if (value === "none" || value === "low" || value === "medium" || value === "high" || value === "xhigh" || value === "max") return value;
   return undefined;
 }
 

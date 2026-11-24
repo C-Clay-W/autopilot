@@ -7,7 +7,7 @@
 
 import { readSessionIdentity } from "../domain/product-mode";
 import type { ProductMode, ChatRetrievalMode } from "../domain/product-mode";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { RuntimePorts } from "../ports";
 import type { Session, SessionPersistenceMode, SessionRunConfig } from "../domain";
 import { AgentRuntimeError as RuntimeError } from "../protocol";
@@ -43,6 +43,8 @@ export interface SessionService {
 
 /** 创建 Session 的输入。 */
 export interface CreateSessionInput {
+  /** 只供受信宿主的新建入口使用；不可接管已有自由 Session。 */
+  managedExecution?: Session["managedExecution"];
   /** 兼容迁移时可保留既有 ID；正常新建由 Core 生成。 */
   id?: string;
   /** 服务端来源；省略仅兼容既有 Work 宿主。 */
@@ -69,6 +71,19 @@ export function createSessionService(ports: RuntimePorts, jobService?: JobServic
 
   /** 创建前校验身份及 ID；旧 Work 调用方缺省 projectId 时只复用宿主绑定工作区。 */
   async function create(input: CreateSessionInput): Promise<Session> {
+    if (input.managedExecution) {
+      const identity = input.managedExecution;
+      if (input.id || identity.threadPolicy !== "disabled" || !/^[\w-]{1,128}$/.test(identity.hostId) || !/^[\w-]{1,128}$/.test(identity.requestId) || input.productMode === "chat" || input.persistenceMode === "ephemeral") throw new RuntimeError("INVALID_INPUT", "受管创建身份无效");
+      const id = createHash("sha256").update(JSON.stringify([identity.hostId, identity.requestId])).digest("hex");
+      return ports.threadStore.withSessionLock(id, async function createManaged() {
+        const existing = await ports.sessionStore.get(id);
+        if (existing) {
+          if (JSON.stringify(existing.managedExecution) !== JSON.stringify(identity) || (input.projectId && existing.projectId !== input.projectId)) throw new RuntimeError("SESSION_MODE_MISMATCH", "受管创建身份冲突");
+          return structuredClone(existing);
+        }
+        return createSessionRecord(ports, { ...input, id });
+      });
+    }
     return createSessionRecord(ports, input);
   }
 
@@ -102,6 +117,7 @@ export function createSessionService(ports: RuntimePorts, jobService?: JobServic
     if (!stored) throw new RuntimeError("SESSION_NOT_FOUND", "Session 不存在");
     const identity = readSessionIdentity(stored);
     const next = readSessionIdentity(session);
+    if (JSON.stringify(stored.managedExecution) !== JSON.stringify(session.managedExecution)) throw new RuntimeError("SESSION_MODE_MISMATCH", "受管身份不可修改");
     if (JSON.stringify(stored.collaborationAllowedTools) !== JSON.stringify(session.collaborationAllowedTools)) throw new RuntimeError("SESSION_MODE_MISMATCH", "协作能力上限不可修改");
     if (JSON.stringify(stored.creationSource) !== JSON.stringify(session.creationSource)) throw new RuntimeError("SESSION_MODE_MISMATCH", "Session 创建来源不可修改");
     if (stored.collaborationCreationId !== session.collaborationCreationId) throw new RuntimeError("SESSION_MODE_MISMATCH", "Session 协作创建身份不可修改");
@@ -119,6 +135,10 @@ export function createSessionService(ports: RuntimePorts, jobService?: JobServic
     const session = await ports.sessionStore.get(id);
     if (!session) {
       throw new RuntimeError("SESSION_NOT_FOUND", `Session ${id} 不存在`);
+    }
+    if (runConfig.permissionMode !== undefined && runConfig.permissionMode !== session.permissionSelection?.mode) {
+      if (!["ask", "auto_approve", "full_access"].includes(runConfig.permissionMode)) throw new RuntimeError("INVALID_INPUT", "无效权限模式");
+      session.permissionSelection = { mode: runConfig.permissionMode, revision: randomUUID() };
     }
     session.defaultRunConfig = runConfig;
     session.updatedAt = ports.clock.now();
@@ -211,6 +231,7 @@ async function createSessionRecord(ports: RuntimePorts, input: CreateSessionInpu
   const now = ports.clock.now();
   const session: Session = {
     id: input.id ?? randomUUID(),
+    ...(input.managedExecution ? { managedExecution: structuredClone(input.managedExecution) } : {}),
     ...(creation ? { collaborationCreationId: creation.creationId, creationSource: structuredClone(creation.source) } : {}),
     productMode,
     ...(productMode === "work" ? { workContextVersion: 1 as const } : {}),

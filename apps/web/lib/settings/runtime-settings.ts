@@ -13,6 +13,10 @@ export function createSettingsRunConfig(settings: ResolvedAutopilotSettings): Pa
         credentialRef: selectedRoute.credentialRef,
         protocolProfile: selectedRoute.protocolProfile,
         maxOutputTokens: settings.firstParty.maxOutputTokens,
+        compactThresholdTokens: settings.firstParty.compactWindow,
+        timeoutMs: settings.firstParty.timeoutMs,
+        subagentModelId: settings.firstParty.subagentModelId,
+        ...(selectedRoute.apiProtocol === "anthropic-messages" ? { thinkingEnabled: settings.firstParty.thinkingEnabled } : {}),
       }
     : settings.modelRef && settings.modelRef.provider !== "firstParty"
       ? undefined

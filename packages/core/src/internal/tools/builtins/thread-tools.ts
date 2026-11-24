@@ -23,7 +23,7 @@ const createSchema = z.object({ groupId: threadIdSchema.optional(),
   title: z.string().min(1).max(200).optional(),
   roleLabel: z.string().min(1).max(100).optional(),
   modelRef: z.object({ provider: z.string().min(1).max(100), modelId: z.string().min(1).max(200) }).strict().optional(),
-  reasoningEffort: z.enum(["none", "low", "medium", "high", "max"]).optional(),
+  reasoningEffort: z.enum(["none", "low", "medium", "high", "xhigh", "max"]).optional(),
 }).strict();
 
 const listSchema = z.object({ groupId: threadIdSchema.optional(), cursor: cursorSchema.optional(), limit: limitSchema.optional() }).strict();

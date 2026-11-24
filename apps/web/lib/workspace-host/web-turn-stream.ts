@@ -1,7 +1,7 @@
 /**
- * web-turn-stream.ts — Work Turn 的只读观察流
+ * web-turn-stream.ts — Web Turn 的只读观察流
  *
- * 执行由 `WebTurnHost` 持有；本模块只按持久 transcript 重放并续读事件，
+ * 执行由各产品宿主持有；本模块只按持久 transcript 重放并续读事件，
  * 因此页面关闭、刷新或换标签只断开观察，不会取消 Turn。
  * 终态事件在宿主完成展示消息持久化后才下发，避免 History 读到空投影。
  */
@@ -11,11 +11,13 @@ import type { RuntimePorts } from "@autopilot-agent/core";
 import { toWebAgentEventDto } from "@/lib/runtime-host/web-ui-dto";
 import { isTerminalTurnEvent, type WebTurnHost } from "./web-turn-host";
 
-/** 观察流的装配参数；全部来自受信 Workspace 上下文。 */
+/** 观察流的装配参数；全部来自已校验的宿主上下文。 */
 export interface CreateWebTurnStreamInput {
   ports: RuntimePorts;
   /** 本宿主执行的 Turn 才有状态；协作 Runner 或重启后的 Turn 只按持久事件观察。 */
   host?: WebTurnHost;
+  /** Chat 使用原执行索引，在宿主写完消息前暂缓发送持久终态。 */
+  isExecutionActive?: () => boolean;
   sessionId: string;
   turnId: string;
   /** 已确认的最后一个 seq；缺省从头重放。 */
@@ -34,6 +36,7 @@ export function createWebTurnStream(input: CreateWebTurnStreamInput): ReadableSt
   const pollIntervalMs = Math.max(50, input.pollIntervalMs ?? 200);
   const maxWaitMs = Math.max(1_000, input.maxWaitMs ?? 30 * 60 * 1_000);
   const heartbeatMs = Math.max(1_000, input.heartbeatMs ?? 15_000);
+  let cancelled = false;
 
   return new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -62,8 +65,9 @@ export function createWebTurnStream(input: CreateWebTurnStreamInput): ReadableSt
       }
 
       try {
-        while (!input.signal.aborted) {
+        while (!cancelled && !input.signal.aborted) {
           const record = input.host?.status(input.turnId);
+          const executionActive = input.isExecutionActive?.();
           // 启动诊断属于 Host 事实，不占用 Runtime seq，只投影一次。
           if (!diagnosticsSent && record?.diagnostics.length) {
             send({ type: "context_diagnostic", diagnostics: record.diagnostics });
@@ -71,6 +75,7 @@ export function createWebTurnStream(input: CreateWebTurnStreamInput): ReadableSt
           }
 
           const envelopes = await input.ports.transcriptStore.getEvents(input.sessionId);
+          if (cancelled || input.signal.aborted) break;
           const pending = envelopes
             .filter(function sameTurn(envelope) { return envelope.turnId === input.turnId && envelope.seq > cursor; })
             .sort(function bySeq(left, right) { return left.seq - right.seq; });
@@ -96,7 +101,7 @@ export function createWebTurnStream(input: CreateWebTurnStreamInput): ReadableSt
               if (control?.group.enabled && control.controls.some(function pending(item) { return item.kind === "continue_interaction" && item.threadId === input.sessionId && item.expectedTurnId === input.turnId && ["pending", "claimed", "executing"].includes(item.status) && (!paused || !interaction || item.requestId === interaction.requestId && item.approvalId === interaction.approvalId); })) handoffPending = true;
             }
           }
-          const settled = !handoffPending && (record === undefined || record.state === "settled");
+          const settled = !handoffPending && (record === undefined || record.state === "settled") && !executionActive;
           if (terminal && settled) {
             send(toWebAgentEventDto(terminal, input.turnId));
             finish();
@@ -104,6 +109,12 @@ export function createWebTurnStream(input: CreateWebTurnStreamInput): ReadableSt
           }
 
           if (settled && paused) { finish(); return; }
+
+          // Chat 游标已越过终态时正常结束，不重发终态或留下空闲观察。
+          if (settled && input.isExecutionActive && envelopes.some(function alreadyObserved(envelope) { return envelope.turnId === input.turnId && envelope.seq <= cursor && isTerminalTurnEvent(envelope.event.type); })) {
+            finish();
+            return;
+          }
 
           if (record?.state === "settled" && !handoffPending) {
             // 没有 Turn 事件（启动前失败）时补发安全失败提示，不伪造已执行。
@@ -137,7 +148,7 @@ export function createWebTurnStream(input: CreateWebTurnStreamInput): ReadableSt
       }
     },
     cancel() {
-      // 观察者离开不代表取消任务；这里不做任何执行侧动作。
+      cancelled = true;
     },
   });
 }

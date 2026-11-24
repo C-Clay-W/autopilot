@@ -15,7 +15,7 @@ import { TuiFileMentionMenu, TUI_FILE_MENTION_VISIBLE_ROWS } from "./pickers/fil
 import { TuiModelPicker } from "./pickers/model.js";
 import { TuiPermissionPicker } from "./pickers/permission.js";
 import { TuiSkillPicker } from "./pickers/skill.js";
-import { TuiSlashCommandMenu } from "./pickers/slash.js";
+import { getTuiSlashMenuLayout, TuiSlashCommandMenu } from "./pickers/slash.js";
 import { TuiPromptInput } from "./prompt-input.js";
 import type { CliTuiStore } from "./types.js";
 
@@ -23,7 +23,7 @@ import type { CliTuiStore } from "./types.js";
 export interface TuiInputDerivedState {
   slashCommandSuggestions: CliSlashCommand[];
   fileMentionSuggestions: string[];
-  handleTuiViewportKey: (key: Key) => boolean;
+  handleTuiViewportKey: (key: Key, value?: string) => boolean;
   handleApprovalKey?: (value: string, key: Key) => boolean;
 }
 
@@ -44,14 +44,14 @@ function getTuiPickerHeight(input: {
   models?: CliModelOption[];
   efforts?: CliEffortOption[];
   skills?: CliSkillSummary[];
-  slashCommands: CliSlashCommand[];
+  slashMenuHeight: number;
   fileMentionCandidates: string[];
 }): number {
   if (input.permissions) return input.permissions.length + 6;
   if (input.models) return input.models.length + 5;
   if (input.efforts) return input.efforts.length + 5;
   if (input.skills) return Math.min(8, input.skills.length) + 8;
-  if (input.slashCommands.length > 0) return input.slashCommands.length + 5;
+  if (input.slashMenuHeight > 0) return input.slashMenuHeight;
   if (input.fileMentionCandidates.length > 0) return Math.min(TUI_FILE_MENTION_VISIBLE_ROWS, input.fileMentionCandidates.length) + 5;
   return 0;
 }
@@ -59,8 +59,11 @@ function getTuiPickerHeight(input: {
 /** 将 prompt 状态、输入分发和 picker 展示隔离到独立子树。 */
 export const TuiInputArea = memo(function TuiInputArea(props: {
   store: CliTuiStore;
+  parseInput?: import("../controller.js").CliController["parseInput"];
+  suggestSlashCommands?: import("../controller.js").CliController["suggestSlashCommands"];
   draftRef?: CliTuiDraftRef;
   columns: number;
+  availableRows: number;
   maximumPromptRows?: number;
   busy: { current: boolean };
   keepOpenAfterCancel: { current: boolean };
@@ -86,6 +89,7 @@ export const TuiInputArea = memo(function TuiInputArea(props: {
 }): ReactNode {
   const pickers = props.pickers;
   const { input, cursorIndex, handleInput } = usePromptInput({
+    parseInput: props.parseInput,
     draftRef: props.draftRef,
     store: props.store,
     columns: props.columns,
@@ -110,7 +114,7 @@ export const TuiInputArea = memo(function TuiInputArea(props: {
     derivedRef: props.derivedRef,
   });
 
-  const slashCommandSuggestions = getSlashCommandSuggestions(input);
+  const slashCommandSuggestions = (props.suggestSlashCommands ?? getSlashCommandSuggestions)(input);
   props.derivedRef.current.slashCommandSuggestions = slashCommandSuggestions;
   // @ 菜单派生：索引就绪且未被 Esc 关闭时，按当前 token 的四档评分过滤候选池。
   const fileMentionToken = props.fileMentionIndex?.ready ? extractFileMentionToken(input, cursorIndex) : null;
@@ -118,9 +122,13 @@ export const TuiInputArea = memo(function TuiInputArea(props: {
     ? filterFileMentionCandidates(props.fileMentionIndex?.entries ?? [], fileMentionToken.query)
     : [];
   props.derivedRef.current.fileMentionSuggestions = fileMentionSuggestions;
-  const promptHeight = props.showInput ? Math.min(props.maximumPromptRows ?? Infinity, createTuiPromptLayout(input, cursorIndex, Math.max(1, props.columns - 4)).lines.length) + 3 : 0;
+  const promptRows = Math.min(props.maximumPromptRows ?? Infinity, createTuiPromptLayout(input, cursorIndex, Math.max(1, props.columns - 4)).lines.length);
+  const showSlash = props.showInput && !pickers.isPickerActive && slashCommandSuggestions.length > 0;
+  const compactPrompt = showSlash && props.availableRows <= promptRows + 3;
+  const promptHeight = props.showInput ? compactPrompt ? 1 : promptRows + 3 : 0;
+  const slashLayout = showSlash ? getTuiSlashMenuLayout(slashCommandSuggestions.length, props.availableRows - promptHeight, props.columns) : undefined;
   const pickerHeight = props.showInput
-    ? getTuiPickerHeight({ permissions: pickers.permissionPickerOptions, models: pickers.modelPickerOptions, efforts: pickers.effortPickerOptions, skills: pickers.skillPickerSkills, slashCommands: slashCommandSuggestions, fileMentionCandidates: fileMentionSuggestions })
+    ? getTuiPickerHeight({ permissions: pickers.permissionPickerOptions, models: pickers.modelPickerOptions, efforts: pickers.effortPickerOptions, skills: pickers.skillPickerSkills, slashMenuHeight: slashLayout?.height ?? 0, fileMentionCandidates: fileMentionSuggestions })
     : 0;
 
   useLayoutEffect(function notifyInputLayoutChange() {
@@ -157,7 +165,7 @@ export const TuiInputArea = memo(function TuiInputArea(props: {
 
   if (!props.showInput) return null;
   return <>
-    <TuiPromptInput maximumRows={props.maximumPromptRows} input={input} cursorIndex={cursorIndex} columns={props.columns} useColor={props.useColor} screenReader={props.screenReader} busy={props.busy.current} />
+    <TuiPromptInput compact={compactPrompt} maximumRows={compactPrompt ? 1 : props.maximumPromptRows} input={input} cursorIndex={cursorIndex} columns={props.columns} useColor={props.useColor} screenReader={props.screenReader} busy={props.busy.current} />
     {pickers.permissionPickerOptions ? (
       <TuiPermissionPicker options={pickers.permissionPickerOptions} selectedIndex={pickers.permissionPickerIndex} useColor={props.useColor} screenReader={props.screenReader} />
     ) : pickers.modelPickerOptions ? (
@@ -166,8 +174,8 @@ export const TuiInputArea = memo(function TuiInputArea(props: {
       <TuiEffortPicker options={pickers.effortPickerOptions} selectedIndex={pickers.effortPickerIndex} useColor={props.useColor} screenReader={props.screenReader} />
     ) : pickers.skillPickerSkills ? (
       <TuiSkillPicker skills={pickers.skillPickerSkills} query={pickers.skillPickerQuery} selectedIndex={pickers.skillPickerIndex} useColor={props.useColor} screenReader={props.screenReader} />
-    ) : slashCommandSuggestions.length > 0 ? (
-      <TuiSlashCommandMenu commands={slashCommandSuggestions} selectedIndex={pickers.slashCommandIndex} useColor={props.useColor} screenReader={props.screenReader} />
+    ) : slashLayout ? (
+      <TuiSlashCommandMenu commands={slashCommandSuggestions} selectedIndex={pickers.slashCommandIndex} layout={slashLayout} useColor={props.useColor} screenReader={props.screenReader} />
     ) : fileMentionSuggestions.length > 0 ? (
       <TuiFileMentionMenu candidates={fileMentionSuggestions} selectedIndex={pickers.fileMentionIndex} useColor={props.useColor} screenReader={props.screenReader} />
     ) : null}

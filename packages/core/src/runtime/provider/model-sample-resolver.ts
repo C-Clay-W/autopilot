@@ -8,57 +8,32 @@
  * resolveFirstPartyModelSampleOptions 统一冻结 effective effort，不按第三方厂商分支。
  */
 
+import { AgentRuntimeError } from "../protocol/error-code";
+import { resolveRouteModelCapability } from "./model-capability-catalog";
 import type { ModelRef } from "../domain/model-ref";
 import type { ReasoningProfile } from "../domain/reasoning-profile";
 import type { ModelSampleOptions } from "../../internal/types";
 
-/**
- * 根据 ModelRef 与 ReasoningProfile 生成协议层采样选项。
- * - model 直接取 ModelRef.modelId（缺省时由 sampler 用环境变量兜底）
- * - effort 按首批公开值域映射为 thinking / reasoning_effort：
- *   none → thinking=disabled（省略 reasoning_effort）
- *   high → thinking=enabled + reasoning_effort=high
- *   max  → thinking=enabled + reasoning_effort=max
- * @param ref 冻结的模型引用；可能为 undefined（表示使用 Runtime 默认 sampler）
- * @param profile 冻结的推理配置；可能为 undefined（表示不强制思考，由 sampler/provider 默认决定）
- * @returns 解析后的采样选项；无法解析的字段保持 undefined
- */
-export function resolveModelSampleOptions(
-  ref?: ModelRef,
-  profile?: ReasoningProfile,
-): ModelSampleOptions {
-  const options: ModelSampleOptions = {
-    model: ref?.modelId,
+/** 兼容旧冻结快照的 Chat 解析入口，完整保留六档意图，Anthropic 使用独立原映射。 */
+export function resolveModelSampleOptions(ref?: ModelRef, profile?: ReasoningProfile): ModelSampleOptions {
+  const options: ModelSampleOptions = { model: ref?.modelId };
+  if (!profile) return options;
+  return {
+    ...options,
+    thinking: profile.effort === "none" ? "disabled" : "enabled",
+    reasoningEffort: profile.effort,
+    ...(profile.maxTokens !== undefined ? { maxTokens: profile.maxTokens } : {}),
   };
-
-  if (!profile?.effort) return options;
-
-  switch (profile.effort) {
-    case "none":
-      options.thinking = "disabled";
-      // reasoning_effort 省略：思考关闭时不发送该字段
-      break;
-    case "high":
-      options.thinking = "enabled";
-      options.reasoningEffort = "high";
-      break;
-    case "max":
-      options.thinking = "enabled";
-      options.reasoningEffort = "max";
-      break;
-  }
-
-  return options;
 }
 
 /** firstParty effective effort 的来源；当前仅保留用户请求原样生效这一种结果。 */
-export type FirstPartyEffortSource = "requested";
+export type FirstPartyEffortSource = "requested" | "default";
 
 /** firstParty Messages 请求与展示共用的冻结解析结果。 */
 export interface ResolvedFirstPartyModelSample {
   sampleOptions: ModelSampleOptions;
   effectiveReasoning?: {
-    effort: "none" | "low" | "medium" | "high" | "max";
+    effort: "none" | "low" | "medium" | "high" | "xhigh" | "max";
     source: FirstPartyEffortSource;
   };
 }
@@ -81,6 +56,7 @@ export function resolveFirstPartyModelSampleOptions(
       effectiveReasoning: { effort: "none", source: "requested" },
     };
   }
+  if (profile.effort === "xhigh") throw new AgentRuntimeError("REASONING_EFFORT_NOT_SUPPORTED", "Anthropic 不支持 xhigh");
   const effectiveEffort = profile.effort;
   return {
     sampleOptions: {
@@ -93,4 +69,18 @@ export function resolveFirstPartyModelSampleOptions(
       source: "requested",
     },
   };
+}
+
+
+/** 为两种 OpenAI 协议生成同一能力来源的冻结采样值，保留 Anthropic 原映射。 */
+export function resolveRouteModelSample(route: import("./api-protocol").ProviderRouteProfile, ref: ModelRef, profile?: ReasoningProfile): ResolvedFirstPartyModelSample {
+  const capability = resolveRouteModelCapability(route, ref.modelId);
+  if (route.apiProtocol === "anthropic-messages") return resolveFirstPartyModelSampleOptions(ref, profile);
+  if (capability.supportsToolCalls === false) throw new AgentRuntimeError("MODEL_NOT_SUPPORTED", "当前模型协议不支持 Agent 工具，请选择支持工具的 Responses 模型");
+  const effort = profile?.effort ?? capability.defaultReasoningEffort;
+  if (effort && !capability.supportedReasoningEfforts?.includes(effort)) throw new AgentRuntimeError("REASONING_EFFORT_NOT_SUPPORTED", `请配置模型能力并选择合法 effort：${capability.supportedReasoningEfforts?.join("/") ?? "能力未知"}`);
+  const sampleOptions: ModelSampleOptions = { model: ref.modelId, ...(effort ? { reasoningEffort: effort } : {}) };
+  // 旧无预设 Chat 仍保留 thinking 兼容字段，但所有强度都保留 wire 值。
+  if (route.apiProtocol === "openai-chat-completions" && !route.compatibilityPreset && effort) sampleOptions.thinking = effort === "none" ? "disabled" : "enabled";
+  return { sampleOptions, ...(effort ? { effectiveReasoning: { effort, source: profile ? "requested" : "default" } } : {}) };
 }

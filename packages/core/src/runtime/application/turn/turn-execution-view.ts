@@ -127,7 +127,13 @@ export async function readTurnExecutionView(ports: RuntimePorts, input: { sessio
       const intent = [...control!.controls].reverse().find(function latestIntent(item) { return item.kind === "continue_interaction" && item.threadId === input.sessionId && item.expectedTurnId === turn.id && (requestId ? item.requestId === requestId : approval?.type === "approval_required" ? item.approvalId === approval.result.approval.approvalId : true); });
       if (intent) view.continuation = { controlId: intent.controlId, state: intent.status, ...(intent.requestId ? { requestId: intent.requestId } : {}), ...(intent.approvalId ? { approvalId: intent.approvalId } : {}), ...(intent.failureCode ? { failureCode: intent.failureCode } : {}), ...(sanitizeContinuationFailure(intent.failureDiagnostic) ? { failureDiagnostic: sanitizeContinuationFailure(intent.failureDiagnostic) } : {}) };
     }
-    if (!checkpoint || checkpoint.turnId !== turn.id) { view.unconfirmedReason = "checkpoint_missing"; return view; }
+    if (!checkpoint || checkpoint.turnId !== turn.id) {
+      // 首个 checkpoint 前装配失败时，Turn 和 Session 已落失败事实且租约已释放。
+      if (latest?.id === turn.id && turn.status === "failed" && session?.status === "failed" && !session.activeTurnId && !ownerAfter) {
+        return { ...view, status: "failed", execution: "inactive", result: "failed" };
+      }
+      view.unconfirmedReason = "checkpoint_missing"; return view;
+    }
     const started = [...events].reverse().find(function start(item) { return item.event.type === "turn_started"; })?.seq ?? 0;
     const boundarySeq = checkpoint.lease?.safeBoundarySeq ?? lastSeq;
     const terminal = [...events].reverse().find(function ended(item) { return item.seq >= started && item.seq >= boundarySeq && ["turn_completed", "turn_failed", "turn_interrupted", "turn_limit_reached"].includes(item.event.type); });

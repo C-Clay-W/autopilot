@@ -72,6 +72,8 @@ export type SessionStatus = "idle" | "running" | "waiting_approval" | "waiting_u
 
 /** Session 实体。 */
 export interface Session {
+  /** 受信宿主创建时冻结；不从页面/目录推断，不授予业务派工资格。 */
+  readonly managedExecution?: { hostId: string; requestId: string; threadPolicy: "disabled" };
   /** 仅新建 Work 会话由 Core 写入，旧记录不能由 save 升级来源。 */
   readonly workContextVersion?: 1;
   id: string;
@@ -92,6 +94,8 @@ export interface Session {
   title?: string;
   /** Session 级默认运行配置；优先级高于 Project 默认值，低于 Turn 覆盖。 */
   defaultRunConfig?: import("./session-run-config").SessionRunConfig;
+  /** 仅受信宿主设置入口签发的人类权限选择，普通 Turn override 不可生成。 */
+  permissionSelection?: { mode: import("../../internal/tools/types").ToolPermissionMode; revision: string };
   /** 宿主展示投影；与 Core Session 同库持久化，不是独立会话状态源。 */
   presentation?: import("./session-presentation").SessionPresentation;
   createdAt: number;

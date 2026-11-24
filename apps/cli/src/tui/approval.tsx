@@ -61,12 +61,12 @@ export function TuiApprovalPrompt(props: { pendingApproval: NonNullable<CliProje
       {props.pendingApproval.display?.resource ? <Text>影响：{props.pendingApproval.display.resource}</Text> : null}
       {props.pendingApproval.display?.cwd ? <Text>工作目录：{props.pendingApproval.display.cwd}</Text> : null}
       {props.pendingApproval.display?.effect === "external" && props.pendingApproval.display?.hostExecution === true ? (
-        <Text color={props.useColor ? TUI_ACCENT_COLOR : undefined}>⚠ 外部路径：命令声明了工作区外目标，但宿主进程不受该文件范围约束，可能同时影响其他文件；批准不构成精确范围保证</Text>
+        <Text color={props.useColor ? TUI_ACCENT_COLOR : undefined}>⚠ 执行范围未限定：宿主进程不受文件范围隔离，可能影响其他文件；请审查完整命令，批准不构成精确范围保证</Text>
       ) : null}
       {props.pendingApproval.display?.effect === "external" && props.pendingApproval.display?.hostExecution !== true && props.pendingApproval.display?.unknownScope ? (
         <Text color={props.useColor ? TUI_ACCENT_COLOR : undefined}>⚠ 修改范围无法精确限定：该命令未声明精确外部目标，请审查完整命令后再决定</Text>
       ) : null}
-      {props.pendingApproval.display?.effect === "external" && props.pendingApproval.display?.hostExecution !== true && !props.pendingApproval.display?.unknownScope ? (
+      {props.pendingApproval.toolName !== "browser" && props.pendingApproval.display?.effect === "external" && props.pendingApproval.display?.hostExecution !== true && !props.pendingApproval.display?.unknownScope ? (
         <Text color={props.useColor ? TUI_ACCENT_COLOR : undefined}>⚠ 外部路径：目标位于工作区之外，授权仅覆盖上述精确目标</Text>
       ) : null}
       {props.pendingApproval.display?.hostExecution === true ? (

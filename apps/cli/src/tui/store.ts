@@ -1,5 +1,6 @@
 /** TUI 外部 Store：把安全事件归约为 React 可订阅快照，不读取 Core Store 或 checkpoint。 */
 
+import { stripVTControlCharacters } from "node:util";
 import {
   createInitialCliActivityState,
   reduceCliActivityState,
@@ -37,7 +38,7 @@ function createInitialTuiSnapshot(now = Date.now()): CliTuiSnapshot {
 }
 
 /** 创建 Ink TUI 的外部 Store。 */
-export function createCliTuiStore(): CliTuiStore {
+export function createCliTuiStore(): CliTuiStore & { recordTask(id: string, content: string): void } {
   let snapshot = createInitialTuiSnapshot();
   let noticeIndex = 0;
   let promptIndex = 0;
@@ -123,6 +124,8 @@ export function createCliTuiStore(): CliTuiStore {
     // 立即清空会让外层历史区过滤掉同一 Turn，导致最后一段回答不可见。
     snapshot = {
       ...snapshot,
+      // Prompt 与所属 Turn 同帧移交历史，避免中断后仍留在动态区或恢复时重放。
+      activePrompt: snapshot.activePrompt?.turnId === turnId ? undefined : snapshot.activePrompt,
       transcript: [
         ...snapshot.transcript,
         {
@@ -149,22 +152,29 @@ export function createCliTuiStore(): CliTuiStore {
         listeners.delete(listener);
       };
     },
-    recordPrompt(content: string, displayAsActive = true): string | undefined {
+    recordPrompt(content: string, displayAsActive: boolean | "history" = true): string | undefined {
       const trimmed = content.trim();
       if (!trimmed) return undefined;
       // 运行中的 steer/queue 由已确认的 inputId 单独记录，避免发送前伪造成功展示。
-      if (!displayAsActive) return undefined;
+      if (displayAsActive === false) return undefined;
       const key = "prompt:" + String(promptIndex++);
       publish({
         ...snapshot,
         // info 是下一次 Turn 之前的临时反馈；新 prompt 被接收后必须立即消费，不能留在新 Turn 的输入区上方。
         transcript: [
-          ...snapshot.transcript.filter(function omitConsumedNotice(item): boolean { return item.kind !== "notice"; }),
+          ...snapshot.transcript.filter(function omitConsumedNotice(item): boolean { return item.kind !== "notice" || item.persistent === true; }),
           { kind: "prompt", key, content: trimmed },
         ],
-        activePrompt: displayAsActive ? { key, content: trimmed } : snapshot.activePrompt,
+        activePrompt: displayAsActive === true ? { key, content: trimmed } : snapshot.activePrompt,
       });
       return key;
+    },
+    /** 受信派单随首次附着回放，固定身份去重并保留 TASK 前后空行。 */
+    recordTask(id, content) {
+      const key = "task:" + id;
+      if (snapshot.transcript.some(function same(item) { return item.key === key; })) return;
+      const text = stripVTControlCharacters(content).replace(/\r\n?/gu, "\n").replace(/\t/gu, "    ").replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/gu, "").trim();
+      if (text) publish({ ...snapshot, transcript: [{ kind: "prompt", key, content: "\nTASK\n\n" + text }, ...snapshot.transcript] });
     },
     /** 在异步投递之前捕获真实提交位置。 */
     captureInputPosition() { return { ...captureTuiInputPosition(snapshot.liveTurnId, snapshot.liveEvents, snapshot.livePresentation), order: submissionOrder++ }; },
@@ -189,6 +199,13 @@ export function createCliTuiStore(): CliTuiStore {
           },
         ],
       });
+    },
+    /** 清除宿主已明确拒绝的队列项，迟到的已保存回执不会把它追加回来。 */
+    rejectPendingPrompt(inputId: string, message: string): void {
+      if (settledInputIds.has(inputId)) return;
+      settledInputIds.add(inputId);
+      snapshot = { ...snapshot, pendingInputs: snapshot.pendingInputs.filter(function keep(input) { return input.inputId !== inputId; }) };
+      this.addNotice(message);
     },
     /** 在自动 queue Turn 开始前，将 prompt 放进目标 Turn 的事件序列并清除等待态。 */
     markQueuedInputStarted(input: CliQueuedInputStarted): void {
@@ -223,6 +240,10 @@ export function createCliTuiStore(): CliTuiStore {
       eventsByTurn.set(turnId, nextEvents);
       publish({ ...snapshot, liveEvents: snapshot.liveTurnId === turnId ? nextEvents : snapshot.liveEvents, pendingApproval: undefined });
     },
+    /** 发布 Session 内的手动压缩等待态，切换视图后仍由原请求负责清除。 */
+    setCompacting(compacting: boolean): void {
+      publish({ ...snapshot, compacting });
+    },
     addNotice(message: string): void {
       const trimmed = message.trim();
       if (!trimmed) return;
@@ -230,7 +251,7 @@ export function createCliTuiStore(): CliTuiStore {
         ...snapshot,
         transcript: [
           ...snapshot.transcript,
-          { kind: "notice", key: "notice:" + String(noticeIndex++), message: trimmed },
+          { kind: "notice", key: "notice:" + String(noticeIndex++), message: trimmed, persistent: trimmed.includes("\n") },
         ],
       });
     },
@@ -243,7 +264,7 @@ export function createCliTuiStore(): CliTuiStore {
         return;
       }
       // Esc 后只等待 Runtime 的终态；取消请求之后已经在途的回答/工具尾部事件不再进入可见时间线。
-      if (snapshot.cancellationRequested && !(event.type === "status" && isTerminalStatus(event.status))) return;
+      if (snapshot.cancellationRequested && snapshot.liveTurnId === event.turnId && !(event.type === "status" && isTerminalStatus(event.status))) return;
       if (event.type === "turn_started" && finalizedTurns.delete(event.turnId)) {
         snapshot = { ...snapshot, transcript: snapshot.transcript.filter(function previousSegment(item) { return item.kind !== "turn" || item.turnId !== event.turnId; }) };
       }
@@ -253,7 +274,7 @@ export function createCliTuiStore(): CliTuiStore {
       eventsByTurn.set(event.turnId, nextEvents);
       presentationByTurn.set(event.turnId, projection.presentation);
       const isNewTurn = snapshot.liveTurnId !== event.turnId;
-      const activePrompt = snapshot.activePrompt && snapshot.activePrompt.turnId === undefined
+      const activePrompt = snapshot.activePrompt && snapshot.activePrompt.turnId === undefined && !isTerminalStatus(projection.status)
         ? { ...snapshot.activePrompt, turnId: event.turnId }
         : snapshot.activePrompt;
       const eventTime = Date.now();
@@ -288,7 +309,7 @@ export function createCliTuiStore(): CliTuiStore {
           ? { ...projection.pendingApproval }
           : undefined,
         activeSkills: projection.activeSkills.map(function copySkill(skill) { return { ...skill }; }),
-        cancellationRequested: event.type === "status" && isTerminalStatus(event.status) ? false : snapshot.cancellationRequested,
+        cancellationRequested: !isNewTurn && !(event.type === "status" && isTerminalStatus(event.status)) && snapshot.cancellationRequested,
       };
       if (event.type === "input_consumed") {
         settledInputIds.add(event.inputId);
@@ -328,7 +349,7 @@ export function createCliTuiStore(): CliTuiStore {
       if (projection.turnId && !eventsByTurn.has(projection.turnId) && projection.events.length > 0) eventsByTurn.set(projection.turnId, projection.events.filter(function belongs(event) { return event.turnId === projection.turnId; }));
       const turnIsFinalized = projection.turnId ? finalizedTurns.has(projection.turnId) : false;
       const isNewTurn = projection.turnId !== undefined && projection.turnId !== snapshot.liveTurnId;
-      const activePrompt = snapshot.activePrompt && snapshot.activePrompt.turnId === undefined && projection.turnId
+      const activePrompt = snapshot.activePrompt && snapshot.activePrompt.turnId === undefined && projection.turnId && !isTerminalStatus(projection.status)
         ? { ...snapshot.activePrompt, turnId: projection.turnId }
         : snapshot.activePrompt;
       const keepFinalizedLiveTurn = Boolean(projection.turnId && turnIsFinalized && projection.turnId === snapshot.liveTurnId);
@@ -356,7 +377,7 @@ export function createCliTuiStore(): CliTuiStore {
           ? { ...projection.pendingApproval }
           : undefined,
         activeSkills: projection.activeSkills.map(function copySkill(skill) { return { ...skill }; }),
-        cancellationRequested: isTerminalStatus(projection.status) ? false : snapshot.cancellationRequested,
+        cancellationRequested: !isNewTurn && !isTerminalStatus(projection.status) && snapshot.cancellationRequested,
       };
       if (projection.turnId && isTerminalStatus(projection.status)) {
         finalizeTurn(projection.turnId, projection.status);

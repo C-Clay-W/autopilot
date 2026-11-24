@@ -1,10 +1,10 @@
 /**
  * listWorkspaceFiles 契约测试：覆盖排除规则、稳定排序、maxFiles 截断、空工作区与错误收敛。
  */
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { AgentRuntimeError } from "../../runtime/protocol/error-code";
 import { listWorkspaceFiles } from "./workspace-files";
 
@@ -52,6 +52,24 @@ describe("listWorkspaceFiles", function workspaceFilesSuite() {
       "src/agent.ts",
       "src/components/Panel.tsx",
     ]);
+  });
+
+  it("环境配置不能让候选枚举跟随工作区外目录链接", async function ignoresFollowConfig() {
+    const root = await createSearchWorkspace();
+    const outside = await mkdtemp(path.join(os.tmpdir(), "autopilot-workspace-files-outside-"));
+    temporaryRoots.push(outside);
+    const config = path.join(outside, "rg.conf");
+    await writeFile(config, "--follow\n", "utf8");
+    await symlink(outside, path.join(root, "outside"), process.platform === "win32" ? "junction" : "dir");
+
+    vi.stubEnv("RIPGREP_CONFIG_PATH", config);
+    try {
+      const result = await listWorkspaceFiles({ workspaceRoot: root });
+      expect(result.files).toContain("src/agent.ts");
+      expect(result.files).not.toContain("outside/rg.conf");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it("maxFiles 截断列表并标注 truncated", async function maxFilesTruncation() {

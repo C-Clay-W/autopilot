@@ -155,13 +155,13 @@ export async function validatePublicWebUrl(
     if (value.length > 2_000) throw new Error("URL_TOO_LONG");
     url = new URL(value);
   } catch {
-    throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址无效");
+    throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址无效", undefined, "url_not_allowed");
   }
   if ((url.protocol !== "http:" && url.protocol !== "https:") || url.username || url.password || !url.hostname) {
-    throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址不允许访问");
+    throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址不允许访问", undefined, "url_not_allowed");
   }
   const hostname = normalizeHostname(url.hostname).toLowerCase();
-  if (isBlockedHostname(hostname)) throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址不允许访问");
+  if (isBlockedHostname(hostname)) throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址不允许访问", undefined, "url_not_allowed");
 
   let addresses: readonly WebFetchResolvedAddress[];
   const literalFamily = isIP(hostname);
@@ -172,15 +172,15 @@ export async function validatePublicWebUrl(
       addresses = await (options.resolveDns ?? resolveWebFetchDns)(hostname, options.signal);
     } catch (error) {
       if (options.signal?.aborted || (error instanceof Error && error.name === "AbortError")) throw createAbortError();
-      throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址解析失败");
+      throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址解析失败", undefined, "dns_failed");
     }
   }
-  if (addresses.length === 0) throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址解析失败");
+  if (addresses.length === 0) throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址解析失败", undefined, "dns_failed");
 
   const unique = new Map<string, WebFetchResolvedAddress>();
   for (const record of addresses) {
     if (!isPublicWebAddress(record.address, record.family)) {
-      throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址不允许访问");
+      throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页地址不允许访问", undefined, "non_public_address");
     }
     unique.set(`${record.family}:${record.address}`, { address: record.address, family: record.family });
   }

@@ -8,6 +8,7 @@
  */
 
 import { createThreadFacade } from "../application/thread-service";
+import { createRuntimeFacts } from "../application/runtime-facts";
 import { createTurnService } from "../application/turn-service";
 import type { TurnService } from "../application/turn-service";
 import { createProjectService } from "../application/project-service";
@@ -56,6 +57,7 @@ export function createAgentRuntime(options: CreateAgentRuntimeOptions): AgentRun
   const undo = createUndoService(ports);
   if (!ports.threadStore) throw new Error("THREADS_UNAVAILABLE");
   return {
+    facts: createRuntimeFacts(ports),
     threads: { bind: function bind(context) { return createThreadFacade(ports, context); } },
     turns,
     projects,

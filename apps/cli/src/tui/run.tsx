@@ -1,6 +1,7 @@
 /** TUI 入口编排：启动 Ink，统一处理信号、退出码和动态渲染生命周期。 */
 
 import { render } from "ink";
+import { createDesktopResize } from "./desktop-resize.js";
 import { createTuiInputRouter, type TuiSgrMouseEvent } from "../tui-input-router.js";
 import type { CliControllerResult } from "../controller.js";
 import type { CliEventListener, CliExitCode } from "../types.js";
@@ -8,7 +9,7 @@ import { CliSessionWorkspace } from "./session-workspace.js";
 import { CliTuiApp } from "./app.js";
 import { getTuiStatusLabel, isActiveTuiStatus, isTerminalStatus, readTuiTerminalSize } from "./format.js";
 import { createRoutedTuiStdin, createTuiMouseInputSink, createTuiRenderStdout, createTuiTerminalLifecycle } from "./lifecycle.js";
-import { getTuiRenderModeFallbackNotice, resolveNoColor, resolveReducedMotion, resolveScreenReader, resolveTuiRenderMode } from "./render-mode.js";
+import { getTuiRenderModeFallbackNotice, getWindowsTuiResizeHost, resolveNoColor, resolveReducedMotion, resolveScreenReader, resolveTuiRenderMode, TuiManagedTerminalStyles } from "./render-mode.js";
 import { createCliTuiStore } from "./store.js";
 import type { CliTuiRecap, RunCliTuiOptions, RunCliTuiResult } from "./types.js";
 
@@ -23,12 +24,15 @@ export function formatCliTuiRecap(recap: CliTuiRecap): string {
 /** 启动 Ink，统一处理信号、退出码和动态渲染生命周期。 */
 export async function runCliTui(options: RunCliTuiOptions): Promise<RunCliTuiResult> {
   const env = options.env ?? process.env;
-  const store = options.sessionManager?.selected().store ?? createCliTuiStore();
+  const store = options.sessionManager?.selected().store ?? options.store ?? createCliTuiStore();
   const noColor = resolveNoColor(env);
   const screenReader = resolveScreenReader(env);
   const renderMode = resolveTuiRenderMode(env);
-  const terminalSizeSource = options.streams.stdout;
-  const renderStdout = createTuiRenderStdout(terminalSizeSource, readTuiTerminalSize(terminalSizeSource));
+  const desktopResize = createDesktopResize(options.streams.stdout, env);
+  const terminalSizeSource = desktopResize.source;
+  const resizeHost = getWindowsTuiResizeHost(options.streams.stdout.isTTY, env);
+  const replayOnWidthChange = resizeHost === "external" && renderMode === "inline" && !screenReader;
+  const renderStdout = createTuiRenderStdout(options.streams.stdout, readTuiTerminalSize(terminalSizeSource), resizeHost !== undefined, desktopResize.written, replayOnWidthChange);
   const fallbackNotice = getTuiRenderModeFallbackNotice({ env, platform: process.platform });
   if (fallbackNotice) options.streams.stderr.write(fallbackNotice);
   const terminalLifecycle = createTuiTerminalLifecycle(options.streams.stdout, renderMode);
@@ -144,8 +148,11 @@ export async function runCliTui(options: RunCliTuiOptions): Promise<RunCliTuiRes
     const current = store.getSnapshot();
     if (!isActiveTuiStatus(current.status) || current.cancellationRequested) return;
     store.setCancellationRequested(true);
-    void options.controller.dispatch({ type: "cancel_turn" }).then(handleResult).catch(function handleCancelFailure() {
-      store.setCancellationRequested(false);
+    void options.controller.dispatch({ type: "cancel_turn" }).then(function finished(result) {
+      if (result.kind === "error" && store.getSnapshot().liveTurnId === current.liveTurnId) store.setCancellationRequested(false);
+      handleResult(result);
+    }).catch(function handleCancelFailure() {
+      if (store.getSnapshot().liveTurnId === current.liveTurnId) store.setCancellationRequested(false);
       store.addNotice("turn cancellation failed");
     });
   }
@@ -205,7 +212,7 @@ export async function runCliTui(options: RunCliTuiOptions): Promise<RunCliTuiRes
   );
   try {
     terminalLifecycle.enter();
-    instance = render(node, {
+    instance = render(<TuiManagedTerminalStyles.Provider value={options.managedPromptBackground === true && !screenReader}>{node}</TuiManagedTerminalStyles.Provider>, {
       stdout: renderStdout.stdout as NodeJS.WriteStream,
       stderr: options.streams.stderr as NodeJS.WriteStream,
       stdin: routedStdin as unknown as NodeJS.ReadStream,
@@ -222,6 +229,7 @@ export async function runCliTui(options: RunCliTuiOptions): Promise<RunCliTuiRes
     terminalLifecycle.reassert();
     await instance.waitUntilExit();
   } finally {
+    desktopResize.close();
     if (mouseFlushTimer) clearTimeout(mouseFlushTimer);
     options.streams.stdin.removeListener("data", routeRawTuiInput);
     options.streams.stdin.removeListener("end", finishRawTuiInput);

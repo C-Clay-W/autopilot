@@ -624,6 +624,18 @@ async function systemPromptOf(options: Parameters<typeof createAgentRuntime>[0])
   return sampled.filter(function selectSystem(message) { return message.role === "system"; }).map(getAgentMessageText).join("\n");
 }
 
+it("Work 注入任务连续性、交付和动画规则，Chat 不注入 Work 行为规范", async function scopesWorkBehaviorPrompt() {
+  const work = await systemPromptOf({});
+  expect(work).toContain("动画需连贯、节奏合理，兼顾不同尺寸与减少动态偏好");
+  expect(work).toContain("压缩后把摘要作为历史线索");
+  expect(work).toContain("当前 Turn 收到用户引导");
+  expect(work).toContain("结束前核对成果、范围和格式");
+
+  const chat = await systemPromptOf({ capabilityCeiling: { productMode: "chat", chatRetrievalMode: "none" } });
+  expect(chat).toContain("Autopilot Chat");
+  expect(chat).not.toContain("【模型行为规范】");
+});
+
 describe("协作约定注入", function threadPromptSuite() {
   it("注册协作工具时注入派工、摘要与两种游标约定", async function injectsThreadConvention() {
     const prompt = await systemPromptOf({ threads: threadCapabilityStub() });

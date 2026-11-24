@@ -20,6 +20,8 @@ export function createRuntimeAgentStream(input: {
   continuity?: { source: "claimed_queue" };
   runConfig?: Partial<Core.RunConfig>;
   requestSignal: AbortSignal;
+  /** Chat 的 HTTP 连接只负责观察，执行生命周期仍由 requestSignal（宿主）控制。 */
+  observerSignal?: AbortSignal;
   initialDiagnostics?: string[];
   contextBudget?: Core.ContextBudgetSnapshot;
   activeSkills?: Array<{ skillId: string; contentHash: string }>;
@@ -46,6 +48,24 @@ export function createRuntimeAgentStream(input: {
     async start(streamController) {
       let sequence = input.initialSeq ?? 0;
 
+      /** Chat 观察者离开后立即停止输出，保留 Core 迭代和宿主写回。 */
+      function detachObserver(): void {
+        if (!streamOpen) return;
+        streamOpen = false;
+        try { streamController.close(); } catch { /* 连接已经关闭 */ }
+      }
+      input.observerSignal?.addEventListener("abort", detachObserver, { once: true });
+      if (input.observerSignal?.aborted) detachObserver();
+
+      /** 浏览器关闭导致的入队失败只能结束 Chat 观察；旧请求模式保留执行错误语义。 */
+      function enqueue(data: string): void {
+        try { streamController.enqueue(encoder.encode(data)); }
+        catch (error) {
+          if (!input.observerSignal) throw error;
+          detachObserver();
+        }
+      }
+
       const send = (event: Record<string, unknown>) => {
         if (!streamOpen) return;
         const startedAt = performance.now();
@@ -58,14 +78,14 @@ export function createRuntimeAgentStream(input: {
           timestamp,
           event: event as Core.AgentEvent,
         }, input.turnId);
-        streamController.enqueue(encoder.encode(`data: ${JSON.stringify({ sessionId: input.sessionId, timestamp, ...safeEvent })}\n\n`));
+        enqueue(`data: ${JSON.stringify({ sessionId: input.sessionId, timestamp, ...safeEvent })}\n\n`);
         recordWebPerformanceDiagnostic("sse_enqueue", typeof event.type === "string" ? event.type : "unknown", performance.now() - startedAt);
       };
       // Host 诊断不是 Runtime transcript 事件，不能占用同一 Turn 的 seq。
       const sendHost = (event: Record<string, unknown>) => {
         if (!streamOpen) return;
         const startedAt = performance.now();
-        streamController.enqueue(encoder.encode(`data: ${JSON.stringify({ sessionId: input.sessionId, timestamp: new Date().toISOString(), ...event, turnId: input.turnId })}\n\n`));
+        enqueue(`data: ${JSON.stringify({ sessionId: input.sessionId, timestamp: new Date().toISOString(), ...event, turnId: input.turnId })}\n\n`);
         recordWebPerformanceDiagnostic("sse_enqueue", typeof event.type === "string" ? event.type : "unknown", performance.now() - startedAt);
       };
       // 续跑从审批前的完整投影开始；异常终止时也用它保存已经发生的过程。
@@ -169,28 +189,21 @@ export function createRuntimeAgentStream(input: {
 
         // 终态消息先持久化，再通知浏览器刷新，避免快速失败的 History 先读到空投影。
         if (terminalEvent) send(terminalEvent);
-        if (streamOpen) {
-          streamController.enqueue(encoder.encode("data: [DONE]\n\n"));
-          streamController.close();
-          streamOpen = false;
-        }
+        if (streamOpen) { enqueue("data: [DONE]\n\n"); detachObserver(); }
       } catch (error) {
         const failure = toWebTurnFailure(error, undefined, { failureStage: "web_stream" });
         if (!controller.signal.aborted) {
           await persistAssistantMessage(input.runtime, input.sessionId, input.turnId, projection, projection.answer.trim(), failure).catch(() => undefined);
         }
         sendHost({ type: "turn_failed", error: failure.message, feedbackId: failure.feedbackId, failure });
-        if (streamOpen) {
-          streamController.enqueue(encoder.encode("data: [DONE]\n\n"));
-          streamController.close();
-          streamOpen = false;
-        }
+        if (streamOpen) { enqueue("data: [DONE]\n\n"); detachObserver(); }
       } finally {
+        input.observerSignal?.removeEventListener("abort", detachObserver);
         input.requestSignal.removeEventListener("abort", abortRequest);
         unregisterActiveTurn(input.sessionId, input.turnId, controller);
         input.onSettled?.();
       }
     },
-    cancel() { streamOpen = false; controller.abort(); },
+    cancel() { streamOpen = false; if (!input.observerSignal) controller.abort(); },
   });
 }

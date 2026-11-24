@@ -264,7 +264,7 @@ export function createSafeWebFetchCapability(options: SafeWebFetchOptions = {}):
     /** 读取明确 URL；跨域目标和剩余跳数只交给 Core，在审批后续接。 */
     async fetch(input) {
       if (input.redirectsRemaining !== undefined && (!Number.isInteger(input.redirectsRemaining) || input.redirectsRemaining < 0 || input.redirectsRemaining > MAX_REDIRECTS)) {
-        throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页重定向预算无效");
+        throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页重定向预算无效", undefined, "redirect_rejected");
       }
       const original = await validatePublicWebUrl(input.url, { resolveDns, signal: input.signal });
       let current = original;
@@ -277,19 +277,19 @@ export function createSafeWebFetchCapability(options: SafeWebFetchOptions = {}):
           const location = readHeader(response.headers, "location");
           if (!location || redirectCount >= redirectLimit) {
             response.abort();
-            throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页重定向无效或超过上限");
+            throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页重定向无效或超过上限", undefined, "redirect_rejected");
           }
           let redirectUrl: URL;
           try {
             redirectUrl = new URL(location, current.url);
           } catch {
             response.abort();
-            throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页重定向地址无效");
+            throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页重定向地址无效", undefined, "redirect_rejected");
           }
           if (redirectUrl.hostname.toLowerCase() !== current.url.hostname.toLowerCase()) {
             response.abort();
             if (!["http:", "https:"].includes(redirectUrl.protocol) || redirectUrl.username || redirectUrl.password) {
-              throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页重定向地址无效");
+              throw new WebFetchCapabilityError("WEB_URL_BLOCKED", "网页重定向地址无效", undefined, "redirect_rejected");
             }
             throw new WebFetchCapabilityError("WEB_REDIRECT_REQUIRES_APPROVAL", "网页重定向需要新的域名审批", {
               url: redirectUrl.toString(), remainingRedirects: redirectLimit - redirectCount - 1,

@@ -1,6 +1,19 @@
 /** command-policy 单元测试：验证工作区内精确命令约束的绑定与识别（问题 2.2"记住此命令"的基础身份）。 */
 import { describe, expect, it } from "vitest";
-import { computeWorkspaceCommandConstraint, isWorkspaceCommandConstraint, resolveCommandAuthorizationIdentity } from "./command-policy";
+import { decideCommandPermission, defaultCommandRules, computeWorkspaceCommandConstraint, isWorkspaceCommandConstraint, resolveCommandAuthorizationIdentity } from "./command-policy";
+
+describe("共用命令分类", function commandProtection() {
+  it("分支查询、Git 删除和所有 push 使用各自的权限事实", function protectsGitEffects() {
+    expect(decideCommandPermission("git", ["branch", "--list"]).risk).toBe("read_only");
+    expect(decideCommandPermission("git", ["diff", "--ext-diff"]).risk).toBe("unknown");
+    for (const args of [["rm", "file"], ["branch", "-D", "topic"], ["tag", "--delete", "old"], ["update-ref", "-d", "refs/heads/topic"], ["worktree", "remove", "temp"], ["stash", "clear"], ["checkout", "-f", "topic"]]) {
+      expect(decideCommandPermission("git.exe", args).risk).toBe("destructive");
+    }
+    expect(decideCommandPermission("git.cmd", ["push", "--delete", "origin", "topic"]).requireSingleApproval).toBe(true);
+    expect(decideCommandPermission("C:/Git/bin/git.exe", ["-C", ".", "--no-pager", "push", "origin"]).requireSingleApproval).toBe(true);
+    expect(decideCommandPermission("git", ["-C", ".", "reset", "--hard"]).decision).toBe("deny");
+  });
+});
 
 describe("computeWorkspaceCommandConstraint", function commandConstraintSuite() {
   const base = { workspaceRoot: "C:\\ws", cwd: "C:\\ws\\sub", program: "npx.CMD", args: ["--no-install", "tsc"], platform: "win32" as NodeJS.Platform };
@@ -64,5 +77,19 @@ describe("resolveCommandAuthorizationIdentity（R6：分类名与授权身份分
     expect(current.startsWith("cmd:v2:")).toBe(true);
     expect(isWorkspaceCommandConstraint("cmd:v1:legacy-hash")).toBe(true);
     expect(current.startsWith("cmd:v1:")).toBe(false);
+  });
+});
+
+/** 只对无歧义的预览参数豁免内置删除拒绝，自定义规则仍保持最严格决定。 */
+describe("git clean dry-run", function cleanDryRunSuite() {
+  it.each([["-nd"], ["-dn"], ["--dry-run"], ["-n", "-d"], ["-nfx"], ["-nd", "--", "folder"]])("只读预览 %j", function safeClean(...flags) {
+    expect(decideCommandPermission("git", ["clean", ...flags]).risk).toBe("read_only");
+  });
+  it.each([[], ["-fd"], ["--", "-n"], ["-n", "--interactive"], ["-n", "--no-dry-run"], ["--dry-run=false"], ["-n", "-e", "pattern"], ["-nD"]])("危险或未知组合保留拒绝 %j", function unsafeClean(...flags) {
+    expect(decideCommandPermission("git", ["clean", ...flags]).decision).toBe("deny");
+  });
+  it("工作区外路径保持需确认，自定义拒绝不可绕过", function keepsBoundaries() {
+    expect(decideCommandPermission("git", ["clean", "-nd", "--", "../outside"]).risk).toBe("unknown");
+    expect(decideCommandPermission("git", ["clean", "-nd"], [...defaultCommandRules, { pattern: ["git"], decision: "deny", risk: "destructive", reason: "custom" }]).decision).toBe("deny");
   });
 });

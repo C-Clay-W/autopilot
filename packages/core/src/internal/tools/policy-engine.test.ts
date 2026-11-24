@@ -34,6 +34,21 @@ function createFacts(overrides: Partial<ToolActionFacts> = {}): ToolActionFacts 
 }
 
 describe("PolicyEngine", () => {
+  it("完全访问放行普通外部调用，破坏、推送和未知进程仍仅能单次确认", function fullAccessProtection() {
+    const context = createContext({ permissionMode: "full_access", workspaceTrusted: true });
+    const engine = new PolicyEngine();
+    const protectedOperations = [
+      createFacts({ risk: "destructive", destructive: true }),
+      createFacts({ risk: "external_side_effect", requireSingleApproval: true }),
+      createFacts(),
+    ];
+    expect(engine.evaluate({ context, metadata, facts: createFacts({ risk: "external_side_effect" }), grantMatched: false }).decision).toBe("allow");
+    for (const facts of protectedOperations) {
+      expect(engine.canUsePersistentGrant(context, facts)).toBe(false);
+      expect(engine.evaluate({ context, metadata, facts, grantMatched: true })).toMatchObject({ decision: "approval_required", allowedApprovalDecisions: ["allow_once", "deny"] });
+    }
+  });
+
   it("硬拒绝优先于 full_access、grant 与任意审批", () => {
     const result = new PolicyEngine().evaluate({
       context: createContext({ permissionMode: "full_access" }),
@@ -131,7 +146,7 @@ describe("PolicyEngine", () => {
     expect(engine.canUsePersistentGrant(createContext({ permissionMode: "ask" }), facts)).toBe(false);
   });
 
-  it("G4：已确认可沙箱执行的调用在 auto_approve+Trust 下自动放行，无需审批", () => {
+  it("权限策略新裁决：沙箱可用不能把未知风险变成 auto_approve 自动放行", () => {
     const engine = new PolicyEngine();
     const facts = createFacts();
     const result = engine.evaluate({
@@ -141,7 +156,7 @@ describe("PolicyEngine", () => {
       grantMatched: false,
       sandbox: { available: true },
     });
-    expect(result).toMatchObject({ decision: "allow" });
+    expect(result).toMatchObject({ decision: "approval_required" });
   });
 
   it("G4：auto_approve 但未信任工作区时，沙箱可用也不自动放行外部/未知风险", () => {

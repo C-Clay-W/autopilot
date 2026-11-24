@@ -8,6 +8,7 @@
 export { NodeChatError, NodeStateError } from "./node/node-errors";
 export type { NodeChatErrorCode, NodeStateErrorCode, NodeStateRecoveryDiagnostic } from "./node/node-errors";
 export { createNodeRuntimePorts } from "./node/create-node-runtime-ports";
+export { withNodeRuntimeOwner } from "./node/runtime-owner";
 export { createNodeChatStorage } from "./node/create-node-chat-storage";
 export type { CreateNodeChatStorageOptions, NodeChatStorage } from "./node/create-node-chat-storage";
 export { resolveNodeChatStatePaths } from "./node/chat-state";
@@ -40,7 +41,7 @@ export { createNodeExternalPermissionProjector } from "./node/settings/node-exte
 export type { CreateNodeExternalPermissionProjectorOptions } from "./node/settings/node-external-permission-projector";
 export { isSafeSettingsFile } from "./node/settings/node-settings-loader";
 export { createNodeUserSettingsService, NodeUserSettingsError } from "./node/settings/node-user-settings-service";
-export type { MainModelCatalogResult, MainSettingsCategoryInput, MainSettingsCategoryUpdate, RagSettingsCategoryConnectionInput, RagSettingsCategoryInput, UserSettingsStatus, UserSettingsWriteResult, WebSearchSettingsCategoryInput } from "./node/settings/node-user-settings-service";
+export type { MainModelCapabilities, MainModelCapabilitiesInput, MainModelCatalogResult, MainSettingsCategoryInput, MainSettingsCategoryUpdate, RagSettingsCategoryConnectionInput, RagSettingsCategoryInput, UserSettingsStatus, UserSettingsWriteResult, WebSearchSettingsCategoryInput } from "./node/settings/node-user-settings-service";
 export { getNodeMemoryDirectory, getNodeMemoryWorkspaceId, getLegacyWebMemoryDirectory, retrieveNodeMemories } from "./node/capabilities/memory-retriever";
 export { loadMcpConfigFromWorkspace } from "./node/capabilities/mcp-loader";
 export { discoverInstructions } from "./node/capabilities/instruction-store";
@@ -73,6 +74,7 @@ export { createNodeTranscriptStore } from "./node/stores/node-transcript-store";
 export { createNodeTurnStore } from "./node/stores/node-turn-store";
 export { createNodeClock } from "./node/stores/node-clock";
 export { createNodeThreadRunner } from "./node/thread-runner";
+export * from "./node/desktop-status-protocol";
 export type { NodeThreadRunner, NodeThreadRunnerOptions, NodeThreadRunnerPrompt, NodeThreadRunnerStopReport } from "./node/thread-runner";
 export { createNodeThreadHandoffWriter } from "./node/thread-handoff";
 export type { CreateNodeThreadHandoffWriterOptions } from "./node/thread-handoff";

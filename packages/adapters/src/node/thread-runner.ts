@@ -53,6 +53,8 @@ export interface NodeThreadRunnerStopReport {
 
 /** 宿主持有的协作执行驱动器。 */
 export interface NodeThreadRunner {
+  /** 复制现有活动索引身份，仅供宿主发现目标，不证明执行状态。 */
+  listExecutions(): Array<{ threadId: string; turnId: string }>;
   /** 启动循环；首次调度前先收敛上次崩溃遗留的领取。 */
   start(): Promise<void>;
   /** 停止新领取，取消本 owner 的 Turn，退回未启动交付并报告未确认项。 */
@@ -446,6 +448,7 @@ export function createNodeThreadRunner(options: NodeThreadRunnerOptions): NodeTh
     stop,
     kick,
     registerExecution,
+    listExecutions: function listExecutions() { return [...active.values()].map(function identity(record) { return { threadId: record.threadId, turnId: record.turnId }; }); },
     isRunning: function isRunning() { return running; },
     reconcile: function converge() { return delivery.reconcile({ staleMs, activeMessageIds: activeMessageIds() }); },
   };

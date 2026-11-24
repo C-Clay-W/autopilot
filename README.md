@@ -5,7 +5,7 @@
 <p align="center">
   <strong>Autopilot Agent</strong><br>
   本地 AI 编程助手：阅读与修改项目、执行开发命令、跟踪后台任务、管理会话。<br>
-  CLI 和本地 Web 共享 TypeScript Agent Runtime。
+  CLI、本地 Web 与 Desktop 共享 TypeScript Agent Runtime。
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
 **一个 Agent 编排不依赖第三方框架、Provider 中立、按五个包分层的本地 AI 编程助手。** 主循环、上下文预算与压缩、工具调度、会话与审批由项目自行实现；CLI 与本地 Web 共用同一套 Runtime。
 
 - **掌握执行链路**：从模型采样、工具调用到结果回填与 checkpoint 恢复，关键状态与控制逻辑都可在源码中追溯。
-- **模型协议与内核分离**：内核使用 Provider 中立消息，由协议 Adapter 处理 OpenAI Chat Completions 与 Anthropic Messages，避免把某一家模型的 wire 格式写进主循环。
+- **模型协议与内核分离**：内核使用 Provider 中立消息，由协议 Adapter 处理 OpenAI Responses / Chat Completions 与 Anthropic Messages，避免把某一家模型的 wire 格式写进主循环。
 - **同一内核，多种界面**：Core 管执行，Adapters 接宿主，Presentation 投影事件，CLI 与 Web 消费这些能力；无需为不同界面维护两套 Agent 编排。
 - **把依赖用在合适的边界**：保留文件解析、向量存储、数据库驱动、参数校验、终端渲染和系统沙箱等成熟实现，把自研投入放在 Agent 的行为与控制链路上。
 
@@ -39,7 +39,7 @@ flowchart TB
   presentation --> core
   core --> kernel[自研：主循环 / 工具调度 / 上下文压缩 / 会话与审批]
   core --> protocol[Provider 中立协议与 Adapter]
-  protocol --> models[OpenAI Chat Completions / Anthropic Messages]
+  protocol --> models[OpenAI Responses / Chat Completions / Anthropic Messages]
   cli --> adapters[Adapters：Node 宿主能力]
   web --> adapters
   adapters -->|注入 RuntimePorts| core
@@ -52,13 +52,15 @@ flowchart TB
 需要 Node.js `>=20.11.0 <22`，建议 Node 20.20.2 与 npm 10。
 
 ```bash
-npm install -g autopilot-agent@0.3.0
+npm install -g autopilot-agent@0.4.0
 ap --help
 ```
 
 主包自动带入 Core、Adapters、Presentation 和 CLI。ap 与 autopilot 等价。完整安装、模型配置、使用和排错见 [主包使用手册](packages/autopilot-agent/README.md)。npm CLI 不包含 Web 应用。
 
 ## 从源码运行
+
+完整工程使用 Node 22.13+ 安装依赖，独立运行 CLI 时使用 Node 20.20.2。Desktop 安装版、源码版及 Web 两种启动方式见 [三端启动指南](agent/doc/HowToUse.md)。
 
 ```bash
 git clone https://github.com/C-Clay-W/autopilot.git
@@ -68,6 +70,7 @@ npm run build -w packages/core
 npm run build -w packages/adapters
 npm run build -w packages/presentation
 npm run build -w apps/cli
+# 用 Node 20.20.2 运行 CLI
 node apps/cli/dist/main.js --help
 ```
 
@@ -82,9 +85,10 @@ node apps/cli/dist/main.js --help
 | [@autopilot-agent/core](packages/core/README.md) | Runtime、审批、会话、工具、RAG 与宿主接口 |
 | [@autopilot-agent/adapters](packages/adapters/README.md) | Node 存储、工作区、配置、沙箱及外部能力 |
 | [@autopilot-agent/presentation](packages/presentation/README.md) | 共享安全事件投影、时间线、分组和展示文案 |
+| [apps/desktop](apps/desktop) | Electron 桌面工作台，支持并排终端和主控编排 |
 | [apps/web](apps/web/README.md) | Next.js 本地 Chat / Work 界面，源码运行，不作为 npm 应用分发 |
 
-源码与五个 npm 包当前版本均为 **0.3.0**；Web 仍仅通过源码运行。详见 [更新日志](CHANGELOG.md)。
+源码与五个 npm 包当前版本均为 **0.4.0**；Web 仍仅通过源码运行。详见 [更新日志](CHANGELOG.md)。
 
 CLI 支持单窗口多会话与主子 Thread 会话，可分派任务、沟通消息、汇报进展并集中处理审批。Web 支持 Thread 协议，创建平行会话并发处理任务，保持主控上下文；Chat 支持 Intelligent UI，动态展示图表、表格、选项、时间线和步骤。
 
@@ -97,6 +101,23 @@ CLI 支持单窗口多会话与主子 Thread 会话，可分派任务、沟通�
 - [源码启动与使用](agent/doc/HowToUse.md)
 
 必要测试、配置及合成 fixture 随源码提供。真实 env、凭据、会话/数据库和内部运行记录不公开。
+
+## 0.4.0 Desktop 示例截图
+
+<p align="center">
+  <img src=".github/Autopilot-0.4.0-desktop-mode-selection.png" alt="Desktop 模式选择" width="960"><br>
+  <em>Desktop 模式选择</em>
+</p>
+
+<p align="center">
+  <img src=".github/Autopilot-0.4.0-desktop-orchestration.png" alt="Orchestration" width="960"><br>
+  <em>Orchestration</em>
+</p>
+
+<p align="center">
+  <img src=".github/Autopilot-0.4.0-desktop-parallel.png" alt="Parallel" width="960"><br>
+  <em>Parallel</em>
+</p>
 
 ## 0.3.0 示例截图
 

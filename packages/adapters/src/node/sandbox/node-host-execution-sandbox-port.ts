@@ -4,7 +4,7 @@
  * 受信宿主在 Windows 停用进程沙箱：本 port 不加载 SRT、不要求 provision、不执行任何
  * 系统变更，只提供"停用"能力事实与 fail-closed 边界——prepare 无条件拒绝（不存在沙箱
  * 包装），setup 不触发 UAC 仅返回停用报告，release/shutdown 幂等空操作。进程类调用
- * 的放行由 PolicyEngine 的宿主逐次审批决定；执行器以 status() 的 backend
+ * 的放行由 PolicyEngine 按权限模式与风险决定；执行器以 status() 的 backend
  * "host-execution" 识别本模式并构造宿主执行范围。本实现绝不报告任何隔离能力。
  */
 import {
@@ -25,7 +25,7 @@ function hostExecutionCapabilityReport(): SandboxCapabilityReport {
     installed: false,
     provisioned: false,
     diagnostics: [
-      "Windows 宿主执行模式：进程沙箱已停用，进程调用经用户逐次审批后在宿主以当前用户权限直接执行",
+      "Windows 宿主执行模式：进程沙箱已停用，调用按权限模式与风险分流，在宿主以当前用户权限直接执行",
     ],
   };
 }

@@ -5,7 +5,7 @@
 import { NodeStateError, createNodeIdentityError, toNodeBoundaryError } from "../node-errors";
 import fs from "node:fs";
 import type { ProductMode, Session, SessionStore } from "@autopilot-agent/core";
-import { atomicReplace, getFileOperationDiagnostic, safeFilePath, withFileLock } from "../file-utils";
+import { atomicReplace, replaceSessionFile, getFileOperationDiagnostic, safeFilePath, withFileLock } from "../file-utils";
 import { assertNodeStateSchema, ensureNodeStateRoot, getNodeStatePaths } from "../state-root";
 import type { NodeStoreOptions } from "../types";
 import { assertNodeSessionIdentity, normalizeNodeSession } from "../session-record";
@@ -140,7 +140,7 @@ export function createNodeSessionStore(options: NodeSessionStoreOptions): Sessio
           phase = "identity";
           const previous = read(session.id);
           if (previous) assertNodeSessionIdentity(previous, next);
-          atomicReplace(filePath(session.id), JSON.stringify(next, null, 2));
+          return replaceSessionFile(filePath(session.id), JSON.stringify(next, null, 2));
         });
       } catch (error) { throw toNodeBoundaryError(error, "STATE_STORAGE_UNAVAILABLE", { operation: "session_save", target: "session", phase, ...getFileOperationDiagnostic(error) }); }
     },

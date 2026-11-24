@@ -8,6 +8,9 @@
 import type { CredentialRef } from "../domain";
 import { parseExternalPermissionRule } from "../domain/external-permissions";
 import type { SandboxMode } from "../domain/sandbox-policy";
+import { parseReasoningEffort } from "../domain/model-ref";
+import { resolveRouteModelCapability, resolveRouteProtocolProfile } from "../provider/model-capability-catalog";
+import { isCompatibilityPreset } from "../provider/compatibility-presets";
 import type { ModelRef } from "../domain/model-ref";
 import type { ReasoningProfile } from "../domain/reasoning-profile";
 import {
@@ -482,7 +485,7 @@ function parseExternalPermissions(value: unknown, scope: AutopilotSettingsScope,
 /** 解析显式 route 的模型清单、受信兼容 profile 覆盖与受信上下文窗口声明。 */
 function parseRouteModels(value: unknown, apiProtocol: ProviderRouteProfile["apiProtocol"]): ProviderRouteProfile["models"] | undefined {
   if (!Array.isArray(value) || value.length === 0) return undefined;
-  const models: Array<{ id: string; protocolProfile?: ProviderRouteProfile["protocolProfile"]; contextWindowTokens?: number }> = [];
+  const models: Array<ProviderRouteProfile["models"][number]> = [];
   for (const item of value) {
     if (!isRecord(item)) return undefined;
     const id = parseNonEmptyString(item.id);
@@ -494,8 +497,10 @@ function parseRouteModels(value: unknown, apiProtocol: ProviderRouteProfile["api
         ? item.contextWindowTokens as number
         : undefined;
     if (item.contextWindowTokens !== undefined && contextWindowTokens === undefined) return undefined;
+    if (item.capabilities !== undefined && !isModelCapabilityDeclaration(item.capabilities)) return undefined;
     models.push({
       id,
+      ...(item.capabilities !== undefined ? { capabilities: item.capabilities } : {}),
       ...(item.protocolProfile !== undefined ? { protocolProfile: item.protocolProfile } : {}),
       ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
     });
@@ -513,6 +518,10 @@ function parseProviderRoutes(value: unknown, scope: AutopilotSettingsScope, diag
   const routes: Record<string, ProviderRouteProfile> = {};
   for (const [routeId, rawRoute] of Object.entries(value)) {
     if (!parseNonEmptyString(routeId) || !isRecord(rawRoute) || rawRoute.id !== routeId || !isApiProtocol(rawRoute.apiProtocol)) {
+      diagnostics.push({ scope, code: "SETTINGS_PROVIDER_ROUTE_INVALID", field: "providerRoutes" });
+      return undefined;
+    }
+    if (rawRoute.compatibilityPreset !== undefined && (!isCompatibilityPreset(rawRoute.compatibilityPreset) || rawRoute.apiProtocol === "anthropic-messages")) {
       diagnostics.push({ scope, code: "SETTINGS_PROVIDER_ROUTE_INVALID", field: "providerRoutes" });
       return undefined;
     }
@@ -535,8 +544,15 @@ function parseProviderRoutes(value: unknown, scope: AutopilotSettingsScope, diag
       baseUrl,
       credentialRef,
       ...(rawRoute.protocolProfile !== undefined ? { protocolProfile: rawRoute.protocolProfile } : {}),
+      ...(rawRoute.compatibilityPreset !== undefined ? { compatibilityPreset: rawRoute.compatibilityPreset as ProviderRouteProfile["compatibilityPreset"] } : {}),
       models,
     });
+    try {
+      for (const model of models) { resolveRouteModelCapability(routes[routeId], model.id); resolveRouteProtocolProfile(routes[routeId], model.id); }
+    } catch {
+      diagnostics.push({ scope, code: "SETTINGS_PROVIDER_ROUTE_INVALID", field: "providerRoutes" });
+      return undefined;
+    }
   }
   return Object.freeze(routes);
 }
@@ -583,10 +599,11 @@ function finalizeModelRouting(resolved: ResolvedAutopilotSettings, diagnostics: 
   };
 }
 
-/** 解析 CC 顶层 effortLevel；max/xhigh/ultra 不属于顶层有效值域。 */
+/** 解析中立六档 effortLevel，模型与协议子集在能力解析与冻结时校验。 */
 function parseTopLevelEffort(value: unknown, scope: AutopilotSettingsScope, diagnostics: SettingsDiagnostic[]): ReasoningProfile | undefined {
   if (value === undefined) return undefined;
-  if (value === "low" || value === "medium" || value === "high") return { effort: value };
+  const effort = parseReasoningEffort(value);
+  if (effort) return { effort };
   diagnostics.push({ scope, code: "SETTINGS_EFFORT_INVALID", field: "effortLevel" });
   return undefined;
 }
@@ -595,7 +612,8 @@ function parseTopLevelEffort(value: unknown, scope: AutopilotSettingsScope, diag
 function parseEnvironmentEffort(value: string | undefined, scope: AutopilotSettingsScope, diagnostics: SettingsDiagnostic[]): ReasoningProfile | undefined | "unset" {
   if (value === undefined) return undefined;
   if (value === "auto" || value === "unset") return "unset";
-  if (value === "low" || value === "medium" || value === "high" || value === "max") return { effort: value };
+  const effort = parseReasoningEffort(value);
+  if (effort) return { effort };
   diagnostics.push({ scope, code: "SETTINGS_EFFORT_INVALID", field: "env.CLAUDE_CODE_EFFORT_LEVEL" });
   return undefined;
 }
@@ -779,5 +797,24 @@ export function resolveAutopilotSettings(sources: readonly AutopilotSettingsSour
       else diagnostics.push({ scope: source.scope, code: "SETTINGS_SCHEMA_VERSION_UNSUPPORTED", field: "schemaVersion" });
     }
   }
-  return { ...finalizeModelRouting(resolved, diagnostics), diagnostics };
+  const finalized = finalizeModelRouting(resolved, diagnostics);
+  const selectedRoute = finalized.modelRef && finalized.providerRoutes[finalized.modelRef.provider];
+  if (selectedRoute && finalized.reasoningProfile) {
+    const capability = resolveRouteModelCapability(selectedRoute, finalized.modelRef!.modelId);
+    if (!capability.supportedReasoningEfforts?.includes(finalized.reasoningProfile.effort)) diagnostics.push({ scope: "user", code: "SETTINGS_EFFORT_INVALID", field: "effortLevel" });
+  } else if (finalized.modelRef?.provider === "firstParty" && finalized.reasoningProfile?.effort === "xhigh") {
+    diagnostics.push({ scope: "user", code: "SETTINGS_EFFORT_INVALID", field: "effortLevel" });
+  }
+  return { ...finalized, diagnostics };
+}
+
+
+/** 在受信边界验证能力覆盖的字段、集合和数值。 */
+function isModelCapabilityDeclaration(value: unknown): value is import("../provider/api-protocol").ModelCapabilityDeclaration {
+  if (!isRecord(value) || Object.keys(value).some(function unknown(key) { return !["supportedReasoningEfforts", "defaultReasoningEffort", "inputModalities", "supportsToolCalls", "maxOutputTokens"].includes(key); })) return false;
+  if (value.supportedReasoningEfforts !== undefined && (!Array.isArray(value.supportedReasoningEfforts) || value.supportedReasoningEfforts.some(function invalid(effort) { return !parseReasoningEffort(effort); }) || new Set(value.supportedReasoningEfforts).size !== value.supportedReasoningEfforts.length)) return false;
+  if (value.defaultReasoningEffort !== undefined && !parseReasoningEffort(value.defaultReasoningEffort)) return false;
+  if (value.inputModalities !== undefined && (!Array.isArray(value.inputModalities) || !value.inputModalities.length || !value.inputModalities.includes("text") || value.inputModalities.some(function invalid(item) { return item !== "text" && item !== "image"; }) || new Set(value.inputModalities).size !== value.inputModalities.length)) return false;
+  if (value.supportsToolCalls !== undefined && typeof value.supportsToolCalls !== "boolean") return false;
+  return value.maxOutputTokens === undefined || Number.isSafeInteger(value.maxOutputTokens) && (value.maxOutputTokens as number) > 0;
 }

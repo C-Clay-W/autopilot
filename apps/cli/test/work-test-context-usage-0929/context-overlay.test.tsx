@@ -31,13 +31,13 @@ function createContextController(calls: CliAction[]): CliController {
 }
 
 /** 渲染标准测试宿主；onRequestCancel 会把 cancel_turn 记入 calls 用于断言 Esc 语义。 */
-function renderApp(calls: CliAction[], store: ReturnType<typeof createCliTuiStore>) {
+function renderApp(calls: CliAction[], store: ReturnType<typeof createCliTuiStore>, screenReader = true) {
   return render(<CliTuiApp
     store={store}
     controller={createContextController(calls)}
     closeWhenIdle={false}
     useColor={false}
-    screenReader={true}
+    screenReader={screenReader}
     onResult={function syncResult(result) { store.syncProjection(result.projection); }}
     onRequestInterrupt={function ignoreInterrupt() {}}
     onRequestCancel={function recordCancel() { calls.push({ type: "cancel_turn" }); }}
@@ -47,6 +47,22 @@ function renderApp(calls: CliAction[], store: ReturnType<typeof createCliTuiStor
 }
 
 describe("/context 覆盖视图", function contextOverlaySuite() {
+  it("无彩色终端保留占用网格，读屏只显示文字", async function rendersGridWithoutColor() {
+    for (const screenReader of [false, true]) {
+      const rendered = renderApp([], createCliTuiStore(), screenReader);
+      try {
+        rendered.stdin.write("/context");
+        rendered.stdin.write("\r");
+        await new Promise<void>(function waitForOverlay(resolve) { setTimeout(resolve, 20); });
+
+        const frame = rendered.lastFrame() ?? "";
+        expect(frame).toContain("Context Usage");
+        expect(/Context Usage\n[█▓░▒]+ {2}model:/u.test(frame)).toBe(!screenReader);
+        expect(frame).not.toContain("\u001b[");
+      } finally { rendered.unmount(); }
+    }
+  });
+
   it("打开覆盖层渲染报告与灰色退出提示，不固化进 transcript", async function opensOverlayWithoutTranscript() {
     const calls: CliAction[] = [];
     const store = createCliTuiStore();

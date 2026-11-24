@@ -556,6 +556,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
     visionAnalyzer: context.visionAnalyzer,
     sandbox: context.sandbox,
     hostMutationProtection: context.hostMutationProtection,
+    hostToolAdmission: context.hostToolAdmission,
   });
   const scheduler = createToolScheduler(context.toolRegistry, (request, executionOptions) => executor.execute(request, executionOptions));
 
@@ -823,6 +824,10 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
     runtimeBudget.totalTokens += sampled.usage.contextTokens;
     runtimeBudget.inputTokens = (runtimeBudget.inputTokens ?? 0) + sampled.usage.inputTokens;
     runtimeBudget.outputTokens = (runtimeBudget.outputTokens ?? 0) + sampled.usage.outputTokens;
+    if (sampled.usage.reasoningTokens !== undefined) {
+      runtimeBudget.reasoningTokens = (runtimeBudget.reasoningTokens ?? 0) + sampled.usage.reasoningTokens;
+      runtimeBudget.reasoningReportedOutputTokens = (runtimeBudget.reasoningReportedOutputTokens ?? 0) + sampled.usage.outputTokens;
+    }
     runtimeBudget.updatedAt = clock();
   }
 
@@ -1095,7 +1100,7 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
         }
         pendingCalls = undefined;
         const pendingCall = calls[0];
-        if (needsResumeApproval && !resumeApprovalAvailable && !context.reissueApproval) {
+        if (needsResumeApproval && !resumeApprovalAvailable && !context.reissueApproval && !context.revalidateApproval) {
           const checkpoint: AgentCheckpoint = { turnId, status: "awaiting_approval", stepCount, messages, pendingCalls: calls, completedCallIds: [...completedCallIds], ...mutationGateSnapshot(), ...usageAnchorSnapshot(), ...runtimeBudgetSnapshot(), ...contextUsageSnapshot(), ...toolGuardrailSnapshot(), ...todoSnapshotSnapshot(), ...threadObservationSnapshot(), ...checkpointContext(context.contextSnapshot, activeSkills) };
           yield { type: "turn_paused", turnId, checkpoint };
           return;
@@ -1644,8 +1649,9 @@ export async function* runKernel(context: RunContext): AsyncGenerator<AgentLoopE
 
       for (let index = 0; index < sampledToolCalls.length;) {
         const batch: AgentToolCall[] = [];
-        if (context.toolRegistry.get(sampledToolCalls[index].name).metadata.effect === "none") {
-          while (index < sampledToolCalls.length && context.toolRegistry.get(sampledToolCalls[index].name).metadata.effect === "none") batch.push(sampledToolCalls[index++]);
+        // todo_write 可携带需审批的文件集合，独立执行以保留原调用/回放顺序及完整暂停边界。
+        if (context.toolRegistry.get(sampledToolCalls[index].name).metadata.effect === "none" && sampledToolCalls[index].name !== "todo_write") {
+          while (index < sampledToolCalls.length && context.toolRegistry.get(sampledToolCalls[index].name).metadata.effect === "none" && sampledToolCalls[index].name !== "todo_write") batch.push(sampledToolCalls[index++]);
         } else {
           batch.push(sampledToolCalls[index++]);
         }

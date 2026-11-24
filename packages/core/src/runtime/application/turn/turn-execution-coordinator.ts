@@ -249,25 +249,37 @@ export function createTurnExecutionCoordinator(
       : undefined;
     const internalRuntime = createInternalAgentRuntime(agentOptions);
     const abortController = new AbortController();
+    if (activeTurns.has(turnId)) throw new RuntimeError("TURN_ALREADY_RUNNING", `Turn ${turnId} 已在当前 Runtime 中运行`);
     activeTurns.set(turnId, abortController);
 
-    session.status = "running";
-    session.activeTurnId = turnId;
-    session.updatedAt = ports.clock.now();
-    await ports.sessionStore.save(session);
-    // 恢复等待回答的 Turn 前先回写运行态，允许模型在读取答案后再次请求澄清。
-    const runningTurn = await ports.turnStore.get(turnId);
-    if (runningTurn) {
-      runningTurn.status = "running";
-      runningTurn.completedAt = undefined;
-      await ports.turnStore.save(runningTurn);
-    }
-
     const isDurable = session.persistenceMode !== "ephemeral";
-    const transcript = isDurable ? await ports.transcriptStore.getEvents(sessionId) : [];
-    let seq = transcript.reduce(function getTurnMaximum(current, envelope) {
-      return envelope.turnId === turnId ? Math.max(current, envelope.seq) : current;
-    }, 0);
+    let seq = 0;
+    let sessionPublished = false;
+    try {
+      const transcript = isDurable ? await ports.transcriptStore.getEvents(sessionId) : [];
+      seq = transcript.reduce(function getTurnMaximum(current, envelope) {
+        return envelope.turnId === turnId ? Math.max(current, envelope.seq) : current;
+      }, 0);
+      const turn = await ports.turnStore.get(turnId);
+      await ports.sessionStore.save({ ...session, status: "running", activeTurnId: turnId, updatedAt: ports.clock.now() });
+      sessionPublished = true;
+      if (turn) await ports.turnStore.save({ ...turn, status: "running", completedAt: undefined });
+    } catch (error) {
+      // 首个事件之前仍属于原暂停点；只回滚本执行段已发布的状态，外层按 leaseId 释放租约。
+      if (activeTurns.get(turnId) === abortController) {
+        try {
+          if (sessionPublished && await ports.leaseStore.heartbeat({ sessionId, lease, now: ports.clock.now() })) {
+            const current = await requireSession(sessionId);
+            if (current.activeTurnId === turnId && current.status === "running") {
+              await ports.sessionStore.save({ ...current, activeTurnId: session.activeTurnId, status: session.status, updatedAt: session.updatedAt });
+            }
+          }
+        } finally {
+          if (activeTurns.get(turnId) === abortController) activeTurns.delete(turnId);
+        }
+      }
+      throw error;
+    }
     let finalCheckpoint: AgentCheckpoint | undefined;
     let latestCheckpoint: AgentCheckpoint | undefined;
     let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -287,6 +299,8 @@ export function createTurnExecutionCoordinator(
       const writes = await Promise.allSettled([
         ports.sessionStore.save({ ...session, status, activeTurnId: undefined, updatedAt: ports.clock.now() }),
         turn ? ports.turnStore.save({ ...turn, status: deriveTurnStatus(checkpoint.status), completedAt: ports.clock.now() }) : Promise.resolve(),
+        // 审批/回答暂停仍属本回合；撤销失败也必须继续释放 Core 执行租约。
+        !["awaiting_approval", "awaiting_user_input"].includes(checkpoint.status) ? agentOptions.browser?.endTurn({ sessionId, turnId }) : Promise.resolve(),
       ]);
       if (activeTurns.get(turnId) === abortController) activeTurns.delete(turnId);
       await leaseCoordinator.release(sessionId, lease);
@@ -345,6 +359,8 @@ export function createTurnExecutionCoordinator(
         // Turn 范围累计分项跨 Continue 保留；缺分项的旧 checkpoint 不补造，靠 DTO 的完整性校验降级。
         ...(typeof previousRuntimeBudget?.inputTokens === "number" ? { inputTokens: previousRuntimeBudget.inputTokens } : {}),
         ...(typeof previousRuntimeBudget?.outputTokens === "number" ? { outputTokens: previousRuntimeBudget.outputTokens } : {}),
+        ...(typeof previousRuntimeBudget?.reasoningTokens === "number" ? { reasoningTokens: previousRuntimeBudget.reasoningTokens } : {}),
+        ...(typeof previousRuntimeBudget?.reasoningReportedOutputTokens === "number" ? { reasoningReportedOutputTokens: previousRuntimeBudget.reasoningReportedOutputTokens } : {}),
         executionSegmentVersion: 1,
       };
       const initialCheckpoint: AgentCheckpoint = runtimeInput.checkpoint
@@ -492,9 +508,11 @@ export function createTurnExecutionCoordinator(
         try {
           if (stopped) await commitBoundary(stopped);
           else {
-            await ports.sessionStore.save({ ...session, status: "failed", activeTurnId: undefined, updatedAt: ports.clock.now() });
-            const turn = await ports.turnStore.get(turnId);
-            if (turn) await ports.turnStore.save({ ...turn, status: "failed", completedAt: ports.clock.now() });
+            try {
+              await ports.sessionStore.save({ ...session, status: "failed", activeTurnId: undefined, updatedAt: ports.clock.now() });
+              const turn = await ports.turnStore.get(turnId);
+              if (turn) await ports.turnStore.save({ ...turn, status: "failed", completedAt: ports.clock.now() });
+            } finally { await agentOptions.browser?.endTurn({ sessionId, turnId }); }
           }
         } finally {
           if (activeTurns.get(turnId) === abortController) activeTurns.delete(turnId);

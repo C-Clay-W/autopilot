@@ -285,7 +285,6 @@ export function createUndoService(ports: RuntimePorts): UndoService {
         workspaceRoot: candidate.workspaceRoot,
         workspaceTrusted: true,
         permissionMode: turn.frozenRunConfig.permissionMode ?? "ask",
-        agentFlow: { async search() { return []; } },
       },
       metadata: { effect: "workspace", destructive: true, concurrency: { max: 1 }, retry: { safe: false } },
       facts: {

@@ -28,13 +28,14 @@ export function useViewport(input: {
   viewportHeight: number;
   stdout: { write(chunk: string): void };
   onCopyText?: (text: string) => void;
+  onCopyError: () => void;
 }): {
   viewportState: ScrollViewportState;
   selection: TuiTextSelection;
   handleTuiMouseEvent: (event: TuiSgrMouseEvent, wheelNotches: number) => void;
-  handleTuiViewportKey: (key: Key) => boolean;
+  handleTuiViewportKey: (key: Key, value?: string) => boolean;
 } {
-  const { isViewportMode, columns, viewportLines, viewportHeight, stdout, onCopyText } = input;
+  const { isViewportMode, columns, viewportLines, viewportHeight, stdout, onCopyText, onCopyError } = input;
   const [selection, setSelection] = useState<TuiTextSelection>({});
   const selectionRef = useRef(selection);
   const scrollbarDraggingRef = useRef(false);
@@ -54,6 +55,11 @@ export function useViewport(input: {
   function updateTuiTextSelection(next: TuiTextSelection): void {
     selectionRef.current = next;
     setSelection(next);
+  }
+
+  /** 剪贴板失败进入既有通知，不让子进程错误静默丢失。 */
+  function copySelection(text: string): void {
+    void Promise.resolve().then(function copy() { return onCopyText ? onCopyText(text) : copyTuiSelectedText(text, stdout); }).catch(onCopyError);
   }
 
   /** 将视口内鼠标坐标转换成时间线来源坐标；固定输入区和滚动条不参与划选。 */
@@ -82,10 +88,7 @@ export function useViewport(input: {
       if (selectionPoint) updateTuiTextSelection({ ...selectionRef.current, focus: selectionPoint });
       selectionDraggingRef.current = false;
       const text = getTuiSelectedText(viewportLines, selectionPoint ? { ...selectionRef.current, focus: selectionPoint } : selectionRef.current);
-      if (text) {
-        if (onCopyText) onCopyText(text);
-        else copyTuiSelectedText(text, stdout);
-      }
+      if (text) copySelection(text);
       return;
     }
     if (event.released) {
@@ -111,8 +114,14 @@ export function useViewport(input: {
   }
 
   /** 在真实备用屏中处理半视口与顶底跳转；picker 和审批由前置键位分支优先消费。 */
-  function handleTuiViewportKey(key: Key): boolean {
+  function handleTuiViewportKey(key: Key, value = ""): boolean {
     if (!isViewportMode) return false;
+    const explicitCopy = value === "[99;6u" || value === "\u001b[99;6u" || Boolean(key.ctrl && key.shift && value.toLowerCase() === "c");
+    if (explicitCopy || key.ctrl && (value === "c" || value === "\u0003")) {
+      const text = getTuiSelectedText(viewportLines, selectionRef.current);
+      if (text) copySelection(text);
+      return explicitCopy || Boolean(text);
+    }
     const current = viewportStateRef.current;
     const jump = Math.max(1, Math.floor(current.viewportHeight / 2));
     if (key.pageUp) {

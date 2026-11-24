@@ -223,6 +223,7 @@ describe("Talk-Plan0813 TUI Step 2", function tuiUpdateStep2Suite() {
     }
     const mouseInput = createTuiMouseInputSink();
     const copied: string[] = [];
+    let interrupts = 0;
     const rendered = render(createElement(CliTuiApp, {
       store,
       controller: createViewportController(projection),
@@ -233,7 +234,7 @@ describe("Talk-Plan0813 TUI Step 2", function tuiUpdateStep2Suite() {
       mouseInput,
       onCopyText: function onCopyText(text): void { copied.push(text); },
       onResult: function onResult(): void {},
-      onRequestInterrupt: function onRequestInterrupt(): void {},
+      onRequestInterrupt: function onRequestInterrupt(): void { interrupts += 1; },
       onRequestCancel: function onRequestCancel(): void {},
       onEof: function onEof(): void {},
       onAppExit: function onAppExit(): void {},
@@ -247,6 +248,19 @@ describe("Talk-Plan0813 TUI Step 2", function tuiUpdateStep2Suite() {
     await waitForTuiFrame();
     expect(copied).toHaveLength(1);
     expect(copied[0]).toMatch(/^line-\d{2}$/u);
+    rendered.stdin.write("\u0003");
+    await waitForTuiFrame();
+    expect(copied).toHaveLength(2);
+    expect(interrupts).toBe(0);
+    rendered.stdin.write("\u001b[99;6u");
+    await waitForTuiFrame();
+    expect(copied).toHaveLength(3);
+    expect(copied[2]).toBe(copied[0]);
+    mouseInput.dispatch({ code: 0, column: 1, row: 1, released: false, kind: "button" });
+    mouseInput.dispatch({ code: 0, column: 1, row: 1, released: true, kind: "button" });
+    rendered.stdin.write("\u0003");
+    await waitForTuiFrame();
+    expect(interrupts).toBe(1);
 
     mouseInput.dispatch({ code: 64, column: 1, row: 1, released: false, kind: "wheel_up" }, 99);
     await waitForTuiFrame();

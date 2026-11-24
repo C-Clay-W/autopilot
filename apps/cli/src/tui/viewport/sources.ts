@@ -430,6 +430,8 @@ export function createTuiViewportSources(snapshot: CliTuiSnapshot, statusView: C
     if (item.kind === "prompt") {
       sources.push({ itemId: item.key, text: item.content, spans: createTuiViewportTextSpans(item.content, "accent") });
       if (item.key === snapshot.activePrompt?.key) renderedActivePrompt = true;
+    } else if (item.kind === "notice" && item.persistent) {
+      sources.push({ itemId: item.key, text: item.message });
     } else if (item.kind === "turn" && item.turnId !== snapshot.liveTurnId) {
       appendEventGroup(item.key, item.events, item);
     }
@@ -505,7 +507,7 @@ export function createTuiViewportSourceCache(): TuiViewportSourceCache {
       ? [{ itemId: item.key, text: item.content, spans: createTuiViewportTextSpans(item.content, "accent") }]
       : item.kind === "turn"
         ? createTuiViewportEventSources(item.key, item.events, contentWidth, item)
-        : [];
+        : item.kind === "notice" && item.persistent ? [{ itemId: item.key, text: item.message }] : [];
     history.set(item.key, { item, width: contentWidth, decorativeGrid, sources });
     stats.historyBuilds += 1;
     return sources;
@@ -568,6 +570,8 @@ export function createTuiViewportSourceCache(): TuiViewportSourceCache {
       if (item.kind === "prompt") {
         sources.push(...getHistorySources(item, contentWidth, decorativeGrid));
         if (item.key === snapshot.activePrompt?.key) renderedActivePrompt = true;
+      } else if (item.kind === "notice" && item.persistent) {
+        sources.push(...getHistorySources(item, contentWidth, decorativeGrid));
       } else if (item.kind === "turn" && item.turnId !== snapshot.liveTurnId) {
         sources.push(...getHistorySources(item, contentWidth, decorativeGrid));
       }

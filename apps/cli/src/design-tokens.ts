@@ -1,6 +1,7 @@
 /** CLI TUI 语义色 token；组件只引用 token，不直接写危险态颜色。 */
+const tuiAccentIndex = 208;
 export const CLI_TUI_COLORS = {
-  accent: "ansi256(208)",
+  accent: `ansi256(${tuiAccentIndex})`,
   permissionFullAccess: "#ff6b80",
   copilotBlue: "ansi256(33)",
   copilotBlueBright: "ansi256(39)",
@@ -13,6 +14,10 @@ export const CLI_TUI_COLORS = {
 
 /** Design.md 中橙色强调色的 ANSI 256 语义映射；NO_COLOR 时完全不输出颜色。 */
 export const TUI_ACCENT_COLOR = CLI_TUI_COLORS.accent;
+/** 编排受管终端的模型名使用同一个强调色，不修改 Ink 的全局颜色级别。 */
+export const TUI_MANAGED_MODEL_ACCENT_SGR = `\u001b[38;5;${tuiAccentIndex}m`;
+/** 受管终端的风险标签沿用普通 TUI 的完全访问红色。 */
+export const TUI_MANAGED_FULL_ACCESS_SGR = `\u001b[38;2;${CLI_TUI_COLORS.permissionFullAccess.slice(1).match(/../g)!.map(function component(value) { return parseInt(value, 16); }).join(";")}m`;
 /** 工具徽标 chip 的强调背景色；与唯一强调色同源，只用于标注当前活动步骤。 */
 export const TUI_ACCENT_BG_COLOR = CLI_TUI_COLORS.accent;
 /** 工具徽标 chip 上的深色粗体文字色；对应 Web 的 text-ink-on-dark 槽位语义。 */
@@ -35,5 +40,8 @@ export const TUI_WAITING_BACKGROUND_COLOR = "ansi256(236)";
 export const TUI_DIFF_ADDED_COLOR = "ansi256(46)";
 /** unified diff 删除行的语义色。 */
 export const TUI_DIFF_REMOVED_COLOR = "ansi256(196)";
-/** 输入区（prompt）的背景色。 */
-export const TUI_PROMPT_BACKGROUND_COLOR = "ansi256(236)";
+const tuiPromptBackgroundIndex = 236;
+/** 用户提示词背景，与 Desktop 深灰侧栏接近。 */
+export const TUI_PROMPT_BACKGROUND_COLOR = `ansi256(${tuiPromptBackgroundIndex})`;
+/** 编排主控仅为已提交消息绘制此背景，不修改 Ink 的全局颜色级别。 */
+export const TUI_MANAGED_PROMPT_BACKGROUND_SGR = `\u001b[48;5;${tuiPromptBackgroundIndex}m`;

@@ -28,7 +28,7 @@ export type CliThreadCommand =
   | { type: "group_of"; threadId: string }
   | { type: "group_enable"; requestId: string; rootThreadId: string }
   | { type: "group_disable"; requestId: string; groupId: string }
-  | { type: "create"; requestId: string; groupId: string; parentThreadId: string; title?: string; roleLabel?: string; modelRef?: { provider: string; modelId: string }; reasoningEffort?: "none" | "low" | "medium" | "high" | "max" }
+  | { type: "create"; requestId: string; groupId: string; parentThreadId: string; title?: string; roleLabel?: string; modelRef?: { provider: string; modelId: string }; reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max" }
   | { type: "associate"; groupId: string; threadId: string; requestId: string }
   | { type: "list"; groupId: string; cursor?: string; limit?: number }
   | { type: "read"; groupId: string; threadId: string; cursor?: string; limit?: number }
@@ -42,6 +42,7 @@ export type CliThreadCommand =
 
 /** CLI 命令语法树；命令本身不包含宿主状态根或 Runtime 实例。 */
 export type CliCommand =
+  | { type: "browser"; operation: import("@autopilot-agent/core").BrowserOperation; permit?: string }
   | { type: "project_open"; path?: string }
   | { type: "project_list" }
   | { type: "project_current" }
@@ -189,7 +190,7 @@ export interface CliStatusView {
   permissionMode: CliPermissionMode;
   workspaceRoot?: string;
   source: "runtime_default" | "session_default" | "turn_frozen";
-  /** 活动 Turn 存在时，Session 默认权限若不同则提示下轮值。 */
+  /** 当前执行段权限与人类已保存选择不同时，提示下次安全恢复或新回合值。 */
   nextPermissionMode?: CliPermissionMode;
   /** 活动 Turn 存在时显示已保存、但尚未冻结到当前 Turn 的下一轮模型。 */
   nextModel?: string;
@@ -210,6 +211,9 @@ export interface CliRuntimeStatusDefaults {
     provider: string;
     modelId: string;
     requestableEfforts: readonly string[];
+    defaultReasoningEffort?: string;
+    reasoningCapabilityUnknown?: boolean;
+    supportsToolCalls?: boolean;
   }>;
 }
 

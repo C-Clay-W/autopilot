@@ -197,6 +197,22 @@ describe("Web Fetch URL policy", function webFetchUrlPolicySuite() {
 
 /** 安全 Fetch 的逐跳连接、正文门禁、提取与取消契约。 */
 describe("Safe Web Fetch capability", function safeWebFetchSuite() {
+  /** 保留地址门禁并给受控拦截返回可区分的标识，Fake-IP 时不得发 HTTP。 */
+  it("区分 URL、DNS 与非公网地址拦截，并在 Fake-IP 时不发送 HTTP", async function explainsBlockedTargets() {
+    let requests = 0;
+    const capability = createSafeWebFetchCapability({
+      async resolveDns(hostname) {
+        if (hostname === "fake.example.com") return [{ address: "198.18.1.4", family: 4 }];
+        throw new Error("fixture DNS unavailable");
+      },
+      async request() { requests += 1; throw new Error("blocked requests must not reach HTTP"); },
+    });
+    await expect(capability.fetch({ url: "file:///fixture" })).rejects.toMatchObject({ code: "WEB_URL_BLOCKED", blockReason: "url_not_allowed" });
+    await expect(capability.fetch({ url: "https://missing.example.com/" })).rejects.toMatchObject({ code: "WEB_URL_BLOCKED", blockReason: "dns_failed" });
+    await expect(capability.fetch({ url: "https://fake.example.com/" })).rejects.toMatchObject({ code: "WEB_URL_BLOCKED", blockReason: "non_public_address" });
+    expect(requests).toBe(0);
+  });
+
   /** HTML 必须通过 DOM 解析，脚本与嵌入节点不会进入模型可见正文。 */
   it("提取 HTML 标题和结构文本且钉住已校验地址", async function extractsBoundedHtml() {
     const requests: WebFetchHttpRequest[] = [];
@@ -253,7 +269,7 @@ describe("Safe Web Fetch capability", function safeWebFetchSuite() {
     const requests: WebFetchHttpRequest[] = [];
     const capability = createSafeWebFetchCapability({ resolveDns: resolver, request: createLocalHttpClient(requests) });
 
-    await expect(capability.fetch({ url: "http://public.example.com/rebinding" })).rejects.toMatchObject({ code: "WEB_URL_BLOCKED" });
+    await expect(capability.fetch({ url: "http://public.example.com/rebinding" })).rejects.toMatchObject({ code: "WEB_URL_BLOCKED", blockReason: "non_public_address" });
     expect(requests).toHaveLength(1);
   });
 
@@ -262,7 +278,7 @@ describe("Safe Web Fetch capability", function safeWebFetchSuite() {
     const requests: WebFetchHttpRequest[] = [];
     const capability = createSafeWebFetchCapability({ resolveDns: resolveFixtureDns, request: createLocalHttpClient(requests) });
 
-    await expect(capability.fetch({ url: "http://public.example.com/loop" })).rejects.toMatchObject({ code: "WEB_URL_BLOCKED" });
+    await expect(capability.fetch({ url: "http://public.example.com/loop" })).rejects.toMatchObject({ code: "WEB_URL_BLOCKED", blockReason: "redirect_rejected" });
     expect(requests).toHaveLength(11);
   });
 

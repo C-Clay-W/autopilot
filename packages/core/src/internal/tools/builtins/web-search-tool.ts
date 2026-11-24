@@ -5,7 +5,7 @@
 import { z } from "zod";
 import { isWebSearchCapabilityError, type WebSearchCapabilityError, type WebSearchCapability, type WebSearchResult, type WebSearchSource } from "../../../runtime/protocol/web-capability";
 import { createToolError, TOOL_ERROR_CODES } from "../tool-error";
-import type { AgentToolDefinition, ToolActionFacts } from "../types";
+import type { AgentToolDefinition, ToolActionFacts, ToolExecutionContext } from "../types";
 
 const MAX_ANSWER_BYTES = 24 * 1024;
 const MAX_OUTPUT_BYTES = 64 * 1024;
@@ -86,15 +86,16 @@ function normalizeSearchResult(result: WebSearchResult): WebSearchResult {
   return { answer: answer.value, sources, truncated };
 }
 
-/** 为已启用的搜索能力生成无需逐次审批的外部查询事实。 */
-function createWebSearchActionFacts(): ToolActionFacts {
+/** 已启用的公开搜索在 Work 的自动批准和完全访问模式下走只读路径。 */
+function createWebSearchActionFacts(_input: WebSearchInput, context: ToolExecutionContext): ToolActionFacts {
+  const readOnly = (context.permissionMode === "full_access" || context.permissionMode === "auto_approve") && context.capabilityCeiling?.productMode !== "chat";
   return {
     toolName: "web_search",
     effect: "external",
     destructive: false,
     operation: "search_public_web",
     resource: "public web",
-    risk: "external_side_effect",
+    risk: readOnly ? "read_only" : "external_side_effect",
   };
 }
 

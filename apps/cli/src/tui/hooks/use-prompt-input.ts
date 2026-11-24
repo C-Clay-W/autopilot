@@ -32,6 +32,7 @@ import { readMacClipboard, readWindowsClipboard, type CliDraftImage } from "../i
 
 /** usePromptInput 的运行依赖；派生值（slash 建议、视口按键）由 app.tsx 通过 ref 注入。 */
 export interface UsePromptInputInput {
+  parseInput?: import("../../controller.js").CliController["parseInput"];
   store: CliTuiStore;
   columns: number;
   draftRef?: { current?: ReturnType<typeof createPromptDraft> };
@@ -57,7 +58,7 @@ export interface UsePromptInputInput {
     current: {
       slashCommandSuggestions: CliSlashCommand[];
       fileMentionSuggestions: string[];
-      handleTuiViewportKey: (key: Key) => boolean;
+      handleTuiViewportKey: (key: Key, value?: string) => boolean;
       handleApprovalKey?: (value: string, key: Key) => boolean;
     };
   };
@@ -201,6 +202,7 @@ export function usePromptInput(input: UsePromptInputInput): {
   /** 分发终端按键并保持图片占位符与草稿身份一致。 */
   function handleInput(value: string, key: Key): void {
     recordTuiPerformanceDiagnostic("input_key_arrived", value && !key.ctrl && !key.meta ? "text" : "control");
+    if (!bracketedPasteRef.current && (key.ctrl && (value.toLowerCase() === "c" || value === "\u0003") || /^(?:\u001b)?\[99;6u$/.test(value)) && derivedRef.current.handleTuiViewportKey(key, value)) return;
     const controlAction = parseTuiControlAction(value, key);
     if (controlAction === "eof") {
       onEof();
@@ -256,12 +258,12 @@ export function usePromptInput(input: UsePromptInputInput): {
     }
     if (derivedRef.current.slashCommandSuggestions.length > 0) {
       const slashCommandSuggestions = derivedRef.current.slashCommandSuggestions;
-      const selectedCommand = slashCommandSuggestions[Math.max(0, Math.min(slashCommandIndexRef.current, slashCommandSuggestions.length - 1))];
+      const commandCount = slashCommandSuggestions.length;
+      const selectedIndex = Math.max(0, Math.min(slashCommandIndexRef.current, commandCount - 1));
+      const selectedCommand = slashCommandSuggestions[selectedIndex];
       if (selectedCommand && (key.upArrow || key.downArrow)) {
-        const nextIndex = key.upArrow
-          ? Math.max(0, slashCommandIndexRef.current - 1)
-          : Math.min(slashCommandSuggestions.length - 1, slashCommandIndexRef.current + 1);
-        updateSlashCommandIndex(nextIndex);
+        const step = key.upArrow ? -1 : 1;
+        updateSlashCommandIndex((selectedIndex + step + commandCount) % commandCount);
         return;
       }
       if (selectedCommand && key.tab) {
@@ -317,7 +319,7 @@ export function usePromptInput(input: UsePromptInputInput): {
       return;
     }
     if (derivedRef.current.handleTuiViewportKey(key)) return;
-    if (busy.current && !isActiveTuiStatus(current.status)) return;
+    if (current.compacting || busy.current && !isActiveTuiStatus(current.status) && !input.parseInput) return;
     const deleteDirection = resolveTuiDeleteDirection(value, key, rawInputSequenceRef.current);
     if (deleteDirection) {
       const characters = splitTuiInputGraphemes(inputRef.current);
@@ -393,13 +395,15 @@ export function usePromptInput(input: UsePromptInputInput): {
     }
     pasteCarriageReturnRef.current = false;
     if (key.return) {
+      // 受管远端提交期间允许继续编辑草稿，但不丢弃尚未可提交的下一条消息。
+      if (busy.current && !isActiveTuiStatus(current.status)) return;
       if (pastingCountRef.current > 0) { store.addNotice("图片仍在处理，请稍候发送"); return; }
       const content = inputRef.current.trim();
       if (!content) return;
       const spans = imageSpans(content);
       if (new Set(spans.map(function id(span) { return span.id; })).size !== spans.length) { store.addNotice("图片占位符重复，请删除重复内容"); return; }
       const images = spans.map(function image(span) { return imageDraftsRef.current.get(span.id)!; });
-      const parsed = parseSlashAction(content);
+      const parsed = input.parseInput?.(content) ?? parseSlashAction(content);
       if (parsed.kind === "error") { store.addNotice(parsed.message); return; }
       if (images.length && parsed.action.type !== "submit_prompt") { store.addNotice("图片不能附加到命令，请先发送或删除图片"); return; }
       if (parsed.action.type === "submit_prompt") {

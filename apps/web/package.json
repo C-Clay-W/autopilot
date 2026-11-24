@@ -1,6 +1,6 @@
 {
   "name": "@autopilot-agent/web",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "scripts": {
     "dev": "next dev --webpack",
@@ -10,8 +10,8 @@
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
-    "@autopilot-agent/core": "0.3.0",
-    "@autopilot-agent/presentation": "0.3.0",
+    "@autopilot-agent/core": "0.4.0",
+    "@autopilot-agent/presentation": "0.4.0",
     "@json-render/react": "0.21.1",
     "@lancedb/lancedb": "^0.31.0",
     "mammoth": "^1.12.0",

@@ -24,6 +24,10 @@ export interface Turn {
   sessionId: string;
   status: TurnStatus;
   frozenRunConfig: FrozenRunConfig;
+  /** 新 Turn 已观察到的人类选择；与冻结参数分开，避免覆盖单次 Turn 权限。 */
+  permissionSelectionRevision?: string;
+  /** 恢复租约边界的权限修订审计；原 frozenRunConfig 永不因此改写。 */
+  permissionRevisions?: Array<{ permissionMode: NonNullable<FrozenRunConfig["permissionMode"]>; selectionRevision: string; changedAt: number; leaseId: string; approvalCutoffSeq: number }>;
   /** 私有 Provider 执行快照；公开 Runtime DTO 必须剥离该字段。 */
   frozenProviderConfig?: FrozenProviderConfig;
   /** Todo 当前任务链身份；claimed queue 继承上一 Turn，普通新 Turn 创建新链。 */

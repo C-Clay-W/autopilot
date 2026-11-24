@@ -11,13 +11,15 @@ import type { SessionDirectoryPage, SessionDirectoryQuery } from "../../ports/se
 export class MemorySessionStore implements SessionStore {
   private sessions = new Map<string, Session>();
 
+  /** 返回独立副本，调用方修改必须经 save 才能写入。 */
   async get(id: string): Promise<Session | null> {
-    return this.sessions.get(id) ?? null;
+    const session = this.sessions.get(id);
+    return session ? structuredClone(session) : null;
   }
 
   /** 列出内存中的全部 Session。 */
   async list(): Promise<Session[]> {
-    return [...this.sessions.values()];
+    return structuredClone([...this.sessions.values()]);
   }
 
   /** 只投影元数据，不复制presentation等正文属性。 */
@@ -58,8 +60,9 @@ export class MemorySessionStore implements SessionStore {
     return true;
   }
 
+  /** 保存输入副本，避免调用方持有嵌套引用改写内部状态。 */
   async save(session: Session): Promise<void> {
-    this.sessions.set(session.id, session);
+    this.sessions.set(session.id, structuredClone(session));
   }
 
   async delete(id: string): Promise<boolean> {

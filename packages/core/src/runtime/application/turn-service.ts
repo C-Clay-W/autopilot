@@ -7,7 +7,7 @@
  *
  * Phase 3 改动：
  * - start 时调用 resolveRunConfig 计算三层优先级，冻结为 FrozenRunConfig 并写入 TurnStore。
- * - continue 强制读取 TurnStore 中的 FrozenRunConfig，忽略 input.runConfig 覆盖。
+ * - continue 保留原 FrozenRunConfig，权限仅在恢复租约边界采用受信人类选择，不接受 input.runConfig 提权。
  * - ephemeral 模式跳过 transcript / checkpoint 持久化，但 eventSink 仍执行。
  * - 事件信封构造改为调用 createEventEnvelope 纯工厂函数。
  */
@@ -150,6 +150,7 @@ export function createTurnService(
     const capability = runtimeConfigResolver.readRuntimeDefault().threads;
     if (!capability?.humanPrincipalId) return { queued: false };
     const session = await requireSession(input.sessionId);
+    if (session.managedExecution) return { queued: false };
     if (session.productMode !== "work" || session.projectId !== capability.projectId) throw new RuntimeError("THREAD_SCOPE_DENIED", "THREAD_SCOPE_DENIED");
     const service = createThreadService(ports, ports.threadStore, { ...capability, actor: { kind: "human", principalId: capability.humanPrincipalId } });
     const groupId = await service.resolveGroup({ threadIds: [input.sessionId] });
@@ -188,6 +189,7 @@ export function createTurnService(
     runtimeDefault: import("../protocol").RunConfig,
   ): Promise<import("../protocol").RunConfig> {
     const threads = runtimeDefault.threads;
+    if (session.managedExecution) return { ...runtimeDefault, threads: undefined };
     if (!threads) return runtimeDefault;
     if (session.productMode === "work" && session.projectId === threads.projectId && (threads.humanPrincipalId || await hasEnabledThreadMembership(ports, threads, session.id))) return { ...runtimeDefault, threads };
     return { ...runtimeDefault, threads: undefined };
@@ -229,6 +231,7 @@ export function createTurnService(
       sessionId: input.sessionId,
       status: "running",
       frozenRunConfig,
+      permissionSelectionRevision: session.permissionSelection?.revision,
       frozenProviderConfig,
       todoChainId,
       startedAt: ports.clock.now(),
@@ -281,7 +284,7 @@ export function createTurnService(
     }
   }
 
-  /** 继续运行 turn；强制使用 TurnStore 中的 FrozenRunConfig，忽略 input.runConfig 覆盖。 */
+  /** 继续原 turn，保持冻结配置，恢复租约边界仅采用受信人类权限修订。 */
   async function* continueTurn(input: ContinueTurnInput): AsyncGenerator<AgentEvent> {
     const session = await requireSession(input.sessionId);
     await assertWorkHistoryWritable(ports, session);
@@ -293,14 +296,14 @@ export function createTurnService(
     const checkpoint = webInputs.restore(recovered.checkpoint);
 
     // 仅可信权威视图已撤下当前审批身份时允许重签，HTTP/模型不能自报该内部标记。
-    const approvalView = checkpoint.status === "awaiting_approval" && !input.approval
+    const approvalView = checkpoint.status === "awaiting_approval"
       ? await recoveryService.getRecoverableState({ sessionId: input.sessionId, turnId: turn.id })
       : undefined;
     const reissueApproval = approvalView?.status === "awaiting_approval" && approvalView.recoverable && !approvalView.approval;
 
     const turnId = input.turnId ?? checkpoint.turnId;
     const userQuestion = await resolveUserQuestionContinuation(input, checkpoint, turnId);
-    // Work 恢复也须重取宿主动态协作能力，再与原冻结目录取交集；模型和权限仍用原冻结参数。
+    // Work 恢复重取宿主动态协作能力并与原目录取交集；模型保持冻结，权限在领取租约后单独解析。
     const runtimeDefault = await scopeThreadsForSession(session, session.productMode === "chat" ? runtimeConfigResolver.readRuntimeDefault() : { ...defaultRunConfig, threads: runtimeConfigResolver.readRuntimeDefault().threads });
     const resolved = await resolveTurnCapabilities({ session, turnId, runtimeDefault, override: input.runConfig, frozen: turn.frozenRunConfig, continuing: true, now: ports.clock.now() });
     const capabilities = resolved.capabilities;
@@ -315,22 +318,47 @@ export function createTurnService(
         || current.checkpoint.lease?.safeBoundarySeq !== recovered.checkpoint.lease?.safeBoundarySeq) {
         throw new RuntimeError("TURN_NOT_RESUMABLE", "恢复等待期间执行段已改变，请读取当前状态");
       }
-      if (providerConfig !== turn.frozenProviderConfig) {
-        await ports.turnStore.save({ ...turn, frozenProviderConfig: providerConfig });
+      // 仅在取得恢复执行权后读取人类设置，不采纳 continue.runConfig 的权限或模型覆盖。
+      const latestSession = await requireSession(input.sessionId);
+      const previousPermission = turn.permissionRevisions?.slice(-1)[0];
+      const selection = latestSession.productMode !== "chat" ? latestSession.permissionSelection : undefined;
+      const permissionChanged = selection !== undefined && selection.revision !== (previousPermission?.selectionRevision ?? turn.permissionSelectionRevision);
+      const permissionMode = permissionChanged ? selection.mode : previousPermission?.permissionMode ?? resolved.frozen.permissionMode;
+      const permissionEvents = permissionChanged || previousPermission && checkpoint.status === "awaiting_approval"
+        ? (await ports.transcriptStore.getEvents(input.sessionId)).filter(function sameTurn(event) { return event.turnId === turnId; })
+        : [];
+      const pendingApprovalEvent = permissionEvents.find(function matchesApproval(envelope) { return envelope.event.type === "approval_required" && envelope.event.result.approval.approvalId === approvalView?.approval?.approvalId; });
+      // 修订已落盘但执行段尚未启动就失败时，重试仍须撤下修订前的批准，不能恢复成旧授权。
+      const revalidatePermission = permissionChanged || Boolean(previousPermission && pendingApprovalEvent && pendingApprovalEvent.seq <= previousPermission.approvalCutoffSeq);
+      if (!revalidatePermission && turn.permissionRevisions?.length && input.approval && approvalView?.approval?.approvalId !== input.approval.approvalId) {
+        throw new RuntimeError("APPROVAL_MISMATCH", "审批不属于当前权限执行段，请读取最新请求");
       }
-      /** 在协调器内创建已冻结权限的输入，生命周期仍由原执行链管理。 */
-      yield* executionCoordinator.execute({ sessionId: input.sessionId, turnId, frozen: resolved.frozen, capabilities, providerConfig, previousContextWindowTokens: undefined, lease, makeRuntimeInput: () => ({
+      const executionFrozen = { ...resolved.frozen, permissionMode };
+      await ports.turnStore.save({
+        ...turn,
+        frozenProviderConfig: providerConfig,
+        ...(permissionChanged ? { permissionRevisions: [...(turn.permissionRevisions ?? []), {
+          permissionMode: selection.mode,
+          selectionRevision: selection.revision,
+          changedAt: ports.clock.now(),
+          leaseId: lease.leaseId,
+          approvalCutoffSeq: permissionEvents.reduce(function latestSeq(value, event) { return Math.max(value, event.seq); }, 0),
+        }] } : {}),
+      });
+      /** 在协调器内采用该段权限，原模型、Provider 和冻结审计仍保持原值。 */
+      yield* executionCoordinator.execute({ sessionId: input.sessionId, turnId, frozen: executionFrozen, capabilities, providerConfig, previousContextWindowTokens: undefined, lease, makeRuntimeInput: () => ({
         turnId,
         todoChainId: turn.todoChainId ?? turn.id,
         checkpoint,
-        reissueApproval,
+        reissueApproval: !revalidatePermission && reissueApproval,
+        revalidateApproval: revalidatePermission,
         signal: input.signal,
         maxSteps: turn.frozenRunConfig.maxSteps,
         maxToolRetries: turn.frozenRunConfig.maxToolRetries,
         runtimeLimitsResolved: true,
         maxDurationMs: turn.frozenRunConfig.maxDurationMs,
         maxTotalTokens: turn.frozenRunConfig.maxTotalTokens,
-        approval: input.approval
+        approval: (!revalidatePermission || input.approval?.decision === "deny") && input.approval
           ? { approvalId: input.approval.approvalId, decision: mapApprovalDecision(input.approval.decision) }
           : undefined,
         userQuestion,
@@ -376,10 +404,10 @@ export function createTurnService(
 
   /** 精确验证Session/Turn后仅abort本Runtime的controller，返回真实归属，不写持久状态。 */
   async function cancelLocalExecution(input: CancelTurnInput): Promise<boolean> {
+    const controller = activeTurns.get(input.turnId);
     const turn = await ports.turnStore.get(input.turnId);
     if (!turn || turn.sessionId !== input.sessionId) throw new RuntimeError("TURN_NOT_FOUND", "Turn 不存在或不属于当前会话");
-    const controller = activeTurns.get(input.turnId);
-    if (!controller) return false;
+    if (!controller || controller !== activeTurns.get(input.turnId)) return false;
     controller.abort();
     return true;
   }

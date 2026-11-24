@@ -485,4 +485,24 @@ describe("CLI Presentation adapter", function cliPresentationAdapterSuite() {
     expect(frame).not.toContain("PRIVATE_");
     rendered.unmount();
   });
+
+  it("网页拦截在实时、历史与纯文本展示保留安全诊断和原错误码", function rendersWebBlockReason() {
+    const turnId = "turn-web-blocked";
+    const projector = createCliEventProjector({ sessionId: "web-blocked" });
+    const reason = "网页目标地址位于非公网网段，请检查 DNS 或代理设置";
+    projector.project(asEvent({ type: "turn_started", turnId, stepCount: 0 }));
+    projector.project(asEvent({ type: "tool_result", turnId, stepId: "step-web", callId: "blocked-fetch", toolName: "web_fetch", summary: "PRIVATE_RAW_SUMMARY", retryCount: 0, result: { status: "error", callId: "blocked-fetch", toolName: "web_fetch", error: { code: "WEB_URL_BLOCKED", message: "PRIVATE_RAW_ERROR" }, display: { titleKey: "tool.web_fetch.completed", target: "github.com", summary: reason } } }));
+    const { events, presentation } = projector.getProjection();
+    const live = render(createElement(TuiLiveTurn, { turnId, events, presentation, status: "running", approvalSelectedIndex: 0, useColor: false, screenReader: true, todoExpanded: false, maximumWidth: 100 }));
+    const history = render(createElement(Box, { flexDirection: "column" }, renderTimeline(events, false, { turnId, presentation })));
+    try {
+      const plain = createPlainRenderer("text").render(events.find(function isResult(event) { return event.type === "tool_result"; })!);
+      for (const text of [live.lastFrame(), history.lastFrame(), plain]) {
+        expect(text).toContain(reason);
+        expect(text).not.toContain("PRIVATE_");
+      }
+      expect(live.lastFrame()).toContain("WEB_URL_BLOCKED");
+      expect(history.lastFrame()).toContain("WEB_URL_BLOCKED");
+    } finally { live.unmount(); history.unmount(); }
+  });
 });

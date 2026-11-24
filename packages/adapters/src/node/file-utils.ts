@@ -13,6 +13,8 @@ export interface FileOperationDiagnostic {
   phase: "lock" | "temporary_write" | "rename" | "cleanup";
   osCode?: string;
   lockWaitMs?: number;
+  attempts?: number;
+  elapsedMs?: number;
   cleanupFailed?: boolean;
 }
 const fileDiagnostics = new WeakMap<object, FileOperationDiagnostic>();
@@ -162,17 +164,34 @@ async function acquireProcessLock(filePath: string, requireExitedOwner = false):
   }
 }
 
-/** 关闭并按 owner 校验后删除跨进程锁文件。 */
-function releaseProcessLock(handle: ProcessLockHandle): void {
+/** 短暂句柄竞争时重试释放，每次重核 owner；失败不能被当成已经释放。 */
+async function removeOwnedProcessLock(lockPath: string, ownerId: string): Promise<void> {
+  const startedAt = Date.now();
+  while (true) {
+    try {
+      const metadata = JSON.parse(await fsp.readFile(lockPath, "utf8")) as Partial<ProcessLockMetadata>;
+      if (metadata.ownerId !== ownerId) return;
+      await fsp.unlink(lockPath);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT") return;
+      if ((code === "EPERM" || code === "EACCES" || code === "EBUSY") && Date.now() - startedAt < PROCESS_LOCK_TIMEOUT_MS) {
+        await waitForProcessLock();
+        continue;
+      }
+      rememberFileFailure(error, { phase: "cleanup", cleanupFailed: true });
+      throw error;
+    }
+  }
+}
+
+/** 关闭并按 owner 校验后删除跨进程锁文件，完成前不释放进程内队列。 */
+async function releaseProcessLock(handle: ProcessLockHandle): Promise<void> {
   try {
     fs.closeSync(handle.descriptor);
   } finally {
-    try {
-      const metadata = JSON.parse(fs.readFileSync(handle.lockPath, "utf8")) as Partial<ProcessLockMetadata>;
-      if (metadata.ownerId === handle.ownerId) fs.unlinkSync(handle.lockPath);
-    } catch {
-      // 锁文件可能已由 stale recovery 清理；不影响临界区结果。
-    }
+    await removeOwnedProcessLock(handle.lockPath, handle.ownerId);
   }
 }
 
@@ -195,7 +214,7 @@ export async function withFileLock<T>(filePath: string, operation: () => T | Pro
     try {
       return await operation();
     } finally {
-      releaseProcessLock(handle);
+      await releaseProcessLock(handle);
     }
   } finally {
     release();
@@ -241,12 +260,7 @@ async function releaseAsyncProcessLock(handle: AsyncProcessLockHandle): Promise<
   try {
     await handle.descriptor.close();
   } finally {
-    try {
-      const metadata = JSON.parse(await fsp.readFile(handle.lockPath, "utf8")) as Partial<ProcessLockMetadata>;
-      if (metadata.ownerId === handle.ownerId) await fsp.unlink(handle.lockPath);
-    } catch {
-      // 锁文件可能已由 stale recovery 清理；不影响临界区结果。
-    }
+    await removeOwnedProcessLock(handle.lockPath, handle.ownerId);
   }
 }
 
@@ -299,6 +313,33 @@ export function atomicReplace(filePath: string, content: string): void {
       if (failure) rememberFileFailure(failure, { ...getFileOperationDiagnostic(failure)!, cleanupFailed: true });
       else { rememberFileFailure(error, { phase: "cleanup" }); throw error; }
     }
+  }
+}
+
+/** Session 保存遇 Windows 共享冲突时，在原锁内复用同一临时文件，最多五次、退避共 300ms。 */
+export async function replaceSessionFile(filePath: string, content: string): Promise<void> {
+  if (process.platform !== "win32") return atomicReplace(filePath, content);
+  ensureParentDirectory(filePath);
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  const delays = [20, 40, 80, 160];
+  let attempts = 0;
+  const started = performance.now();
+  try {
+    await fsp.writeFile(temporaryPath, content, { encoding: "utf8", flag: "wx" });
+    for (;;) {
+      attempts++;
+      try { await fsp.rename(temporaryPath, filePath); return; }
+      catch (error) {
+        const delay = delays[attempts - 1];
+        if (!delay || !["EBUSY", "EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+        await new Promise(function backoff(resolve) { setTimeout(resolve, delay); });
+      }
+    }
+  } catch (error) {
+    let cleanupFailed = false;
+    try { await fsp.rm(temporaryPath, { force: true }); } catch { cleanupFailed = true; }
+    rememberFileFailure(error, { phase: attempts ? "rename" : "temporary_write", attempts, elapsedMs: Math.round(performance.now() - started), cleanupFailed });
+    throw error;
   }
 }
 

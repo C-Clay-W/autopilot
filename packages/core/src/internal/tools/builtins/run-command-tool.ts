@@ -157,7 +157,7 @@ export function createRunCommandTool(): AgentToolDefinition<z.infer<typeof runCo
         destructive: result.risk === "destructive",
         operation: "command",
         resource: normalizeProgramName(input.program),
-        risk: target ? "external_side_effect" : result.risk,
+        risk: result.risk === "destructive" ? "destructive" : target ? "external_side_effect" : result.risk,
         stableConstraint: target
           ? computeExternalExecutionConstraint("run_command", target)
           : cwd
@@ -166,6 +166,7 @@ export function createRunCommandTool(): AgentToolDefinition<z.infer<typeof runCo
         ...(target ? { externalMutation: true, externalExecutionTarget: target } : {}),
         hardDenyReason: result.decision === "deny" ? result.reason : undefined,
         requiresApproval: result.decision !== "deny",
+        requireSingleApproval: result.requireSingleApproval ?? (target && result.risk === "unknown" && context.permissionMode !== "ask" ? true : undefined),
         approval: { reason: target ? "命令请求修改一个工作区外精确文件，需要明确用户授权" : result.reason, preview: { program: input.program, args: input.args, cwd: input.cwd, timeoutMs: input.timeoutMs, ...(target ? { externalWriteTarget: externalExecutionTargetLabel(target), operation: "write" } : {}) } },
         ...(cwd || target ? { commandCwd: cwd?.canonicalTarget ?? input.cwd } : {}),
       };

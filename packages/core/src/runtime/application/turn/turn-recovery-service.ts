@@ -14,7 +14,7 @@ import { AgentRuntimeError as RuntimeError } from "../../protocol";
 import { sanitizeCheckpoint, sanitizeEventForExternal } from "../../protocol/sanitize-checkpoint";
 import { sanitizeAgentTerminationView } from "../../protocol/recoverable-turn-view";
 import { migrateAgentMessages } from "../../protocol/migrate-agent-messages";
-import { createAgentToolResultMessage, getAgentToolCalls, scanAgentToolPairing, validateAgentMessages } from "../../../internal/types/agent-message";
+import { createAgentToolResultMessage, getAgentToolCalls, scanAgentToolPairing, validateAgentMessages, type AgentMessage } from "../../../internal/types/agent-message";
 import { serializeToolResultForModel } from "../../../internal/tool-scheduler";
 import { createSyntheticToolErrorResult } from "../../../internal/tools/synthetic-tool-result";
 import type { FrozenRunConfig, Turn } from "../../domain";
@@ -122,6 +122,17 @@ function assessSafetyBudgetMigration(turn: Turn, checkpoint: AgentCheckpoint): {
   };
 }
 
+/** 用未知结果闭合尾部工具调用，保留已知结果，也不重新执行原工具。 */
+export function closeInterruptedToolCalls(messages: AgentMessage[], pendingCalls: ReturnType<typeof getAgentToolCalls>): AgentMessage[] {
+  return validateAgentMessages([
+    ...messages,
+    ...pendingCalls.map(function closeUnknownOutcome(call) {
+      const result = createSyntheticToolErrorResult(call, "TOOL_OUTCOME_UNKNOWN", "中断前无法确认该工具是否已产生副作用，请先验证外部状态后再继续");
+      return createAgentToolResultMessage({ toolCallId: call.id, text: serializeToolResultForModel(result), isError: true });
+    }),
+  ]);
+}
+
 /** 创建只读取 durable recovery 状态并投影公开 DTO 的服务。 */
 export function createTurnRecoveryService(
   ports: RuntimePorts,
@@ -153,15 +164,7 @@ export function createTurnRecoveryService(
       && pendingCalls[0]?.name === "ask_user_question"
       && checkpoint.pendingUserQuestion?.callId === pendingCalls[0]?.id;
     const shouldClose = pendingCalls.length > 0 && mustCloseInterruptedCalls(checkpoint.status) && !preserveCancelledQuestion;
-    const messages = shouldClose
-      ? validateAgentMessages([
-          ...pairing.messages,
-          ...pendingCalls.map(function closeUnknownOutcome(call) {
-            const result = createSyntheticToolErrorResult(call, "TOOL_OUTCOME_UNKNOWN", "恢复时无法确认该工具是否已产生副作用，请先验证外部状态后再继续");
-            return createAgentToolResultMessage({ toolCallId: call.id, text: serializeToolResultForModel(result), isError: true });
-          }),
-        ])
-      : pairing.messages;
+    const messages = shouldClose ? closeInterruptedToolCalls(pairing.messages, pendingCalls) : pairing.messages;
     const normalized: AgentCheckpoint = {
       ...checkpoint,
       messageSchemaVersion: 2,
@@ -279,6 +282,7 @@ export function createTurnRecoveryService(
         : undefined,
       effectiveReasoning: turn.frozenProviderConfig?.effectiveReasoning,
       permissionMode: turn.frozenRunConfig.permissionMode,
+      executionPermissionMode: turn.permissionRevisions?.slice(-1)[0]?.permissionMode ?? turn.frozenRunConfig.permissionMode,
       ...(turn.frozenRunConfig.capabilityCeiling ? { capabilityCeiling: structuredClone(turn.frozenRunConfig.capabilityCeiling) } : {}),
     };
   }
@@ -379,7 +383,7 @@ function isTerminalStatus(status: AgentCheckpoint["status"]): boolean {
 
 /** 将内部 durable Turn 记录收窄为宿主可读取的安全元数据。 */
 function sanitizeTurnForExternal(turn: Turn): Turn {
-  const { frozenProviderConfig: _frozenProviderConfig, frozenRunConfig, ...safeTurn } = turn;
+  const { frozenProviderConfig: _frozenProviderConfig, permissionRevisions: _permissionRevisions, permissionSelectionRevision: _permissionSelectionRevision, frozenRunConfig, ...safeTurn } = turn;
   const { credentialRef: _credentialRef, rerankPolicy: _rerankPolicy, safetyBudgetVersion: _safetyBudgetVersion, modelRef, ...safeFrozenRunConfig } = frozenRunConfig;
   return {
     ...safeTurn,

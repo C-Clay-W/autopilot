@@ -144,7 +144,7 @@ function renderGridLines(usage: ContextUsageView, columns: number): string[] {
 
 /**
  * 生成 Context 报告文本行。
- * grid=false（Plain/screen reader/NO_COLOR）跳过装饰网格但保留完整文本；
+ * grid=false（Plain/screen reader）跳过装饰网格但保留完整文本；
  * 列数不足以并排时整体改为上下堆叠。
  */
 export function formatContextReportLines(

@@ -12,6 +12,7 @@ import type { ModelSampler } from "../../internal/kernel/model-sampler";
 import type { ModelSampleOptions } from "../../internal/types";
 import { CanonicalMessageError, getAgentMessageText, type AgentContentBlock, type AgentMessage, validateAgentMessages } from "../../internal/types/agent-message";
 import type { OpenAiChatCompletionsProtocolProfile } from "./api-protocol";
+import { getCompatibilityPresetPolicy } from "./compatibility-presets";
 import type { ModelBehaviorProfile } from "./model-behavior-profile";
 import { createDefaultModelBehaviorProfile } from "./model-behavior-profile";
 import { normalizeProviderHttpFailure, parseRetryAfterMs } from "./provider-failure-normalization";
@@ -21,9 +22,11 @@ export interface CreateOpenAiChatCompletionsSamplerInput {
   baseUrl?: string;
   apiKey?: string;
   timeoutMs?: number;
+  maxOutputTokens?: number;
   sampleOptions: ModelSampleOptions;
   protocolProfile?: OpenAiChatCompletionsProtocolProfile;
   behaviorProfile?: ModelBehaviorProfile;
+  compatibilityPreset?: import("./api-protocol").CompatibilityPreset;
 }
 
 /** Chat Completions 请求所需的明确输入。 */
@@ -33,12 +36,13 @@ export interface OpenAiChatCompletionsRequestInput {
   tools: AgentModelToolDefinition[];
   sampleOptions: ModelSampleOptions;
   maxTokens: number;
+  compatibilityPreset?: import("./api-protocol").CompatibilityPreset;
   protocolProfile: OpenAiChatCompletionsProtocolProfile;
   imageData?: import("../../internal/kernel/model-sampler").ModelImageData;
 }
 
 /** Chat Completions 流式调用的默认超时；用户取消仍由调用方 signal 独立控制。 */
-const DEFAULT_AGENT_PROVIDER_TIMEOUT_MS = 120_000;
+const DEFAULT_AGENT_PROVIDER_TIMEOUT_MS = 600_000;
 
 /** 当旧快照未带 profile 时采用最保守的 Chat Completions 行为。 */
 function getProtocolProfile(profile?: OpenAiChatCompletionsProtocolProfile): OpenAiChatCompletionsProtocolProfile {
@@ -111,19 +115,24 @@ export function createOpenAiChatCompletionsMessages(
 
 /** 将 V2 canonical 与冻结选项构造成可精确断言的 Chat Completions HTTP body。 */
 export function createOpenAiChatCompletionsRequest(input: OpenAiChatCompletionsRequestInput): Record<string, unknown> {
+  const policy = getCompatibilityPresetPolicy(input.compatibilityPreset).chat;
   const body: Record<string, unknown> = {
     model: input.model,
     messages: createOpenAiChatCompletionsMessages(input.messages, input.protocolProfile, input.imageData),
     tools: input.tools,
     tool_choice: input.sampleOptions.toolChoice ? { type: "function", function: { name: input.sampleOptions.toolChoice.name } } : "auto",
-    temperature: input.sampleOptions.toolChoice ? 0 : input.sampleOptions.temperature ?? 0.2,
-    max_tokens: input.maxTokens,
+    [policy.maxTokensField]: input.maxTokens,
+    ...(policy.sampling === "default" ? { temperature: input.sampleOptions.toolChoice ? 0 : input.sampleOptions.temperature ?? 0.2 } : {}),
     stream: true,
   };
   if (input.protocolProfile.supportsUsageInStreaming) body.stream_options = { include_usage: true };
-  if (input.sampleOptions.thinking) body.thinking = { type: input.sampleOptions.toolChoice ? "disabled" : input.sampleOptions.thinking };
-  if (!input.sampleOptions.toolChoice && input.sampleOptions.reasoningEffort) body.reasoning_effort = input.sampleOptions.reasoningEffort;
-  if (!input.sampleOptions.toolChoice && !input.sampleOptions.thinking && input.sampleOptions.topP !== undefined) body.top_p = input.sampleOptions.topP;
+  if (policy.sampling === "none-only" && input.sampleOptions.reasoningEffort === "none") {
+    if (input.sampleOptions.temperature !== undefined) body.temperature = input.sampleOptions.temperature;
+    if (input.sampleOptions.topP !== undefined) body.top_p = input.sampleOptions.topP;
+  }
+  if (policy.supportsThinking && input.sampleOptions.thinking) body.thinking = { type: input.sampleOptions.thinking };
+  if (input.sampleOptions.reasoningEffort) body.reasoning_effort = input.sampleOptions.reasoningEffort;
+  if (policy.supportsLegacyTopP && !input.sampleOptions.toolChoice && !input.sampleOptions.thinking && input.sampleOptions.topP !== undefined) body.top_p = input.sampleOptions.topP;
   return body;
 }
 
@@ -143,7 +152,8 @@ function normalizeStreamUsage(usage: unknown): AgentSampleUsage | undefined {
     || !Number.isSafeInteger(inputTokens) || !Number.isSafeInteger(outputTokens) || !Number.isSafeInteger(contextTokens)
     || inputTokens < 0 || outputTokens < 0 || contextTokens < 0 || contextTokens !== inputTokens + outputTokens
   ) return undefined;
-  return { inputTokens, outputTokens, contextTokens };
+  const reasoningTokens = (candidate.completion_tokens_details as Record<string, unknown> | undefined)?.reasoning_tokens;
+  return { inputTokens, outputTokens, contextTokens, ...(typeof reasoningTokens === "number" && Number.isSafeInteger(reasoningTokens) && reasoningTokens >= 0 && reasoningTokens <= outputTokens ? { reasoningTokens } : {}) };
 }
 
 /** 判断 Provider 错误是否是可由 Runtime compact 后重试的上下文溢出。 */
@@ -180,7 +190,7 @@ export function createOpenAiChatCompletionsSampler(input: CreateOpenAiChatComple
         const response = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-          body: JSON.stringify(createOpenAiChatCompletionsRequest({ model, messages, tools, sampleOptions: { ...sampleOptions, toolChoice: options.toolChoice }, maxTokens: options.maxTokens ?? sampleOptions.maxTokens ?? 8_192, protocolProfile, imageData: options.imageData })),
+          body: JSON.stringify(createOpenAiChatCompletionsRequest({ model, messages, tools, sampleOptions: { ...sampleOptions, toolChoice: options.toolChoice }, maxTokens: Math.min(options.maxTokens ?? sampleOptions.maxTokens ?? input.maxOutputTokens ?? 8_192, sampleOptions.maxTokens ?? Infinity, input.maxOutputTokens ?? Infinity), protocolProfile, compatibilityPreset: input.compatibilityPreset, imageData: options.imageData })),
           signal: requestController.signal,
         });
         if (!response.ok) {

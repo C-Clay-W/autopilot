@@ -279,15 +279,13 @@ function sanitizeTerminalFailureDiagnostic(event: AgentLoopEvent): AgentLoopEven
     : undefined;
   const providerFailureReason = sanitizeAgentProviderFailureReason(errorCode, event.providerFailureReason);
   const providerFailureDetail = errorCode.startsWith("PROVIDER_") ? sanitizeAgentProviderFailureDetail(event.providerFailureDetail) : undefined;
-  const safeEvent = { ...event };
-  delete safeEvent.feedbackId;
-  delete safeEvent.failureStage;
-  delete safeEvent.providerHttpStatus;
-  delete (safeEvent as unknown as Record<string, unknown>).providerFailureProfile;
-  delete safeEvent.providerFailureReason;
-  delete safeEvent.providerFailureDetail;
   return {
-    ...safeEvent,
+    type: "turn_failed",
+    turnId: event.turnId,
+    checkpoint: event.checkpoint,
+    ...(event.error !== undefined ? { error: event.error } : {}),
+    // checkpoint、termination 与错误正文继续由外层统一投影；未知/历史字段默认不带出。
+    ...(event.termination !== undefined ? { termination: event.termination } : {}),
     errorCode,
     failureStage,
     ...(feedbackId ? { feedbackId } : {}),

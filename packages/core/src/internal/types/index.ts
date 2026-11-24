@@ -61,14 +61,14 @@ export interface AgentToolCall {
  * Kernel 只负责透传，不在 Kernel 内猜测 Provider 或改写强度。
  * - model：实际请求的模型 ID（来自 ModelRef.modelId，缺省由 sampler 用环境变量兜底）
  * - thinking：Provider 思考开关（enabled/disabled/auto）
- * - reasoningEffort：协议层推理强度（none 时省略该字段）
+ * - reasoningEffort：冻结的协议层推理强度，OpenAI 协议显式发送 none
  */
 export interface ModelSampleOptions {
-  /** 仅结构化收尾使用：强制提交指定工具，Adapter 在该次请求关闭思考并保留其余冻结配置。 */
+  /** 仅结构化收尾使用：强制提交指定工具，具体 thinking 规则由协议 Adapter 保持。 */
   toolChoice?: { name: string };
   model?: string;
   thinking?: "enabled" | "disabled" | "auto";
-  reasoningEffort?: "low" | "medium" | "high" | "max";
+  reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
   /** 仅非思考模式使用的采样温度。 */
   temperature?: number;
   /** 仅非思考模式使用的 nucleus sampling 阈值。 */

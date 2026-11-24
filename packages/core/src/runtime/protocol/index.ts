@@ -24,7 +24,7 @@ export { createEventEnvelope } from "./event-envelope";
 export type { McpCapability, McpServerConfig } from "./mcp-capability";
 export { parseMcpConfig, getMcpServerConfigHash, getMcpServerGrantConstraint } from "./mcp-capability";
 export { WebFetchCapabilityError, WebSearchCapabilityError } from "./web-capability";
-export type { WebCapability, WebFetchCapability, WebFetchCapabilityErrorCode, WebFetchResult, WebSearchCapability, WebSearchCapabilityErrorCode, WebSearchResult, WebSearchSource } from "./web-capability";
+export type { WebCapability, WebFetchBlockReason, WebFetchCapability, WebFetchCapabilityErrorCode, WebFetchResult, WebSearchCapability, WebSearchCapabilityErrorCode, WebSearchResult, WebSearchSource } from "./web-capability";
 export type { WorkPreviewCapability, WorkPreviewPrepareRequest, WorkPreviewPrepareResult, WorkPreviewOpenWhen } from "./work-preview-capability";
 export type { CompactTurnInput, CompactTurnResult } from "./compact-turn-input";
 export type { AgentTerminationBudget, AgentTerminationReason, AgentTerminationView, RecoverableTurnStatus, RecoverableApprovalView, RecoverableTurnView } from "./recoverable-turn-view";
@@ -95,3 +95,5 @@ export interface SteerTurnInput {
 // 复用内部既有类型作为稳定 DTO 公开，Phase 2 不新增序列化字段。
 // AgentCheckpoint 保留给 CheckpointStore 等实现端口（签名需要完整 checkpoint）；宿主 UI/投影应使用 PublicCheckpointView。
 export type { AgentCheckpoint };
+
+export type { BrowserCapability, BrowserBinding, BrowserOperation, BrowserRequestAuthorization } from "./browser-capability";
